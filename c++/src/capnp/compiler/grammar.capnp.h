@@ -26,6 +26,7 @@ CAPNP_DECLARE_SCHEMA(c90246b71adedbaa);
 CAPNP_DECLARE_SCHEMA(aee8397040b0df7a);
 CAPNP_DECLARE_SCHEMA(aa28e1400d793359);
 CAPNP_DECLARE_SCHEMA(96efe787c17e83bb);
+CAPNP_DECLARE_SCHEMA(c028e7691f548ce7);
 CAPNP_DECLARE_SCHEMA(d5e71144af1ce175);
 CAPNP_DECLARE_SCHEMA(d00489d473826290);
 CAPNP_DECLARE_SCHEMA(fb5aeed95cdf6af9);
@@ -222,6 +223,7 @@ struct Declaration {
     BUILTIN_CAPABILITY,
     TYPE,
   };
+  struct OrdinalRange;
   struct BrandParameter;
   struct AnnotationApplication;
   struct ParamList;
@@ -237,6 +239,21 @@ struct Declaration {
 
   struct _capnpPrivate {
     CAPNP_DECLARE_STRUCT_HEADER(96efe787c17e83bb, 2, 8)
+    #if !CAPNP_LITE
+    static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
+    #endif  // !CAPNP_LITE
+  };
+};
+
+struct Declaration::OrdinalRange {
+  OrdinalRange() = delete;
+
+  class Reader;
+  class Builder;
+  class Pipeline;
+
+  struct _capnpPrivate {
+    CAPNP_DECLARE_STRUCT_HEADER(c028e7691f548ce7, 2, 0)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -358,6 +375,7 @@ struct Declaration::Id {
     UNSPECIFIED,
     UID,
     ORDINAL,
+    ORDINAL_RANGES,
   };
 
   struct _capnpPrivate {
@@ -1697,6 +1715,97 @@ private:
 };
 #endif  // !CAPNP_LITE
 
+class Declaration::OrdinalRange::Reader {
+public:
+  typedef OrdinalRange Reads;
+
+  Reader() = default;
+  inline explicit Reader(::capnp::_::StructReader base): _reader(base) {}
+
+  inline ::capnp::MessageSize totalSize() const {
+    return _reader.totalSize().asPublic();
+  }
+
+#if !CAPNP_LITE
+  inline ::kj::StringTree toString() const {
+    return ::capnp::_::structString(_reader, *_capnpPrivate::brand());
+  }
+#endif  // !CAPNP_LITE
+
+  inline  ::uint16_t getStart() const;
+
+  inline  ::uint16_t getEnd() const;
+
+  inline  ::uint32_t getStartByte() const;
+
+  inline  ::uint32_t getEndByte() const;
+
+private:
+  ::capnp::_::StructReader _reader;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::_::PointerHelpers;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::List;
+  friend class ::capnp::MessageBuilder;
+  friend class ::capnp::Orphanage;
+};
+
+class Declaration::OrdinalRange::Builder {
+public:
+  typedef OrdinalRange Builds;
+
+  Builder() = delete;  // Deleted to discourage incorrect usage.
+                       // You can explicitly initialize to nullptr instead.
+  inline Builder(decltype(nullptr)) {}
+  inline explicit Builder(::capnp::_::StructBuilder base): _builder(base) {}
+  inline operator Reader() const { return Reader(_builder.asReader()); }
+  inline Reader asReader() const { return *this; }
+
+  inline ::capnp::MessageSize totalSize() const { return asReader().totalSize(); }
+#if !CAPNP_LITE
+  inline ::kj::StringTree toString() const { return asReader().toString(); }
+#endif  // !CAPNP_LITE
+
+  inline  ::uint16_t getStart();
+  inline void setStart( ::uint16_t value);
+
+  inline  ::uint16_t getEnd();
+  inline void setEnd( ::uint16_t value);
+
+  inline  ::uint32_t getStartByte();
+  inline void setStartByte( ::uint32_t value);
+
+  inline  ::uint32_t getEndByte();
+  inline void setEndByte( ::uint32_t value);
+
+private:
+  ::capnp::_::StructBuilder _builder;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+  friend class ::capnp::Orphanage;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::_::PointerHelpers;
+};
+
+#if !CAPNP_LITE
+class Declaration::OrdinalRange::Pipeline {
+public:
+  typedef OrdinalRange Pipelines;
+
+  inline Pipeline(decltype(nullptr)): _typeless(nullptr) {}
+  inline explicit Pipeline(::capnp::AnyPointer::Pipeline&& typeless)
+      : _typeless(kj::mv(typeless)) {}
+
+private:
+  ::capnp::AnyPointer::Pipeline _typeless;
+  friend class ::capnp::PipelineHook;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+};
+#endif  // !CAPNP_LITE
+
 class Declaration::BrandParameter::Reader {
 public:
   typedef BrandParameter Reads;
@@ -2322,6 +2431,10 @@ public:
   inline bool hasOrdinal() const;
   inline  ::capnp::compiler::LocatedInteger::Reader getOrdinal() const;
 
+  inline bool isOrdinalRanges() const;
+  inline bool hasOrdinalRanges() const;
+  inline  ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>::Reader getOrdinalRanges() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -2370,6 +2483,14 @@ public:
   inline  ::capnp::compiler::LocatedInteger::Builder initOrdinal();
   inline void adoptOrdinal(::capnp::Orphan< ::capnp::compiler::LocatedInteger>&& value);
   inline ::capnp::Orphan< ::capnp::compiler::LocatedInteger> disownOrdinal();
+
+  inline bool isOrdinalRanges();
+  inline bool hasOrdinalRanges();
+  inline  ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>::Builder getOrdinalRanges();
+  inline void setOrdinalRanges( ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>::Reader value);
+  inline  ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>::Builder initOrdinalRanges(unsigned int size);
+  inline void adoptOrdinalRanges(::capnp::Orphan< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>>&& value);
+  inline ::capnp::Orphan< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>> disownOrdinalRanges();
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -5548,6 +5669,62 @@ inline typename Declaration::Type::Builder Declaration::Builder::initType() {
   _builder.getPointerField(::capnp::bounded<5>() * ::capnp::POINTERS).clear();
   return typename Declaration::Type::Builder(_builder);
 }
+inline  ::uint16_t Declaration::OrdinalRange::Reader::getStart() const {
+  return _reader.getDataField< ::uint16_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint16_t Declaration::OrdinalRange::Builder::getStart() {
+  return _builder.getDataField< ::uint16_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+inline void Declaration::OrdinalRange::Builder::setStart( ::uint16_t value) {
+  _builder.setDataField< ::uint16_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint16_t Declaration::OrdinalRange::Reader::getEnd() const {
+  return _reader.getDataField< ::uint16_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint16_t Declaration::OrdinalRange::Builder::getEnd() {
+  return _builder.getDataField< ::uint16_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void Declaration::OrdinalRange::Builder::setEnd( ::uint16_t value) {
+  _builder.setDataField< ::uint16_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint32_t Declaration::OrdinalRange::Reader::getStartByte() const {
+  return _reader.getDataField< ::uint32_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint32_t Declaration::OrdinalRange::Builder::getStartByte() {
+  return _builder.getDataField< ::uint32_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void Declaration::OrdinalRange::Builder::setStartByte( ::uint32_t value) {
+  _builder.setDataField< ::uint32_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint32_t Declaration::OrdinalRange::Reader::getEndByte() const {
+  return _reader.getDataField< ::uint32_t>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint32_t Declaration::OrdinalRange::Builder::getEndByte() {
+  return _builder.getDataField< ::uint32_t>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+inline void Declaration::OrdinalRange::Builder::setEndByte( ::uint32_t value) {
+  _builder.setDataField< ::uint32_t>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool Declaration::BrandParameter::Reader::hasName() const {
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
@@ -6310,6 +6487,60 @@ inline ::capnp::Orphan< ::capnp::compiler::LocatedInteger> Declaration::Id::Buil
   KJ_IREQUIRE((which() == Declaration::Id::ORDINAL),
               "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::capnp::compiler::LocatedInteger>::disown(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS));
+}
+
+inline bool Declaration::Id::Reader::isOrdinalRanges() const {
+  return which() == Declaration::Id::ORDINAL_RANGES;
+}
+inline bool Declaration::Id::Builder::isOrdinalRanges() {
+  return which() == Declaration::Id::ORDINAL_RANGES;
+}
+inline bool Declaration::Id::Reader::hasOrdinalRanges() const {
+  if (which() != Declaration::Id::ORDINAL_RANGES) return false;
+  return !_reader.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS).isNull();
+}
+inline bool Declaration::Id::Builder::hasOrdinalRanges() {
+  if (which() != Declaration::Id::ORDINAL_RANGES) return false;
+  return !_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS).isNull();
+}
+inline  ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>::Reader Declaration::Id::Reader::getOrdinalRanges() const {
+  KJ_IREQUIRE((which() == Declaration::Id::ORDINAL_RANGES),
+              "Must check which() before get()ing a union member.");
+  return ::capnp::_::PointerHelpers< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>>::get(_reader.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS));
+}
+inline  ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>::Builder Declaration::Id::Builder::getOrdinalRanges() {
+  KJ_IREQUIRE((which() == Declaration::Id::ORDINAL_RANGES),
+              "Must check which() before get()ing a union member.");
+  return ::capnp::_::PointerHelpers< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>>::get(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS));
+}
+inline void Declaration::Id::Builder::setOrdinalRanges( ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>::Reader value) {
+  _builder.setDataField<Declaration::Id::Which>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, Declaration::Id::ORDINAL_RANGES);
+  ::capnp::_::PointerHelpers< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>>::set(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS), value);
+}
+inline  ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>::Builder Declaration::Id::Builder::initOrdinalRanges(unsigned int size) {
+  _builder.setDataField<Declaration::Id::Which>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, Declaration::Id::ORDINAL_RANGES);
+  return ::capnp::_::PointerHelpers< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>>::init(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS), size);
+}
+inline void Declaration::Id::Builder::adoptOrdinalRanges(
+    ::capnp::Orphan< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>>&& value) {
+  _builder.setDataField<Declaration::Id::Which>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, Declaration::Id::ORDINAL_RANGES);
+  ::capnp::_::PointerHelpers< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>>::adopt(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>> Declaration::Id::Builder::disownOrdinalRanges() {
+  KJ_IREQUIRE((which() == Declaration::Id::ORDINAL_RANGES),
+              "Must check which() before get()ing a union member.");
+  return ::capnp::_::PointerHelpers< ::capnp::List< ::capnp::compiler::Declaration::OrdinalRange,  ::capnp::Kind::STRUCT>>::disown(_builder.getPointerField(
       ::capnp::bounded<1>() * ::capnp::POINTERS));
 }
 
