@@ -797,6 +797,7 @@ private:
       case schema::Node::FILE:
       case schema::Node::ENUM:
       case schema::Node::ANNOTATION:
+      case schema::Node::TYPE:
         break;
 
       case schema::Node::STRUCT:
@@ -3039,6 +3040,10 @@ private:
           kj::strTree(),
         };
       }
+
+      case schema::Node::TYPE:
+        // A `type` newtype is not reached here yet; it produces no node text of its own.
+        break;
     }
 
     KJ_UNREACHABLE;
