@@ -190,6 +190,14 @@ private:
   Orphan<List<schema::Annotation>> compileAnnotationApplications(
       List<Declaration::AnnotationApplication>::Reader annotations,
       kj::StringPtr targetsFlagName);
+
+  Orphan<List<schema::Annotation>> compileFieldAnnotations(
+      List<Declaration::AnnotationApplication>::Reader fieldAnnotations,
+      uint64_t newtypeId);
+  // Like compileAnnotationApplications() with "targetsField", but also merges in the
+  // (field-scoped) annotations of the `type` newtype that the field was written as, following
+  // the newtype chain.  Use-site annotations, then nearer newtypes, win over farther ones (by
+  // annotation ID).  `newtypeId` is the field's resolved slot-type `typeId` (0 if none).
 };
 
 class ValueTranslator {
