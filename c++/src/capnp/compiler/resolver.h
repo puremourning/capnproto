@@ -72,6 +72,12 @@ public:
     // using the target type. This happens when the decl resolved to an alias; all other fields
     // of `ResolvedDecl` refer to the target of the alias, except for `scopeId` which is the
     // scope that contained the alias.
+
+    uint64_t newtypeId = 0;
+    // If non-zero, the name resolved through a `type` alias (newtype) with this node ID.  As
+    // with `brand`, the other fields describe the *underlying* target type; this ID lets the
+    // resulting schema::Type record a `typeId` back-reference so that code generators can
+    // recover the newtype's name.  Zero means the name did not resolve through a `type`.
   };
 
   struct ResolvedParameter {
