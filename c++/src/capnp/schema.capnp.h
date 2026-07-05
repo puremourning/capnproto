@@ -89,6 +89,7 @@ struct Node {
     INTERFACE,
     CONST,
     ANNOTATION,
+    TYPE,
   };
   struct Parameter;
   struct NestedNode;
@@ -259,7 +260,7 @@ struct Field {
   struct Ordinal;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(9aad50a41f4af45f, 3, 4)
+    CAPNP_DECLARE_STRUCT_HEADER(9aad50a41f4af45f, 4, 4)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -274,7 +275,7 @@ struct Field::Slot {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(c42305476bb4746f, 3, 4)
+    CAPNP_DECLARE_STRUCT_HEADER(c42305476bb4746f, 4, 4)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -289,7 +290,7 @@ struct Field::Group {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(cafccddb68db1d11, 3, 4)
+    CAPNP_DECLARE_STRUCT_HEADER(cafccddb68db1d11, 4, 4)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -308,7 +309,7 @@ struct Field::Ordinal {
   };
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(bb90d5c287870be6, 3, 4)
+    CAPNP_DECLARE_STRUCT_HEADER(bb90d5c287870be6, 4, 4)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -394,7 +395,7 @@ struct Type {
   struct AnyPointer;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(d07378ede1f9cc60, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(d07378ede1f9cc60, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -409,7 +410,7 @@ struct Type::List {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(87e739250a60ea97, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(87e739250a60ea97, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -424,7 +425,7 @@ struct Type::Enum {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(9e0e78711a7f87a9, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(9e0e78711a7f87a9, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -439,7 +440,7 @@ struct Type::Struct {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(ac3a6f60ef4cc6d3, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(ac3a6f60ef4cc6d3, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -454,7 +455,7 @@ struct Type::Interface {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(ed8bca69f7fb0cbf, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(ed8bca69f7fb0cbf, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -477,7 +478,7 @@ struct Type::AnyPointer {
   struct ImplicitMethodParameter;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(c2573fe8a23e49f1, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(c2573fe8a23e49f1, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -498,7 +499,7 @@ struct Type::AnyPointer::Unconstrained {
   };
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(8e3b5f79fe593656, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(8e3b5f79fe593656, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -513,7 +514,7 @@ struct Type::AnyPointer::Parameter {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(9dd1f724f4614a85, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(9dd1f724f4614a85, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -528,7 +529,7 @@ struct Type::AnyPointer::ImplicitMethodParameter {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(baefc9120c56e274, 3, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(baefc9120c56e274, 4, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -819,6 +820,10 @@ public:
 
   inline  ::uint32_t getEndByte() const;
 
+  inline bool isType() const;
+  inline bool hasType() const;
+  inline  ::capnp::schema::Type::Reader getType() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -917,6 +922,14 @@ public:
 
   inline  ::uint32_t getEndByte();
   inline void setEndByte( ::uint32_t value);
+
+  inline bool isType();
+  inline bool hasType();
+  inline  ::capnp::schema::Type::Builder getType();
+  inline void setType( ::capnp::schema::Type::Reader value);
+  inline  ::capnp::schema::Type::Builder initType();
+  inline void adoptType(::capnp::Orphan< ::capnp::schema::Type>&& value);
+  inline ::capnp::Orphan< ::capnp::schema::Type> disownType();
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -1862,6 +1875,8 @@ public:
 
   inline typename Ordinal::Reader getOrdinal() const;
 
+  inline  ::uint64_t getTypeId() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -1921,6 +1936,9 @@ public:
 
   inline typename Ordinal::Builder getOrdinal();
   inline typename Ordinal::Builder initOrdinal();
+
+  inline  ::uint64_t getTypeId();
+  inline void setTypeId( ::uint64_t value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -2611,6 +2629,8 @@ public:
   inline bool isAnyPointer() const;
   inline typename AnyPointer::Reader getAnyPointer() const;
 
+  inline  ::uint64_t getTypeId() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -2715,6 +2735,9 @@ public:
   inline bool isAnyPointer();
   inline typename AnyPointer::Builder getAnyPointer();
   inline typename AnyPointer::Builder initAnyPointer();
+
+  inline  ::uint64_t getTypeId();
+  inline void setTypeId( ::uint64_t value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -5072,6 +5095,60 @@ inline void Node::Builder::setEndByte( ::uint32_t value) {
       ::capnp::bounded<11>() * ::capnp::ELEMENTS, value);
 }
 
+inline bool Node::Reader::isType() const {
+  return which() == Node::TYPE;
+}
+inline bool Node::Builder::isType() {
+  return which() == Node::TYPE;
+}
+inline bool Node::Reader::hasType() const {
+  if (which() != Node::TYPE) return false;
+  return !_reader.getPointerField(
+      ::capnp::bounded<3>() * ::capnp::POINTERS).isNull();
+}
+inline bool Node::Builder::hasType() {
+  if (which() != Node::TYPE) return false;
+  return !_builder.getPointerField(
+      ::capnp::bounded<3>() * ::capnp::POINTERS).isNull();
+}
+inline  ::capnp::schema::Type::Reader Node::Reader::getType() const {
+  KJ_IREQUIRE((which() == Node::TYPE),
+              "Must check which() before get()ing a union member.");
+  return ::capnp::_::PointerHelpers< ::capnp::schema::Type>::get(_reader.getPointerField(
+      ::capnp::bounded<3>() * ::capnp::POINTERS));
+}
+inline  ::capnp::schema::Type::Builder Node::Builder::getType() {
+  KJ_IREQUIRE((which() == Node::TYPE),
+              "Must check which() before get()ing a union member.");
+  return ::capnp::_::PointerHelpers< ::capnp::schema::Type>::get(_builder.getPointerField(
+      ::capnp::bounded<3>() * ::capnp::POINTERS));
+}
+inline void Node::Builder::setType( ::capnp::schema::Type::Reader value) {
+  _builder.setDataField<Node::Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, Node::TYPE);
+  ::capnp::_::PointerHelpers< ::capnp::schema::Type>::set(_builder.getPointerField(
+      ::capnp::bounded<3>() * ::capnp::POINTERS), value);
+}
+inline  ::capnp::schema::Type::Builder Node::Builder::initType() {
+  _builder.setDataField<Node::Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, Node::TYPE);
+  return ::capnp::_::PointerHelpers< ::capnp::schema::Type>::init(_builder.getPointerField(
+      ::capnp::bounded<3>() * ::capnp::POINTERS));
+}
+inline void Node::Builder::adoptType(
+    ::capnp::Orphan< ::capnp::schema::Type>&& value) {
+  _builder.setDataField<Node::Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, Node::TYPE);
+  ::capnp::_::PointerHelpers< ::capnp::schema::Type>::adopt(_builder.getPointerField(
+      ::capnp::bounded<3>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::capnp::schema::Type> Node::Builder::disownType() {
+  KJ_IREQUIRE((which() == Node::TYPE),
+              "Must check which() before get()ing a union member.");
+  return ::capnp::_::PointerHelpers< ::capnp::schema::Type>::disown(_builder.getPointerField(
+      ::capnp::bounded<3>() * ::capnp::POINTERS));
+}
+
 inline bool Node::Parameter::Reader::hasName() const {
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
@@ -5999,6 +6076,20 @@ inline typename Field::Ordinal::Builder Field::Builder::initOrdinal() {
   _builder.setDataField< ::uint16_t>(::capnp::bounded<6>() * ::capnp::ELEMENTS, 0);
   return typename Field::Ordinal::Builder(_builder);
 }
+inline  ::uint64_t Field::Reader::getTypeId() const {
+  return _reader.getDataField< ::uint64_t>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint64_t Field::Builder::getTypeId() {
+  return _builder.getDataField< ::uint64_t>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+inline void Field::Builder::setTypeId( ::uint64_t value) {
+  _builder.setDataField< ::uint64_t>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, value);
+}
+
 inline  ::uint32_t Field::Slot::Reader::getOffset() const {
   return _reader.getDataField< ::uint32_t>(
       ::capnp::bounded<1>() * ::capnp::ELEMENTS);
@@ -7025,6 +7116,20 @@ inline typename Type::AnyPointer::Builder Type::Builder::initAnyPointer() {
   _builder.setDataField< ::uint64_t>(::capnp::bounded<2>() * ::capnp::ELEMENTS, 0);
   return typename Type::AnyPointer::Builder(_builder);
 }
+inline  ::uint64_t Type::Reader::getTypeId() const {
+  return _reader.getDataField< ::uint64_t>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint64_t Type::Builder::getTypeId() {
+  return _builder.getDataField< ::uint64_t>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+inline void Type::Builder::setTypeId( ::uint64_t value) {
+  _builder.setDataField< ::uint64_t>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool Type::List::Reader::hasElementType() const {
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();

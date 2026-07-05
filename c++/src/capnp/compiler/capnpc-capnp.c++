@@ -536,6 +536,10 @@ private:
       case schema::Node::FILE:
         KJ_FAIL_REQUIRE("Encountered nested file node.");
         break;
+      case schema::Node::TYPE:
+        // A `type` newtype has no textual declaration of its own here; it is reproduced
+        // through the fields that reference it.
+        break;
       case schema::Node::STRUCT: {
         auto structProto = proto.getStruct();
         return kj::strTree(
