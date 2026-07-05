@@ -1293,7 +1293,16 @@ private:
           memberInfo = &arena.allocate<MemberInfo>(
               parent, codeOrder++, member, layout, false);
           allMembers.add(memberInfo);
-          ordinal = member.getId().getOrdinal().getValue();
+          if (member.getId().isOrdinalRanges()) {
+            // `@[...]` ordinal mapping is only meaningful for a field whose type is an inline
+            // group/union newtype (which stamps its members across the given ordinals). That
+            // stamping is not yet implemented, so reject it here for now.
+            errorReporter.addErrorOn(member,
+                "'@[...]' ordinal ranges are only allowed on inline group/union newtype fields, "
+                "which are not yet supported.");
+          } else {
+            ordinal = member.getId().getOrdinal().getValue();
+          }
           break;
         }
 
