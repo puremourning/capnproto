@@ -174,9 +174,31 @@ TEST(SchemaParser, TypeDeclarationResolvesTransparently) {
       "newtype.capnp", "newtype.capnp", nullptr);
 
   auto fields = fileSchema.getNested("S").asStruct().getFields();
-  EXPECT_EQ(schema::Type::DATA, fields[0].getProto().getSlot().getType().which());  // ProviderId
-  EXPECT_EQ(schema::Type::DATA, fields[1].getProto().getSlot().getType().which());  // Uuid
-  EXPECT_EQ(schema::Type::TEXT, fields[2].getProto().getSlot().getType().which());  // plain Text
+  auto providerIdType = fields[0].getProto().getSlot().getType();
+  auto rawType = fields[1].getProto().getSlot().getType();
+  auto nameType = fields[2].getProto().getSlot().getType();
+  EXPECT_EQ(schema::Type::DATA, providerIdType.which());  // ProviderId -> Uuid -> Data
+  EXPECT_EQ(schema::Type::DATA, rawType.which());          // Uuid -> Data
+  EXPECT_EQ(schema::Type::TEXT, nameType.which());         // plain Text
+
+  // The `type` declarations survive into the schema as TYPE nodes.
+  auto uuidNode = fileSchema.getNested("Uuid").getProto();
+  auto providerIdNode = fileSchema.getNested("ProviderId").getProto();
+  EXPECT_EQ(schema::Node::TYPE, uuidNode.which());
+  EXPECT_EQ(schema::Node::TYPE, providerIdNode.which());
+
+  // Each use records a `typeId` back-reference to the newtype it was written as (the outermost
+  // name at the use site), while the wire type stays the underlying type.
+  EXPECT_EQ(providerIdNode.getId(), providerIdType.getTypeId());
+  EXPECT_EQ(uuidNode.getId(), rawType.getTypeId());
+  EXPECT_EQ(0u, nameType.getTypeId());
+
+  // A TYPE node records its underlying type, chaining the back-reference through intermediate
+  // newtypes: ProviderId -> Uuid -> Data.
+  EXPECT_EQ(schema::Type::DATA, uuidNode.getType().which());
+  EXPECT_EQ(0u, uuidNode.getType().getTypeId());
+  EXPECT_EQ(schema::Type::DATA, providerIdNode.getType().which());
+  EXPECT_EQ(uuidNode.getId(), providerIdNode.getType().getTypeId());
 }
 
 TEST(SchemaParser, Constants) {

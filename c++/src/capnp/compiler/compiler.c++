@@ -506,13 +506,19 @@ kj::Maybe<Compiler::Node::Content&> Compiler::Node::getContent(Content::State mi
           }
 
           case Declaration::TYPE: {
-            // `type X = <expr>` currently behaves like `using`: the name resolves
-            // transparently to the target type. (`type` is distinguished from `using` so that
-            // it can additionally carry annotations and be surfaced to code generators, which
-            // is not yet implemented.)
+            // A `type X = <expr>` declaration is represented two ways at once:
+            //   * as a real Node, so that it survives into the schema and code generators can
+            //     see the newtype; and
+            //   * as an Alias, so that references to the name resolve transparently to the
+            //     underlying target type.
+            // resolveMember() finds the node, resolves through the alias, and stamps the
+            // node's ID onto the result as a `newtypeId` back-reference.
+            kj::Own<Node> subNode = arena.allocateOwn<Node>(*this, nestedDecl);
+            kj::StringPtr name = nestedDecl.getName().getValue();
+            content.orderedNestedNodes.add(subNode);
+            content.nestedNodes.insert(std::make_pair(name, kj::mv(subNode)));
             kj::Own<Alias> alias = arena.allocateOwn<Alias>(
                 *module, *this, nestedDecl.getType().getTarget());
-            kj::StringPtr name = nestedDecl.getName().getValue();
             content.aliases.insert(std::make_pair(name, kj::mv(alias)));
             break;
           }
@@ -913,6 +919,21 @@ Compiler::Node::resolveMember(kj::StringPtr name) {
       auto iter = content.nestedNodes.find(name);
       if (iter != content.nestedNodes.end()) {
         Node* node = iter->second;
+        if (node->kind == Declaration::TYPE) {
+          // A `type` newtype resolves transparently to its underlying target (via the alias
+          // created alongside the node), but records the node's ID so that the resulting
+          // schema::Type carries a `typeId` back-reference to the newtype.
+          auto aliasIter = content.aliases.find(name);
+          if (aliasIter != content.aliases.end()) {
+            KJ_IF_SOME(aliasResult, aliasIter->second->compile()) {
+              if (aliasResult.is<ResolvedDecl>()) {
+                aliasResult.get<ResolvedDecl>().newtypeId = node->id;
+              }
+              return kj::mv(aliasResult);
+            }
+            return kj::none;
+          }
+        }
         ResolveResult result;
         result.init<ResolvedDecl>(ResolvedDecl {
             node->id, node->genericParamCount, id, node->kind, node, kj::none });
@@ -1254,7 +1275,14 @@ kj::Maybe<uint64_t> Compiler::Impl::lookup(uint64_t parent, kj::StringPtr childN
   KJ_IF_SOME(parentNode, findNode(parent)) {
     KJ_IF_SOME(child, parentNode.resolveMember(childName)) {
       if (child.is<Resolver::ResolvedDecl>()) {
-        return child.get<Resolver::ResolvedDecl>().id;
+        auto& decl = child.get<Resolver::ResolvedDecl>();
+        // A `type` newtype resolves transparently to its underlying type, but records its own
+        // node ID in `newtypeId`. Name lookup / navigation wants the newtype node itself (which
+        // does exist in the schema), not the underlying type.
+        if (decl.newtypeId != 0) {
+          return decl.newtypeId;
+        }
+        return decl.id;
       } else {
         // An alias. We don't support looking up aliases with this method.
         return kj::none;
