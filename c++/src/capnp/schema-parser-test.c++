@@ -201,6 +201,66 @@ TEST(SchemaParser, TypeDeclarationResolvesTransparently) {
   EXPECT_EQ(uuidNode.getId(), providerIdNode.getType().getTypeId());
 }
 
+TEST(SchemaParser, TypeNewtypeAnnotationMerge) {
+  // A field written as a `type` newtype inherits that newtype's (field-scoped) annotations,
+  // merged through the newtype chain, with use-site annotations overriding by annotation ID.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("ann.capnp",
+      "@0x8123456789abce02;\n"
+      "annotation hex(field) :Void;\n"
+      "annotation len(field) :UInt32;\n"
+      "annotation pii(field) :Void;\n"
+      "type Uuid = Data $hex $len(16);\n"
+      "type ProviderId = Uuid $pii;\n"
+      "struct S {\n"
+      "  id @0 :Uuid;                  # -> hex, len(16)\n"
+      "  owner @1 :ProviderId;         # -> pii, hex, len(16) (inherited through chain)\n"
+      "  override @2 :Uuid $len(32);   # -> len(32) [use-site wins], hex\n"
+      "  plain @3 :Data;               # -> (none)\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("ann.capnp", "ann.capnp", nullptr);
+
+  uint64_t hexId = fileSchema.getNested("hex").getProto().getId();
+  uint64_t lenId = fileSchema.getNested("len").getProto().getId();
+  uint64_t piiId = fileSchema.getNested("pii").getProto().getId();
+
+  auto fields = fileSchema.getNested("S").asStruct().getFields();
+
+  auto hasAnn = [](StructSchema::Field f, uint64_t id) {
+    for (auto a: f.getProto().getAnnotations()) {
+      if (a.getId() == id) return true;
+    }
+    return false;
+  };
+  auto lenValue = [lenId](StructSchema::Field f) -> kj::Maybe<uint32_t> {
+    for (auto a: f.getProto().getAnnotations()) {
+      if (a.getId() == lenId) return a.getValue().getUint32();
+    }
+    return nullptr;
+  };
+
+  // id :Uuid -> hex, len(16)
+  EXPECT_TRUE(hasAnn(fields[0], hexId));
+  EXPECT_EQ(16u, KJ_ASSERT_NONNULL(lenValue(fields[0])));
+  EXPECT_FALSE(hasAnn(fields[0], piiId));
+
+  // owner :ProviderId -> pii (from ProviderId) + hex, len(16) (inherited from Uuid).
+  EXPECT_TRUE(hasAnn(fields[1], piiId));
+  EXPECT_TRUE(hasAnn(fields[1], hexId));
+  EXPECT_EQ(16u, KJ_ASSERT_NONNULL(lenValue(fields[1])));
+
+  // override :Uuid $len(32) -> use-site len(32) overrides the newtype's len(16); hex inherited.
+  EXPECT_EQ(32u, KJ_ASSERT_NONNULL(lenValue(fields[2])));
+  EXPECT_TRUE(hasAnn(fields[2], hexId));
+
+  // plain :Data -> no annotations at all.
+  EXPECT_EQ(0u, fields[3].getProto().getAnnotations().size());
+}
+
 TEST(SchemaParser, Constants) {
   // This is actually a test of the full dynamic API stack for constants, because the schemas for
   // constants are not actually accessible from the generated code API, so the only way to ever
