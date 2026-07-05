@@ -2990,6 +2990,23 @@ private:
           kj::strTree(),
         };
       }
+
+      case schema::Node::TYPE: {
+        // A `type` newtype produces no generated code of its own here: fields that use the
+        // newtype already carry the underlying type, so wire-compatible code is generated
+        // without any special handling.
+        return NodeText {
+          kj::strTree(),
+          kj::strTree(),
+          kj::strTree(),
+          kj::strTree(),
+
+          kj::strTree(),
+          kj::strTree(),
+
+          kj::strTree(),
+        };
+      }
     }
 
     KJ_UNREACHABLE;
