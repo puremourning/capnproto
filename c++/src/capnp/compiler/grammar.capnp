@@ -156,6 +156,13 @@ struct Declaration {
       target @10 :Expression;
     }
 
+    type :group {
+      # A `type X = <expression>` declaration: names a type as an alias for another type.
+      # Unlike `using`, a `type` declaration may also carry annotations (in the shared
+      # `annotations` field above).
+      target @61 :Expression;
+    }
+
     const :group {
       type @11 :Expression;
       value @12 :Expression;

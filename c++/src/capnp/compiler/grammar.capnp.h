@@ -42,6 +42,7 @@ CAPNP_DECLARE_SCHEMA(992a90eaf30235d3);
 CAPNP_DECLARE_SCHEMA(eb971847d617c0b9);
 CAPNP_DECLARE_SCHEMA(c6238c7d62d65173);
 CAPNP_DECLARE_SCHEMA(9cb9e86e3198037f);
+CAPNP_DECLARE_SCHEMA(ef361d4a5abcdf3c);
 CAPNP_DECLARE_SCHEMA(84e4f3f5a807605c);
 
 }  // namespace schemas
@@ -219,6 +220,7 @@ struct Declaration {
     BUILTIN_ANY_STRUCT,
     BUILTIN_ANY_LIST,
     BUILTIN_CAPABILITY,
+    TYPE,
   };
   struct BrandParameter;
   struct AnnotationApplication;
@@ -231,6 +233,7 @@ struct Declaration {
   struct Interface;
   struct Method;
   struct Annotation;
+  struct Type;
 
   struct _capnpPrivate {
     CAPNP_DECLARE_STRUCT_HEADER(96efe787c17e83bb, 2, 8)
@@ -489,6 +492,21 @@ struct Declaration::Annotation {
 
   struct _capnpPrivate {
     CAPNP_DECLARE_STRUCT_HEADER(9cb9e86e3198037f, 2, 8)
+    #if !CAPNP_LITE
+    static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
+    #endif  // !CAPNP_LITE
+  };
+};
+
+struct Declaration::Type {
+  Type() = delete;
+
+  class Reader;
+  class Builder;
+  class Pipeline;
+
+  struct _capnpPrivate {
+    CAPNP_DECLARE_STRUCT_HEADER(ef361d4a5abcdf3c, 2, 8)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -1427,6 +1445,9 @@ public:
   inline bool isBuiltinCapability() const;
   inline  ::capnp::Void getBuiltinCapability() const;
 
+  inline bool isType() const;
+  inline typename Type::Reader getType() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -1643,6 +1664,10 @@ public:
   inline bool isBuiltinCapability();
   inline  ::capnp::Void getBuiltinCapability();
   inline void setBuiltinCapability( ::capnp::Void value = ::capnp::VOID);
+
+  inline bool isType();
+  inline typename Type::Builder getType();
+  inline typename Type::Builder initType();
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -3122,6 +3147,88 @@ public:
       : _typeless(kj::mv(typeless)) {}
 
   inline  ::capnp::compiler::Expression::Pipeline getType();
+private:
+  ::capnp::AnyPointer::Pipeline _typeless;
+  friend class ::capnp::PipelineHook;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+};
+#endif  // !CAPNP_LITE
+
+class Declaration::Type::Reader {
+public:
+  typedef Type Reads;
+
+  Reader() = default;
+  inline explicit Reader(::capnp::_::StructReader base): _reader(base) {}
+
+  inline ::capnp::MessageSize totalSize() const {
+    return _reader.totalSize().asPublic();
+  }
+
+#if !CAPNP_LITE
+  inline ::kj::StringTree toString() const {
+    return ::capnp::_::structString(_reader, *_capnpPrivate::brand());
+  }
+#endif  // !CAPNP_LITE
+
+  inline bool hasTarget() const;
+  inline  ::capnp::compiler::Expression::Reader getTarget() const;
+
+private:
+  ::capnp::_::StructReader _reader;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::_::PointerHelpers;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::List;
+  friend class ::capnp::MessageBuilder;
+  friend class ::capnp::Orphanage;
+};
+
+class Declaration::Type::Builder {
+public:
+  typedef Type Builds;
+
+  Builder() = delete;  // Deleted to discourage incorrect usage.
+                       // You can explicitly initialize to nullptr instead.
+  inline Builder(decltype(nullptr)) {}
+  inline explicit Builder(::capnp::_::StructBuilder base): _builder(base) {}
+  inline operator Reader() const { return Reader(_builder.asReader()); }
+  inline Reader asReader() const { return *this; }
+
+  inline ::capnp::MessageSize totalSize() const { return asReader().totalSize(); }
+#if !CAPNP_LITE
+  inline ::kj::StringTree toString() const { return asReader().toString(); }
+#endif  // !CAPNP_LITE
+
+  inline bool hasTarget();
+  inline  ::capnp::compiler::Expression::Builder getTarget();
+  inline void setTarget( ::capnp::compiler::Expression::Reader value);
+  inline  ::capnp::compiler::Expression::Builder initTarget();
+  inline void adoptTarget(::capnp::Orphan< ::capnp::compiler::Expression>&& value);
+  inline ::capnp::Orphan< ::capnp::compiler::Expression> disownTarget();
+
+private:
+  ::capnp::_::StructBuilder _builder;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+  friend class ::capnp::Orphanage;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::_::PointerHelpers;
+};
+
+#if !CAPNP_LITE
+class Declaration::Type::Pipeline {
+public:
+  typedef Type Pipelines;
+
+  inline Pipeline(decltype(nullptr)): _typeless(nullptr) {}
+  inline explicit Pipeline(::capnp::AnyPointer::Pipeline&& typeless)
+      : _typeless(kj::mv(typeless)) {}
+
+  inline  ::capnp::compiler::Expression::Pipeline getTarget();
 private:
   ::capnp::AnyPointer::Pipeline _typeless;
   friend class ::capnp::PipelineHook;
@@ -5419,6 +5526,28 @@ inline void Declaration::Builder::setBuiltinCapability( ::capnp::Void value) {
       ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
 }
 
+inline bool Declaration::Reader::isType() const {
+  return which() == Declaration::TYPE;
+}
+inline bool Declaration::Builder::isType() {
+  return which() == Declaration::TYPE;
+}
+inline typename Declaration::Type::Reader Declaration::Reader::getType() const {
+  KJ_IREQUIRE((which() == Declaration::TYPE),
+              "Must check which() before get()ing a union member.");
+  return typename Declaration::Type::Reader(_reader);
+}
+inline typename Declaration::Type::Builder Declaration::Builder::getType() {
+  KJ_IREQUIRE((which() == Declaration::TYPE),
+              "Must check which() before get()ing a union member.");
+  return typename Declaration::Type::Builder(_builder);
+}
+inline typename Declaration::Type::Builder Declaration::Builder::initType() {
+  _builder.setDataField<Declaration::Which>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, Declaration::TYPE);
+  _builder.getPointerField(::capnp::bounded<5>() * ::capnp::POINTERS).clear();
+  return typename Declaration::Type::Builder(_builder);
+}
 inline bool Declaration::BrandParameter::Reader::hasName() const {
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
@@ -6828,6 +6957,45 @@ inline bool Declaration::Annotation::Builder::getTargetsAnnotation() {
 inline void Declaration::Annotation::Builder::setTargetsAnnotation(bool value) {
   _builder.setDataField<bool>(
       ::capnp::bounded<107>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool Declaration::Type::Reader::hasTarget() const {
+  return !_reader.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS).isNull();
+}
+inline bool Declaration::Type::Builder::hasTarget() {
+  return !_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS).isNull();
+}
+inline  ::capnp::compiler::Expression::Reader Declaration::Type::Reader::getTarget() const {
+  return ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::get(_reader.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+inline  ::capnp::compiler::Expression::Builder Declaration::Type::Builder::getTarget() {
+  return ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::get(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+#if !CAPNP_LITE
+inline  ::capnp::compiler::Expression::Pipeline Declaration::Type::Pipeline::getTarget() {
+  return  ::capnp::compiler::Expression::Pipeline(_typeless.getPointerField(5));
+}
+#endif  // !CAPNP_LITE
+inline void Declaration::Type::Builder::setTarget( ::capnp::compiler::Expression::Reader value) {
+  ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::set(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS), value);
+}
+inline  ::capnp::compiler::Expression::Builder Declaration::Type::Builder::initTarget() {
+  return ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::init(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+inline void Declaration::Type::Builder::adoptTarget(
+    ::capnp::Orphan< ::capnp::compiler::Expression>&& value) {
+  ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::adopt(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::capnp::compiler::Expression> Declaration::Type::Builder::disownTarget() {
+  return ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::disown(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
 }
 
 inline bool ParsedFile::Reader::hasRoot() const {

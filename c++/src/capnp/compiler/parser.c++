@@ -657,6 +657,23 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
         return DeclParserResult(kj::mv(decl));
       }));
 
+  parsers.typeDecl = arena.copy(p::transform(
+      p::sequence(keyword("type"), identifier, p::optional(parsers.uid),
+                  p::optional(parenthesizedList(identifier, errorReporter)),
+                  op("="), parsers.expression,
+                  p::many(parsers.annotation)),
+      [this](Located<Text::Reader>&& name, kj::Maybe<Orphan<LocatedInteger>>&& id,
+             kj::Maybe<Located<kj::Array<kj::Maybe<Located<Text::Reader>>>>>&& genericParameters,
+             Orphan<Expression>&& target,
+             kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
+                 -> DeclParserResult {
+        auto decl = orphanage.newOrphan<Declaration>();
+        auto builder = initDecl(decl.get(), kj::mv(name), kj::mv(id),
+                                kj::mv(genericParameters), kj::mv(annotations)).initType();
+        builder.adoptTarget(kj::mv(target));
+        return DeclParserResult(kj::mv(decl));
+      }));
+
   parsers.constDecl = arena.copy(p::transform(
       p::sequence(keyword("const"), identifier, p::optional(parsers.uid),
                   op(":"), parsers.expression,
@@ -1019,7 +1036,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
   // -----------------------------------------------------------------
 
   parsers.genericDecl = arena.copy(p::oneOf(
-      parsers.usingDecl, parsers.constDecl, parsers.annotationDecl,
+      parsers.usingDecl, parsers.typeDecl, parsers.constDecl, parsers.annotationDecl,
       parsers.enumDecl, parsers.structDecl, parsers.interfaceDecl));
   parsers.fileLevelDecl = arena.copy(p::oneOf(
       parsers.genericDecl, nakedId, nakedAnnotation));
