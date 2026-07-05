@@ -121,6 +121,18 @@ struct Declaration {
     unspecified @1 :Void;
     uid @2 :LocatedInteger;
     ordinal @3 :LocatedInteger;  # limited to 16 bits
+    ordinalRanges @62 :List(OrdinalRange);
+    # `@[a-b, c, ...]` on a field: maps the ordinals of an inline group/union newtype into the
+    # parent struct's ordinal space, in declaration order. Each entry is a single ordinal
+    # (start == end) or an inclusive range. Only valid for a field whose type resolves to an
+    # inline `type ... = group {...}` / `union {...}`.
+  }
+
+  struct OrdinalRange {
+    start @0 :UInt16;  # limited to 16 bits
+    end @1 :UInt16;    # inclusive; equals `start` for a single ordinal
+    startByte @2 :UInt32;
+    endByte @3 :UInt32;
   }
 
   parameters @57 :List(BrandParameter);
