@@ -504,6 +504,18 @@ kj::Maybe<Compiler::Node::Content&> Compiler::Node::getContent(Content::State mi
             content.aliases.insert(std::make_pair(name, kj::mv(alias)));
             break;
           }
+
+          case Declaration::TYPE: {
+            // `type X = <expr>` currently behaves like `using`: the name resolves
+            // transparently to the target type. (`type` is distinguished from `using` so that
+            // it can additionally carry annotations and be surfaced to code generators, which
+            // is not yet implemented.)
+            kj::Own<Alias> alias = arena.allocateOwn<Alias>(
+                *module, *this, nestedDecl.getType().getTarget());
+            kj::StringPtr name = nestedDecl.getName().getValue();
+            content.aliases.insert(std::make_pair(name, kj::mv(alias)));
+            break;
+          }
           case Declaration::ENUMERANT:
           case Declaration::FIELD:
           case Declaration::UNION:
@@ -1080,6 +1092,9 @@ static void findImports(Declaration::Reader decl, std::set<kj::StringPtr>& outpu
   switch (decl.which()) {
     case Declaration::USING:
       findImports(decl.getUsing().getTarget(), output);
+      break;
+    case Declaration::TYPE:
+      findImports(decl.getType().getTarget(), output);
       break;
     case Declaration::CONST:
       findImports(decl.getConst().getType(), output);

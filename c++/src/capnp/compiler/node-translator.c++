@@ -761,6 +761,7 @@ void NodeTranslator::DuplicateNameDetector::check(
           break;
         }
 
+        case Declaration::TYPE:
         case Declaration::ENUM:
         case Declaration::STRUCT:
         case Declaration::INTERFACE:
@@ -799,6 +800,7 @@ void NodeTranslator::DuplicateNameDetector::check(
 
     switch (decl.which()) {
       case Declaration::USING:
+      case Declaration::TYPE:
       case Declaration::CONST:
       case Declaration::ENUM:
       case Declaration::STRUCT:

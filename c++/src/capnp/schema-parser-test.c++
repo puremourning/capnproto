@@ -152,6 +152,33 @@ TEST(SchemaParser, Basic) {
   EXPECT_EQ("weird/display/name.capnp", wrongGraultSchema.getProto().getDisplayName());
 }
 
+TEST(SchemaParser, TypeDeclarationResolvesTransparently) {
+  // A `type X = <expr>` declaration behaves like a named `using`: every use of the newtype
+  // resolves to the underlying type in the schema (transparently, even when chained through
+  // another `type`).
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("newtype.capnp",
+      "@0x8123456789abce01;\n"
+      "type Uuid = Data;\n"
+      "type ProviderId = Uuid;\n"
+      "struct S {\n"
+      "  providerId @0 :ProviderId;\n"
+      "  raw @1 :Uuid;\n"
+      "  name @2 :Text;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile(
+      "newtype.capnp", "newtype.capnp", nullptr);
+
+  auto fields = fileSchema.getNested("S").asStruct().getFields();
+  EXPECT_EQ(schema::Type::DATA, fields[0].getProto().getSlot().getType().which());  // ProviderId
+  EXPECT_EQ(schema::Type::DATA, fields[1].getProto().getSlot().getType().which());  // Uuid
+  EXPECT_EQ(schema::Type::TEXT, fields[2].getProto().getSlot().getType().which());  // plain Text
+}
+
 TEST(SchemaParser, Constants) {
   // This is actually a test of the full dynamic API stack for constants, because the schemas for
   // constants are not actually accessible from the generated code API, so the only way to ever
