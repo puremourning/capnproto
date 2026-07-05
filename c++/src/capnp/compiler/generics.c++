@@ -182,6 +182,11 @@ bool BrandedDecl::compileAsType(
         target.initAnyPointer().initUnconstrained().setCapability();
         return true;
 
+      case Declaration::TYPE:
+        // `type` names resolve transparently to their target before reaching here, so a
+        // `type` declaration is not expected in type position at this point; listed for
+        // switch exhaustiveness.
+        KJ_FALLTHROUGH;
       case Declaration::FILE:
       case Declaration::USING:
       case Declaration::CONST:
