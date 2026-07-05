@@ -1517,8 +1517,18 @@ private:
         }
       }
 
-      member->getSchema().adoptAnnotations(translator.compileAnnotationApplications(
-          member->declAnnotations, targetsFlagName));
+      if (member->declKind == Declaration::FIELD) {
+        // A field written as a `type` newtype inherits that newtype's (field-scoped)
+        // annotations, merged with any specified at the use site.
+        auto fieldReader = member->getSchema().asReader();
+        uint64_t newtypeId = fieldReader.isSlot()
+            ? fieldReader.getSlot().getType().getTypeId() : 0;
+        member->getSchema().adoptAnnotations(
+            translator.compileFieldAnnotations(member->declAnnotations, newtypeId));
+      } else {
+        member->getSchema().adoptAnnotations(translator.compileAnnotationApplications(
+            member->declAnnotations, targetsFlagName));
+      }
     }
 
     // And fill in the sizes.
@@ -2447,6 +2457,66 @@ Orphan<List<schema::Annotation>> NodeTranslator::compileAnnotationApplications(
   }
 
   return result;
+}
+
+Orphan<List<schema::Annotation>> NodeTranslator::compileFieldAnnotations(
+    List<Declaration::AnnotationApplication>::Reader fieldAnnotations,
+    uint64_t newtypeId) {
+  // Compile the field's own (use-site) annotations.
+  Orphan<List<schema::Annotation>> own =
+      compileAnnotationApplications(fieldAnnotations, "targetsField");
+
+  if (newtypeId == 0 || !compileAnnotations) {
+    return own;
+  }
+
+  // Track which annotation IDs are already accounted for. Use-site annotations win, then nearer
+  // newtypes win over farther ones.
+  kj::Vector<uint64_t> seen;
+  auto markSeen = [&](uint64_t id) -> bool {
+    for (uint64_t s: seen) {
+      if (s == id) return false;
+    }
+    seen.add(id);
+    return true;
+  };
+  for (auto ann: own.getReader()) {
+    markSeen(ann.getId());
+  }
+
+  // Walk the newtype chain, collecting field-scoped annotations that aren't already present.
+  kj::Vector<schema::Annotation::Reader> inherited;
+  uint64_t cur = newtypeId;
+  for (uint hops = 0; cur != 0 && hops < 64; hops++) {  // hop limit guards against cycles
+    KJ_IF_MAYBE(schema, resolver.resolveBootstrapSchema(cur, schema::Brand::Reader())) {
+      auto node = schema->getProto();
+      for (auto ann: node.getAnnotations()) {
+        if (markSeen(ann.getId())) {
+          inherited.add(ann);
+        }
+      }
+      cur = node.isType() ? node.getType().getTypeId() : 0;
+    } else {
+      break;
+    }
+  }
+
+  if (inherited.size() == 0) {
+    return own;
+  }
+
+  // Combine the field's own annotations with the inherited ones.
+  auto ownReader = own.getReader();
+  uint ownSize = ownReader.size();
+  auto combined = orphanage.newOrphan<List<schema::Annotation>>(ownSize + inherited.size());
+  auto builder = combined.get();
+  for (uint i = 0; i < ownSize; i++) {
+    builder.setWithCaveats(i, ownReader[i]);
+  }
+  for (auto i: kj::indices(inherited)) {
+    builder.setWithCaveats(ownSize + i, inherited[i]);
+  }
+  return combined;
 }
 
 }  // namespace compiler
