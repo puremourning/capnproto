@@ -686,6 +686,15 @@ void NodeTranslator::compileNode(Declaration::Reader decl, schema::Node::Builder
       targetsFlagName = "targetsInterface";
       break;
 
+    case Declaration::TYPE:
+      // A `type X = <target>` newtype. Record the underlying type; references to the newtype
+      // resolve to this same underlying type but carry a `typeId` back-reference to this node.
+      compileType(decl.getType().getTarget(), builder.initType(), ImplicitParams::none());
+      // A newtype's annotations are field-scoped (they describe fields that use the newtype).
+      // They are stored on this node so that they can be merged onto referencing fields.
+      targetsFlagName = "targetsField";
+      break;
+
     default:
       KJ_FAIL_REQUIRE("This Declaration is not a node.");
       break;
