@@ -695,13 +695,18 @@ void NodeTranslator::compileNode(Declaration::Reader decl, schema::Node::Builder
         // A newtype's annotations are field-scoped (they describe fields that use the newtype).
         // They are stored on this node so that they can be merged onto referencing fields.
         targetsFlagName = "targetsField";
+      } else if (target.isGroup()) {
+        // Inline `type X = group {...}` newtype: compile the body as a struct node (the
+        // "template"). Uses of the newtype with `@[...]` stamp these members into the parent
+        // struct. The newtype identity is still recoverable via Field.typeId at each use site.
+        compileStruct(capnp::VOID, decl.getNestedDecls(), builder);
+        targetsFlagName = "targetsGroup";
       } else {
-        // Inline `type X = group {...}` / `union {...}` newtype template. TODO: compile the body
-        // into a template struct node; not yet implemented.
+        // TODO: `type X = union {...}` needs the body wrapped in an unnamed union (discriminant).
         errorReporter.addErrorOn(decl,
-            "Inline 'type ... = group/union {...}' newtypes are not yet supported.");
+            "Inline 'type ... = union {...}' newtypes are not yet supported.");
         builder.initType().setVoid();
-        targetsFlagName = target.isUnion() ? "targetsUnion" : "targetsGroup";
+        targetsFlagName = "targetsUnion";
       }
       break;
     }
