@@ -938,6 +938,22 @@ public:
     }
   }
 
+  void checkOrdinal(uint value, uint startByte, uint endByte) {
+    // Like check(), but for a synthetic ordinal -- e.g. a leaf field stamped from a group/union
+    // newtype template -- which has no LocatedInteger of its own.
+    if (value < expectedOrdinal) {
+      errorReporter.addError(startByte, endByte, "Duplicate ordinal number.");
+    } else if (value > expectedOrdinal) {
+      errorReporter.addError(startByte, endByte,
+          kj::str("Skipped ordinal @", expectedOrdinal, ".  Ordinals must be sequential with no "
+                  "holes."));
+      expectedOrdinal = value + 1;
+    } else {
+      ++expectedOrdinal;
+      lastOrdinalLocation = nullptr;
+    }
+  }
+
 private:
   ErrorReporter& errorReporter;
   uint expectedOrdinal = 0;
@@ -1055,6 +1071,13 @@ private:
     bool hasDefaultValue = false;               // if declKind == FIELD
     Expression::Reader fieldType;               // if declKind == FIELD
     Expression::Reader fieldDefaultValue;       // if declKind == FIELD && hasDefaultValue
+    kj::Maybe<schema::Type::Reader> stampedType;
+    // If set, this FIELD was stamped from an inline group/union newtype template; this is its
+    // pre-resolved type (used instead of `fieldType`).
+    uint stampedOrdinal = 0;
+    // The parent ordinal assigned to a stamped leaf field (its position in the `@[...]` mapping).
+    uint64_t stampedNewtypeId = 0;
+    // For the group field that stamps a newtype: the newtype's node ID, recorded as Field.typeId.
     List<Declaration::AnnotationApplication>::Reader declAnnotations;
     uint startByte = 0;
     uint endByte = 0;
@@ -1105,6 +1128,27 @@ private:
       if (decl.hasDocComment()) {
         docComment = decl.getDocComment();
       }
+    }
+    inline MemberInfo(MemberInfo& parent, uint codeOrder, kj::StringPtr name,
+                      schema::Type::Reader stampedTypeParam, uint stampedOrdinalParam,
+                      StructLayout::StructOrGroup& fieldScope, uint startByte, uint endByte)
+        : parent(&parent), codeOrder(codeOrder), isInUnion(false),
+          name(name), declKind(Declaration::FIELD),
+          startByte(startByte), endByte(endByte),
+          node(nullptr), sourceInfo(nullptr), fieldScope(&fieldScope) {
+      // A leaf field stamped from a group/union newtype template.
+      stampedType = stampedTypeParam;
+      stampedOrdinal = stampedOrdinalParam;
+    }
+    inline MemberInfo(MemberInfo& parent, uint codeOrder, kj::StringPtr name,
+                      NodeSourceInfoBuilderPair builderPair, uint startByte, uint endByte,
+                      uint64_t stampedNewtypeIdParam)
+        : parent(&parent), codeOrder(codeOrder), isInUnion(false),
+          name(name), declKind(Declaration::GROUP),
+          startByte(startByte), endByte(endByte),
+          node(builderPair.node), sourceInfo(builderPair.sourceInfo), unionScope(nullptr) {
+      // The group node synthesized for a field that stamps an inline group newtype.
+      stampedNewtypeId = stampedNewtypeIdParam;
     }
     inline MemberInfo(MemberInfo& parent, uint codeOrder,
                       const Declaration::Param::Reader& decl,
@@ -1198,6 +1242,11 @@ private:
         node.setId(groupId);
         node.setScopeId(parent->node.getId());
         getSchema().initGroup().setTypeId(groupId);
+        if (stampedNewtypeId != 0) {
+          // This group field was stamped from a group newtype: record the newtype's node ID as
+          // the Field.typeId back-reference (the per-instance group node is Field.group.typeId).
+          getSchema().setTypeId(stampedNewtypeId);
+        }
 
         sourceInfo.setId(groupId);
         KJ_IF_MAYBE(dc, docComment) {
@@ -1296,6 +1345,78 @@ private:
     traverseTopOrGroup(members, parent, layout);
   }
 
+  void stampInlineNewtype(Declaration::Reader member, MemberInfo& parent, uint& codeOrder,
+                          StructLayout::StructOrGroup& layout) {
+    // Resolve the field's type; it must be an inline `type ... = group {...}` newtype, which
+    // compiles to a struct node -- the "template" whose fields we stamp into the parent.
+    uint64_t newtypeId = 0;
+    kj::Maybe<schema::Node::Reader> templateNode;
+    auto brandOrphan = translator.orphanage.newOrphan<schema::Brand>();
+    KJ_IF_MAYBE(decl, translator.compileDeclExpression(
+        member.getField().getType(), ImplicitParams::none())) {
+      KJ_IF_MAYBE(kind, decl->getKind()) {
+        if (*kind == Declaration::TYPE) {
+          newtypeId = decl->getIdAndFillBrand([&]() { return brandOrphan.get(); });
+          KJ_IF_MAYBE(schema, translator.resolver.resolveBootstrapSchema(
+              newtypeId, brandOrphan.getReader())) {
+            if (schema->getProto().isStruct()) {
+              templateNode = schema->getProto();
+            }
+          }
+        }
+      }
+    }
+
+    KJ_IF_MAYBE(tmpl, templateNode) {
+      auto templateFields = tmpl->getStruct().getFields();
+
+      // Flatten the `@[...]` mapping into a list of parent ordinals, in declaration order.
+      kj::Vector<uint> ordinals;
+      for (auto range: member.getId().getOrdinalRanges()) {
+        for (uint o = range.getStart(); o <= range.getEnd(); o++) {
+          ordinals.add(o);
+        }
+      }
+
+      if (ordinals.size() > templateFields.size()) {
+        errorReporter.addErrorOn(member, kj::str(
+            "This '@[...]' maps ", ordinals.size(), " ordinals, but the type has only ",
+            templateFields.size(), " field(s)."));
+      }
+
+      // Mint a group node + group MemberInfo for the field; the group field has no ordinal.
+      auto& groupMember = arena.allocate<MemberInfo>(
+          parent, codeOrder++, member.getName().getValue(),
+          newGroupNode(parent.node, member.getName().getValue()),
+          member.getStartByte(), member.getEndByte(), newtypeId);
+      allMembers.add(&groupMember);
+
+      // Stamp each template field as a leaf, remapping its ordinal into the parent's space. The
+      // leaves share the parent layout, so StructLayout allocates fresh offsets for them.
+      uint n = kj::min(ordinals.size(), templateFields.size());
+      for (uint i = 0; i < n; i++) {
+        auto templateField = templateFields[i];
+        if (!templateField.isSlot()) {
+          errorReporter.addErrorOn(member,
+              "Stamping inline newtypes whose templates contain nested groups/unions is not yet "
+              "supported.");
+          continue;
+        }
+        groupMember.childCount++;
+        auto& leaf = arena.allocate<MemberInfo>(
+            groupMember, i, templateField.getName(),
+            templateField.getSlot().getType(), ordinals[i],
+            layout, member.getStartByte(), member.getEndByte());
+        allMembers.add(&leaf);
+        membersByOrdinal.insert(std::make_pair(ordinals[i], &leaf));
+      }
+    } else {
+      errorReporter.addErrorOn(member,
+          "A '@[...]' ordinal mapping requires a field whose type is an inline "
+          "'type ... = group {...}' newtype.");
+    }
+  }
+
   void traverseTopOrGroup(List<Declaration>::Reader members, MemberInfo& parent,
                           StructLayout::StructOrGroup& layout) {
     uint codeOrder = 0;
@@ -1306,18 +1427,17 @@ private:
 
       switch (member.which()) {
         case Declaration::FIELD: {
-          parent.childCount++;
-          memberInfo = &arena.allocate<MemberInfo>(
-              parent, codeOrder++, member, layout, false);
-          allMembers.add(memberInfo);
           if (member.getId().isOrdinalRanges()) {
-            // `@[...]` ordinal mapping is only meaningful for a field whose type is an inline
-            // group/union newtype (which stamps its members across the given ordinals). That
-            // stamping is not yet implemented, so reject it here for now.
-            errorReporter.addErrorOn(member,
-                "'@[...]' ordinal ranges are only allowed on inline group/union newtype fields, "
-                "which are not yet supported.");
+            // `@[...]` stamps an inline group newtype's fields into this struct at the mapped
+            // ordinals. This synthesizes a group node + leaf members (with no ordinal for the
+            // group field itself), so it does not go through the normal single-field path.
+            parent.childCount++;
+            stampInlineNewtype(member, parent, codeOrder, layout);
           } else {
+            parent.childCount++;
+            memberInfo = &arena.allocate<MemberInfo>(
+                parent, codeOrder++, member, layout, false);
+            allMembers.add(memberInfo);
             ordinal = member.getId().getOrdinal().getValue();
           }
           break;
@@ -1416,7 +1536,9 @@ private:
       // https://github.com/capnproto/capnproto/issues/344 identify the affected field.
       KJ_CONTEXT(member.name);
 
-      if (member.declId.isOrdinal()) {
+      if (member.stampedType != nullptr) {
+        dupDetector.checkOrdinal(member.stampedOrdinal, member.startByte, member.endByte);
+      } else if (member.declId.isOrdinal()) {
         dupDetector.check(member.declId.getOrdinal());
       }
 
@@ -1426,41 +1548,47 @@ private:
       switch (member.declKind) {
         case Declaration::FIELD: {
           auto slot = fieldBuilder.initSlot();
-          auto typeBuilder = slot.initType();
-          if (translator.compileType(member.fieldType, typeBuilder, implicitMethodParams)) {
-            if (member.hasDefaultValue) {
-              if (member.isParam &&
-                  member.fieldDefaultValue.isRelativeName() &&
-                  member.fieldDefaultValue.getRelativeName().getValue() == "null") {
-                // special case: parameter set null
-                switch (typeBuilder.which()) {
-                  case schema::Type::TEXT:
-                  case schema::Type::DATA:
-                  case schema::Type::LIST:
-                  case schema::Type::STRUCT:
-                  case schema::Type::INTERFACE:
-                  case schema::Type::ANY_POINTER:
-                    break;
-                  default:
-                    errorReporter.addErrorOn(member.fieldDefaultValue.getRelativeName(),
-                        "Only pointer parameters can declare their default as 'null'.");
-                    break;
+          KJ_IF_MAYBE(stamped, member.stampedType) {
+            // Field stamped from a group/union newtype template: the type is already resolved.
+            slot.setType(*stamped);
+            translator.compileDefaultDefaultValue(slot.getType(), slot.initDefaultValue());
+          } else {
+            auto typeBuilder = slot.initType();
+            if (translator.compileType(member.fieldType, typeBuilder, implicitMethodParams)) {
+              if (member.hasDefaultValue) {
+                if (member.isParam &&
+                    member.fieldDefaultValue.isRelativeName() &&
+                    member.fieldDefaultValue.getRelativeName().getValue() == "null") {
+                  // special case: parameter set null
+                  switch (typeBuilder.which()) {
+                    case schema::Type::TEXT:
+                    case schema::Type::DATA:
+                    case schema::Type::LIST:
+                    case schema::Type::STRUCT:
+                    case schema::Type::INTERFACE:
+                    case schema::Type::ANY_POINTER:
+                      break;
+                    default:
+                      errorReporter.addErrorOn(member.fieldDefaultValue.getRelativeName(),
+                          "Only pointer parameters can declare their default as 'null'.");
+                      break;
+                  }
+                  translator.compileDefaultDefaultValue(typeBuilder, slot.initDefaultValue());
+                } else {
+                  translator.compileBootstrapValue(member.fieldDefaultValue,
+                                                   typeBuilder, slot.initDefaultValue());
                 }
-                translator.compileDefaultDefaultValue(typeBuilder, slot.initDefaultValue());
+                slot.setHadExplicitDefault(true);
               } else {
-                translator.compileBootstrapValue(member.fieldDefaultValue,
-                                                 typeBuilder, slot.initDefaultValue());
+                translator.compileDefaultDefaultValue(typeBuilder, slot.initDefaultValue());
               }
-              slot.setHadExplicitDefault(true);
             } else {
               translator.compileDefaultDefaultValue(typeBuilder, slot.initDefaultValue());
             }
-          } else {
-            translator.compileDefaultDefaultValue(typeBuilder, slot.initDefaultValue());
           }
 
           int lgSize = -1;
-          switch (typeBuilder.which()) {
+          switch (slot.getType().which()) {
             case schema::Type::VOID: lgSize = -1; break;
             case schema::Type::BOOL: lgSize = 0; break;
             case schema::Type::INT8: lgSize = 3; break;
