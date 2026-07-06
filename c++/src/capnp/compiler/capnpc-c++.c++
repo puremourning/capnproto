@@ -1206,6 +1206,71 @@ private:
 
       case schema::Field::GROUP: {
         auto slots = getSortedSlots(field.getType().asStruct());
+
+        if (hasInlineNewtypeWrapper(proto.getTypeId())) {
+          // Stamped group newtype: return the newtype's offset-parametrized wrapper instead of a
+          // naive nested group class. The per-use-site offsets come from this instance's group
+          // node, listed in the newtype's template-field order.
+          auto group = field.getType().asStruct();
+          auto typeNode = schemaLoader.getUnbound(proto.getTypeId()).getProto();
+          auto tmpl = schemaLoader.getUnbound(typeNode.getType().getStruct().getTypeId()).asStruct();
+          kj::String offsets = kj::strArray(KJ_MAP(tf, tmpl.getFields()) {
+            return kj::str(group.getFieldByName(tf.getProto().getName())
+                .getProto().getSlot().getOffset());
+          }, ", ");
+          kj::String wrapName = kj::str(cppFullName(
+              schemaLoader.getUnbound(proto.getTypeId()), nullptr));
+          kj::String readerType = kj::str(wrapName, "::Reader<", offsets, ">");
+          kj::String builderType = kj::str(wrapName, "::Builder<", offsets, ">");
+          return FieldText {
+            kj::strTree(
+                kj::mv(unionDiscrim.readerIsDecl),
+                "  inline ", readerType, " get", titleCase, "() const;\n"
+                "\n"),
+
+            kj::strTree(
+                kj::mv(unionDiscrim.builderIsDecl),
+                "  inline ", builderType, " get", titleCase, "();\n"
+                "  inline ", builderType, " init", titleCase, "();\n"
+                "\n"),
+
+            kj::strTree(),  // no pipeline for a data-only wrapper
+
+            kj::strTree(
+                kj::mv(unionDiscrim.isDefs),
+                templateContext.allDecls(),
+                "inline ", readerType, " ", scope, "Reader::get", titleCase, "() const {\n",
+                unionDiscrim.check,
+                "  return ", readerType, "(_reader);\n"
+                "}\n",
+                templateContext.allDecls(),
+                "inline ", builderType, " ", scope, "Builder::get", titleCase, "() {\n",
+                unionDiscrim.check,
+                "  return ", builderType, "(_builder);\n"
+                "}\n",
+                templateContext.allDecls(),
+                "inline ", builderType, " ", scope, "Builder::init", titleCase, "() {\n",
+                unionDiscrim.set,
+                KJ_MAP(slot, slots) {
+                  switch (sectionFor(slot.whichType)) {
+                    case Section::NONE:
+                      return kj::strTree();
+                    case Section::DATA:
+                      return kj::strTree(
+                          "  _builder.setDataField<", maskType(slot.whichType), ">(::capnp::bounded<",
+                              slot.offset, ">() * ::capnp::ELEMENTS, 0);\n");
+                    case Section::POINTERS:
+                      return kj::strTree(
+                          "  _builder.getPointerField(::capnp::bounded<", slot.offset,
+                              ">() * ::capnp::POINTERS).clear();\n");
+                  }
+                  KJ_UNREACHABLE;
+                },
+                "  return ", builderType, "(_builder);\n"
+                "}\n")
+          };
+        }
+
         return FieldText {
             kj::strTree(
                 kj::mv(unionDiscrim.readerIsDecl),
@@ -2695,6 +2760,161 @@ private:
     kj::StringTree sourceFileDefs;
   };
 
+  bool isPrimitiveDataType(schema::Type::Reader t) {
+    // True for types stored in the data section (accessed via getDataField), as opposed to
+    // pointer types (Text/Data/List/Struct/Interface/AnyPointer).
+    switch (t.which()) {
+      case schema::Type::VOID:
+      case schema::Type::BOOL:
+      case schema::Type::INT8:  case schema::Type::INT16:
+      case schema::Type::INT32: case schema::Type::INT64:
+      case schema::Type::UINT8: case schema::Type::UINT16:
+      case schema::Type::UINT32: case schema::Type::UINT64:
+      case schema::Type::FLOAT32: case schema::Type::FLOAT64:
+      case schema::Type::ENUM:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  bool hasInlineNewtypeWrapper(uint64_t typeId) {
+    // True if `typeId` names a group newtype we can emit an offset-parametrized wrapper for: a
+    // `type` node whose template is a plain group (no discriminant) of primitive data fields with
+    // no explicit defaults. Unions, pointer fields and defaulted fields fall back to the naive
+    // (wire-correct) per-use-site group.
+    if (typeId == 0) return false;
+    auto node = schemaLoader.getUnbound(typeId).getProto();
+    if (!node.isType()) return false;
+    auto type = node.getType();
+    if (!type.isStruct()) return false;
+    auto tmpl = schemaLoader.getUnbound(type.getStruct().getTypeId()).getProto();
+    if (tmpl.getScopeId() != typeId) return false;  // must be this node's own template
+    auto s = tmpl.getStruct();
+    if (s.getDiscriminantCount() != 0) return false;
+    for (auto f: s.getFields()) {
+      if (!f.isSlot()) return false;
+      if (!isPrimitiveDataType(f.getSlot().getType())) return false;
+      if (f.getSlot().getHadExplicitDefault()) return false;
+    }
+    return true;
+  }
+
+  NodeText makeInlineNewtypeWrapper(kj::StringPtr scope, kj::StringPtr name, StructSchema tmpl) {
+    // Emit the wrapper family for a group newtype (see hasInlineNewtypeWrapper). `Reader<off...>`
+    // / `Builder<off...>` bake per-use-site offsets into the type for zero-cost access; `AnyReader`
+    // / `AnyBuilder` hold the offsets as a runtime pointer so one concrete type composes across
+    // use sites; `asAny()` erases from the templated form to the runtime form.
+    auto fields = tmpl.getFields();
+
+    // Reader getters. `templ` selects the compile-time (`offsets_[i]` template arg) vs runtime
+    // (`_offsets[i]` member) offset form.
+    auto readerGetters = [&](bool templ) {
+      return kj::strTree(KJ_MAP(field, fields) {
+        uint i = field.getIndex();
+        CppTypeName type = typeName(field.getType(), nullptr);
+        auto title = toTitleCase(protoName(field.getProto()));
+        auto off = templ ? kj::strTree("::capnp::bounded<offsets_[", i, "]>()")
+                         : kj::strTree("::capnp::bounded(_offsets[", i, "])");
+        return kj::strTree(
+            "    inline ", type, " get", title, "() const {\n"
+            "      return _reader.getDataField<", type, ">(", kj::mv(off), " * ::capnp::ELEMENTS);\n"
+            "    }\n");
+      });
+    };
+    auto builderAccessors = [&](bool templ) {
+      return kj::strTree(KJ_MAP(field, fields) {
+        uint i = field.getIndex();
+        CppTypeName type = typeName(field.getType(), nullptr);
+        auto title = toTitleCase(protoName(field.getProto()));
+        auto offG = templ ? kj::strTree("::capnp::bounded<offsets_[", i, "]>()")
+                          : kj::strTree("::capnp::bounded(_offsets[", i, "])");
+        auto offS = templ ? kj::strTree("::capnp::bounded<offsets_[", i, "]>()")
+                          : kj::strTree("::capnp::bounded(_offsets[", i, "])");
+        return kj::strTree(
+            "    inline ", type, " get", title, "() {\n"
+            "      return _builder.getDataField<", type, ">(", kj::mv(offG), " * ::capnp::ELEMENTS);\n"
+            "    }\n"
+            "    inline void set", title, "(", type, " value) {\n"
+            "      _builder.setDataField<", type, ">(", kj::mv(offS), " * ::capnp::ELEMENTS, value);\n"
+            "    }\n");
+      });
+    };
+
+    auto body = kj::strTree(
+        "struct ", name, " {\n",
+        "  ", name, "() = delete;\n",
+        "  class AnyReader {\n"
+        "  public:\n"
+        "    AnyReader() = default;\n"
+        "    AnyReader(::capnp::_::StructReader reader, const ::uint16_t* offsets)\n"
+        "        : _reader(reader), _offsets(offsets) {}\n",
+        readerGetters(false),
+        "  private:\n"
+        "    ::capnp::_::StructReader _reader;\n"
+        "    const ::uint16_t* _offsets = nullptr;\n"
+        "  };\n"
+        "  class AnyBuilder {\n"
+        "  public:\n"
+        "    AnyBuilder() = default;\n"
+        "    AnyBuilder(::capnp::_::StructBuilder builder, const ::uint16_t* offsets)\n"
+        "        : _builder(builder), _offsets(offsets) {}\n",
+        builderAccessors(false),
+        "    inline AnyReader asReader() const { return AnyReader(_builder.asReader(), _offsets); }\n"
+        "  private:\n"
+        "    ::capnp::_::StructBuilder _builder;\n"
+        "    const ::uint16_t* _offsets = nullptr;\n"
+        "  };\n"
+        "  template <::uint16_t... capnpOffsets_>\n"
+        "  class Reader {\n"
+        "  public:\n"
+        "    Reader() = default;\n"
+        "    explicit Reader(::capnp::_::StructReader reader): _reader(reader) {}\n",
+        readerGetters(true),
+        "    inline AnyReader asAny() const { return AnyReader(_reader, offsets_); }\n"
+        "  private:\n"
+        "    static constexpr ::uint16_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
+        "    ::capnp::_::StructReader _reader;\n"
+        "  };\n"
+        "  template <::uint16_t... capnpOffsets_>\n"
+        "  class Builder {\n"
+        "  public:\n"
+        "    Builder() = default;\n"
+        "    explicit Builder(::capnp::_::StructBuilder builder): _builder(builder) {}\n",
+        builderAccessors(true),
+        "    inline Reader<capnpOffsets_...> asReader() const {\n"
+        "      return Reader<capnpOffsets_...>(_builder.asReader());\n"
+        "    }\n"
+        "    inline AnyBuilder asAny() { return AnyBuilder(_builder, offsets_); }\n"
+        "  private:\n"
+        "    static constexpr ::uint16_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
+        "    ::capnp::_::StructBuilder _builder;\n"
+        "  };\n"
+        "};\n");
+
+    // The two `offsets_` arrays are ODR-used by asAny() (their address is taken), so class
+    // templates need an out-of-line definition; template statics may live in the header.
+    auto outOfLine = kj::strTree(
+        "template <::uint16_t... capnpOffsets_>\n"
+        "constexpr ::uint16_t ", scope, name,
+            "::Reader<capnpOffsets_...>::offsets_[sizeof...(capnpOffsets_)];\n"
+        "template <::uint16_t... capnpOffsets_>\n"
+        "constexpr ::uint16_t ", scope, name,
+            "::Builder<capnpOffsets_...>::offsets_[sizeof...(capnpOffsets_)];\n");
+
+    if (scope.size() == 0) {
+      return NodeText {
+        kj::strTree(), kj::mv(body), kj::strTree(), kj::mv(outOfLine),
+        kj::strTree(), kj::strTree(), kj::strTree(),
+      };
+    } else {
+      return NodeText {
+        kj::mv(body), kj::strTree(), kj::strTree(), kj::mv(outOfLine),
+        kj::strTree(), kj::strTree(), kj::strTree(),
+      };
+    }
+  }
+
   NodeText makeNodeText(kj::StringPtr namespace_, kj::StringPtr scope,
                         kj::StringPtr name, Schema schema,
                         const TemplateContext& parentTemplateContext) {
@@ -2722,10 +2942,22 @@ private:
     if (proto.isStruct()) {
       for (auto field: proto.getStruct().getFields()) {
         if (field.isGroup()) {
-          nestedTexts.add(makeNodeText(
+          auto groupText = makeNodeText(
               namespace_, subScope, toTitleCase(protoName(field)),
               schemaLoader.getUnbound(field.getGroup().getTypeId()),
-              templateContext));
+              templateContext);
+          if (hasInlineNewtypeWrapper(field.getTypeId())) {
+            // A stamped group newtype with a wrapper: keep the group node's schema tables (the
+            // parent struct's schema depends on them) but drop its Reader/Builder class and the
+            // class's out-of-line statics -- the newtype's wrapper (generated at the `type` node)
+            // replaces the accessor.
+            groupText.outerTypeDecl = kj::strTree();
+            groupText.outerTypeDef = kj::strTree();
+            groupText.readerBuilderDefs = kj::strTree();
+            groupText.inlineMethodDefs = kj::strTree();
+            groupText.sourceFileDefs = kj::strTree();
+          }
+          nestedTexts.add(kj::mv(groupText));
         }
       }
     } else if (proto.isInterface()) {
@@ -2997,9 +3229,12 @@ private:
           auto tmplSchema = schemaLoader.getUnbound(type.getStruct().getTypeId());
           if (tmplSchema.getProto().getScopeId() == proto.getId()) {
             // Inline group/union newtype: its Node.type points at a template struct scoped to
-            // this node. Emit an offset-parametrized wrapper instead of a plain alias.
-            // TODO(next): generate the wrapper; naive per-use-site groups remain wire-correct
-            // until then.
+            // this node.
+            if (hasInlineNewtypeWrapper(proto.getId())) {
+              return makeInlineNewtypeWrapper(scope, name, tmplSchema.asStruct());
+            }
+            // Union / pointer-field / defaulted-field group newtypes have no wrapper yet; the
+            // naive per-use-site group generated at each field remains wire-correct.
             return NodeText {
               kj::strTree(), kj::strTree(), kj::strTree(), kj::strTree(),
               kj::strTree(), kj::strTree(), kj::strTree(),
