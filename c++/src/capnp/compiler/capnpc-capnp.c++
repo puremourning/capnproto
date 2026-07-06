@@ -198,6 +198,11 @@ private:
 
   kj::StringTree genType(schema::Type::Reader type, Schema scope,
                          kj::Maybe<InterfaceSchema::Method> method) {
+    if (type.getTypeId() != 0) {
+      // This type was written as a `type` newtype; show the newtype's name rather than the
+      // underlying type it resolves to.
+      return nodeName(schemaLoader.get(type.getTypeId()), scope, schema::Brand::Reader(), method);
+    }
     switch (type.which()) {
       case schema::Type::VOID: return kj::strTree("Void");
       case schema::Type::BOOL: return kj::strTree("Bool");
@@ -480,6 +485,9 @@ private:
         return kj::strTree(
             indent, proto.getName(),
             " :group", genAnnotations(proto.getAnnotations(), scope), " {",
+            proto.getTypeId() != 0
+                ? kj::strTree("  # type ", getUnqualifiedName(
+                      schemaLoader.get(proto.getTypeId()))) : kj::strTree(),
             hasDiscriminantValue(proto)
                 ? kj::strTree("  # union tag = ", proto.getDiscriminantValue()) : kj::strTree(),
             "\n",
@@ -535,10 +543,6 @@ private:
     switch (proto.which()) {
       case schema::Node::FILE:
         KJ_FAIL_REQUIRE("Encountered nested file node.");
-        break;
-      case schema::Node::TYPE:
-        // A `type` newtype has no textual declaration of its own here; it is reproduced
-        // through the fields that reference it.
         break;
       case schema::Node::STRUCT: {
         auto structProto = proto.getStruct();
@@ -636,6 +640,36 @@ private:
             indent, "annotation ", name, " @0x", kj::hex(proto.getId()),
             " (", strArray(targets, ", "), ") :",
             genType(annotationProto.getType(), schema, kj::none), genAnnotations(schema), ";\n");
+      }
+      case schema::Node::TYPE: {
+        auto type = proto.getType();
+        if (type.isStruct()) {
+          auto templateSchema = schemaLoader.get(type.getStruct().getTypeId());
+          if (templateSchema.getProto().getScopeId() == proto.getId()) {
+            // Inline group/union newtype: emit the template body.
+            auto tmplStruct = templateSchema.asStruct();
+            if (tmplStruct.getProto().getStruct().getDiscriminantCount() > 0) {
+              // A union newtype's template body is an unnamed union; emit its members directly.
+              return kj::strTree(
+                  indent, "type ", name, " @0x", kj::hex(proto.getId()),
+                  genAnnotations(schema), " = union {\n",
+                  KJ_MAP(uField, sortByCodeOrder(tmplStruct.getUnionFields())) {
+                    return genStructField(uField, tmplStruct, indent.next());
+                  },
+                  indent, "}\n");
+            } else {
+              return kj::strTree(
+                  indent, "type ", name, " @0x", kj::hex(proto.getId()),
+                  genAnnotations(schema), " = group {\n",
+                  genStructFields(tmplStruct, indent.next()),
+                  indent, "}\n");
+            }
+          }
+        }
+        // Scalar / named newtype: `type X = <underlying type>;`.
+        return kj::strTree(
+            indent, "type ", name, " @0x", kj::hex(proto.getId()), " = ",
+            genType(type, schema, kj::none), genAnnotations(schema), ";\n");
       }
     }
 
