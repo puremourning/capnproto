@@ -141,6 +141,8 @@ private:
                    schema::Node::Builder builder);
   void compileStruct(Void decl, List<Declaration>::Reader members,
                      schema::Node::Builder builder);
+  void compileInlineGroupNewtypeTemplate(List<Declaration>::Reader members,
+                                         schema::Node::Builder builder);
   void compileInterface(Declaration::Interface::Reader decl,
                         List<Declaration>::Reader members,
                         schema::Node::Builder builder);

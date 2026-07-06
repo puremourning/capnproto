@@ -697,10 +697,10 @@ void NodeTranslator::compileNode(Declaration::Reader decl, schema::Node::Builder
         // They are stored on this node so that they can be merged onto referencing fields.
         targetsFlagName = "targetsField";
       } else if (target.isGroup()) {
-        // Inline `type X = group {...}` newtype: compile the body as a struct node (the
-        // "template"). Uses of the newtype with `@[...]` stamp these members into the parent
-        // struct. The newtype identity is still recoverable via Field.typeId at each use site.
-        compileStruct(capnp::VOID, decl.getNestedDecls(), builder);
+        // Inline `type X = group {...}` newtype. This node stays a `type` node (the newtype
+        // identity / codegen marker); its `Node.type` points at a separate "template" struct
+        // node holding the group's fields, which use sites stamp inline via `@[...]`.
+        compileInlineGroupNewtypeTemplate(decl.getNestedDecls(), builder);
         targetsFlagName = "targetsGroup";
       } else {
         // TODO: `type X = union {...}` needs the body wrapped in an unnamed union (discriminant).
@@ -1361,10 +1361,22 @@ private:
       KJ_IF_SOME(kind, decl.getKind()) {
         if (kind == Declaration::TYPE) {
           newtypeId = decl.getIdAndFillBrand([&]() { return brandOrphan.get(); });
+          // The `type` node's Node.type points at its template struct; follow it to get the
+          // fields to stamp.
           KJ_IF_SOME(schema, translator.resolver.resolveBootstrapSchema(
               newtypeId, brandOrphan.getReader())) {
-            if (schema.getProto().isStruct()) {
-              templateNode = schema.getProto();
+            auto node = schema.getProto();
+            if (node.isType() && node.getType().isStruct()) {
+              // Follow Node.type to the template struct. It's an aux node, resolved via the
+              // bootstrap loader fallback in resolveBootstrapSchema().
+              uint64_t templateId = node.getType().getStruct().getTypeId();
+              auto emptyBrand = translator.orphanage.newOrphan<schema::Brand>();
+              KJ_IF_SOME(tmpl, translator.resolver.resolveBootstrapSchema(
+                  templateId, emptyBrand.getReader())) {
+                if (tmpl.getProto().isStruct()) {
+                  templateNode = tmpl.getProto();
+                }
+              }
             }
           }
         }
@@ -1713,6 +1725,28 @@ void NodeTranslator::compileStruct(Void decl, List<Declaration>::Reader members,
                                    schema::Node::Builder builder) {
   StructTranslator(*this, ImplicitParams::none())
       .translate(decl, members, builder, sourceInfo.get());
+}
+
+void NodeTranslator::compileInlineGroupNewtypeTemplate(List<Declaration>::Reader members,
+                                                       schema::Node::Builder builder) {
+  // `builder` is the `type` node. Mint a separate "template" struct node holding the group's
+  // fields and point Node.type at it. The template is a plain (non-group) struct so the loader
+  // accepts it as a standalone node; use sites stamp its fields inline via `@[...]`.
+  auto parent = builder.asReader();
+  auto templateOrphan = orphanage.newOrphan<schema::Node>();
+  auto templateSourceInfo = orphanage.newOrphan<schema::Node::SourceInfo>();
+  auto templateBuilder = templateOrphan.get();
+  templateBuilder.setId(generateGroupId(parent.getId(), 0));
+  templateBuilder.setDisplayName(kj::str(parent.getDisplayName(), ".(template)"));
+  templateBuilder.setScopeId(parent.getId());
+  templateBuilder.setIsGeneric(parent.getIsGeneric());
+  templateBuilder.initStruct();
+  StructTranslator(*this, ImplicitParams::none())
+      .translate(capnp::VOID, members, templateBuilder, templateSourceInfo.get());
+  uint64_t templateId = templateBuilder.getId();
+  groups.add(AuxNode { kj::mv(templateOrphan), kj::mv(templateSourceInfo) });
+
+  builder.initType().initStruct().setTypeId(templateId);
 }
 
 // -------------------------------------------------------------------
