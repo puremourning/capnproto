@@ -261,6 +261,54 @@ TEST(SchemaParser, TypeNewtypeAnnotationMerge) {
   EXPECT_EQ(0u, fields[3].getProto().getAnnotations().size());
 }
 
+TEST(SchemaParser, InlineGroupNewtypeStamp) {
+  // A field written `@[...] :Vec3` where `type Vec3 = group {...}` stamps the newtype's fields
+  // inline into the parent struct's data space (no pointer), remapping ordinals, and records
+  // Field.typeId = the newtype on each stamped group field.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("stamp.capnp",
+      "@0x8123456789abce03;\n"
+      "type Vec3 = group { x @0 :Float32; y @1 :Float32; z @2 :Float32; }\n"
+      "struct Rectangle {\n"
+      "  topLeft @[0-2] :Vec3;\n"
+      "  bottomRight @[3-5] :Vec3;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("stamp.capnp", "stamp.capnp", nullptr);
+
+  uint64_t vec3Id = fileSchema.getNested("Vec3").getProto().getId();
+  auto rect = fileSchema.getNested("Rectangle").asStruct();
+
+  // Six floats packed inline: 3 data words, no pointers.
+  EXPECT_EQ(3u, rect.getProto().getStruct().getDataWordCount());
+  EXPECT_EQ(0u, rect.getProto().getStruct().getPointerCount());
+
+  auto fields = rect.getFields();
+  ASSERT_EQ(2u, fields.size());
+  auto tl = fields[0].getProto();
+  auto br = fields[1].getProto();
+
+  // Both are group fields whose Field.typeId back-references the Vec3 newtype.
+  EXPECT_TRUE(tl.isGroup());
+  EXPECT_TRUE(br.isGroup());
+  EXPECT_EQ(vec3Id, tl.getTypeId());
+  EXPECT_EQ(vec3Id, br.getTypeId());
+
+  // The per-instance group nodes stamp x/y/z at consecutive offsets in the parent.
+  auto tlFields = rect.getDependency(tl.getGroup().getTypeId()).asStruct().getFields();
+  auto brFields = rect.getDependency(br.getGroup().getTypeId()).asStruct().getFields();
+  ASSERT_EQ(3u, tlFields.size());
+  ASSERT_EQ(3u, brFields.size());
+  for (uint i = 0; i < 3; i++) {
+    EXPECT_EQ(i, tlFields[i].getProto().getSlot().getOffset());
+    EXPECT_EQ(3u + i, brFields[i].getProto().getSlot().getOffset());
+    EXPECT_EQ(schema::Type::FLOAT32, tlFields[i].getProto().getSlot().getType().which());
+  }
+}
+
 TEST(SchemaParser, Constants) {
   // This is actually a test of the full dynamic API stack for constants, because the schemas for
   // constants are not actually accessible from the generated code API, so the only way to ever
