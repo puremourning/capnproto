@@ -1065,9 +1065,10 @@ private:
     bool hasDefaultValue = false;               // if declKind == FIELD
     Expression::Reader fieldType;               // if declKind == FIELD
     Expression::Reader fieldDefaultValue;       // if declKind == FIELD && hasDefaultValue
-    kj::Maybe<schema::Type::Reader> stampedType;
-    // If set, this FIELD was stamped from an inline group/union newtype template; this is its
-    // pre-resolved type (used instead of `fieldType`).
+    kj::Maybe<schema::Field::Reader> stampedField;
+    // If set, this FIELD was stamped from an inline group/union newtype template; this is the
+    // template field it was stamped from (its already-compiled type, default value, and
+    // annotations are copied onto the leaf, rather than re-compiled from `fieldType`).
     uint stampedOrdinal = 0;
     // The parent ordinal assigned to a stamped leaf field (its position in the `@[...]` mapping).
     uint64_t stampedNewtypeId = 0;
@@ -1124,14 +1125,14 @@ private:
       }
     }
     inline MemberInfo(MemberInfo& parent, uint codeOrder, kj::StringPtr name,
-                      schema::Type::Reader stampedTypeParam, uint stampedOrdinalParam,
+                      schema::Field::Reader stampedFieldParam, uint stampedOrdinalParam,
                       StructLayout::StructOrGroup& fieldScope, uint startByte, uint endByte)
         : parent(&parent), codeOrder(codeOrder), isInUnion(false),
           name(name), declKind(Declaration::FIELD),
           startByte(startByte), endByte(endByte),
           node(nullptr), sourceInfo(nullptr), fieldScope(&fieldScope) {
       // A leaf field stamped from a group/union newtype template.
-      stampedType = stampedTypeParam;
+      stampedField = stampedFieldParam;
       stampedOrdinal = stampedOrdinalParam;
     }
     inline MemberInfo(MemberInfo& parent, uint codeOrder, kj::StringPtr name,
@@ -1426,7 +1427,7 @@ private:
         }
         auto& leaf = arena.allocate<MemberInfo>(
             groupMember, i, templateField.getName(),
-            templateField.getSlot().getType(), ordinals[i],
+            templateField, ordinals[i],
             *leafScope, member.getStartByte(), member.getEndByte());
         leaf.isInUnion = isUnion;
         allMembers.add(&leaf);
@@ -1558,7 +1559,7 @@ private:
       // https://github.com/capnproto/capnproto/issues/344 identify the affected field.
       KJ_CONTEXT(member.name);
 
-      if (member.stampedType != nullptr) {
+      if (member.stampedField != nullptr) {
         dupDetector.checkOrdinal(member.stampedOrdinal, member.startByte, member.endByte);
       } else if (member.declId.isOrdinal()) {
         dupDetector.check(member.declId.getOrdinal());
@@ -1570,10 +1571,14 @@ private:
       switch (member.declKind) {
         case Declaration::FIELD: {
           auto slot = fieldBuilder.initSlot();
-          KJ_IF_MAYBE(stamped, member.stampedType) {
-            // Field stamped from a group/union newtype template: the type is already resolved.
-            slot.setType(*stamped);
-            translator.compileDefaultDefaultValue(slot.getType(), slot.initDefaultValue());
+          KJ_IF_MAYBE(stamped, member.stampedField) {
+            // Field stamped from a group/union newtype template: copy the template field's
+            // already-compiled type and default value (offset is assigned separately by the
+            // layout; annotations are copied below).
+            auto stampedSlot = stamped->getSlot();
+            slot.setType(stampedSlot.getType());
+            slot.setDefaultValue(stampedSlot.getDefaultValue());
+            slot.setHadExplicitDefault(stampedSlot.getHadExplicitDefault());
           } else {
             auto typeBuilder = slot.initType();
             if (translator.compileType(member.fieldType, typeBuilder, implicitMethodParams)) {
@@ -1694,13 +1699,19 @@ private:
       }
 
       if (member->declKind == Declaration::FIELD) {
-        // A field written as a `type` newtype inherits that newtype's (field-scoped)
-        // annotations, merged with any specified at the use site.
-        auto fieldReader = member->getSchema().asReader();
-        uint64_t newtypeId = fieldReader.isSlot()
-            ? fieldReader.getSlot().getType().getTypeId() : 0;
-        member->getSchema().adoptAnnotations(
-            translator.compileFieldAnnotations(member->declAnnotations, newtypeId));
+        KJ_IF_MAYBE(stamped, member->stampedField) {
+          // Stamped leaf: copy the template field's annotations, which were already merged with
+          // that field's own newtype chain when the template was compiled.
+          member->getSchema().setAnnotations(stamped->getAnnotations());
+        } else {
+          // A field written as a `type` newtype inherits that newtype's (field-scoped)
+          // annotations, merged with any specified at the use site.
+          auto fieldReader = member->getSchema().asReader();
+          uint64_t newtypeId = fieldReader.isSlot()
+              ? fieldReader.getSlot().getType().getTypeId() : 0;
+          member->getSchema().adoptAnnotations(
+              translator.compileFieldAnnotations(member->declAnnotations, newtypeId));
+        }
       } else {
         member->getSchema().adoptAnnotations(translator.compileAnnotationApplications(
             member->declAnnotations, targetsFlagName));
