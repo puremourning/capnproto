@@ -1566,12 +1566,18 @@ SchemaLoader::Impl::makeBrandedDependencies(
     case schema::Node::FILE:
     case schema::Node::ENUM:
     case schema::Node::ANNOTATION:
-    case schema::Node::TYPE:
       break;
 
     case schema::Node::CONST:
       ADD_ENTRY(CONST_TYPE, 0, makeDepSchema(
           node.getConst().getType(), scopeName, bindings));
+      break;
+
+    case schema::Node::TYPE:
+      // A `type` newtype's underlying type is a dependency (e.g. a group newtype's template
+      // struct), reachable via Schema::getDependency().
+      ADD_ENTRY(CONST_TYPE, 0, makeDepSchema(
+          node.getType(), scopeName, bindings));
       break;
 
     case schema::Node::STRUCT: {
