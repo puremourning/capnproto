@@ -656,22 +656,51 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
         return DeclParserResult(kj::mv(decl));
       }));
 
-  parsers.typeDecl = arena.copy(p::transform(
-      p::sequence(keyword("type"), identifier, p::optional(parsers.uid),
-                  p::optional(parenthesizedList(identifier, errorReporter)),
-                  op("="), parsers.expression,
-                  p::many(parsers.annotation)),
-      [this](Located<Text::Reader>&& name, kj::Maybe<Orphan<LocatedInteger>>&& id,
-             kj::Maybe<Located<kj::Array<kj::Maybe<Located<Text::Reader>>>>>&& genericParameters,
-             Orphan<Expression>&& target,
-             kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
-                 -> DeclParserResult {
-        auto decl = orphanage.newOrphan<Declaration>();
-        auto builder = initDecl(decl.get(), kj::mv(name), kj::mv(id),
-                                kj::mv(genericParameters), kj::mv(annotations)).initType();
-        builder.adoptTarget(kj::mv(target));
-        return DeclParserResult(kj::mv(decl));
-      }));
+  // `type X = group {...}` / `type X = union {...}` are block statements (like `struct`), so the
+  // `group`/`union` branches must be tried before the expression branch (which would otherwise
+  // parse the `group`/`union` keyword as a bare type name).
+  parsers.typeDecl = arena.copy(p::oneOf(
+      p::transform(
+          p::sequence(keyword("type"), identifier, p::optional(parsers.uid),
+                      p::optional(parenthesizedList(identifier, errorReporter)),
+                      op("="), keyword("group"), p::many(parsers.annotation)),
+          [this](Located<Text::Reader>&& name, kj::Maybe<Orphan<LocatedInteger>>&& id,
+                 kj::Maybe<Located<kj::Array<kj::Maybe<Located<Text::Reader>>>>>&& genericParameters,
+                 kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
+                     -> DeclParserResult {
+            auto decl = orphanage.newOrphan<Declaration>();
+            initDecl(decl.get(), kj::mv(name), kj::mv(id), kj::mv(genericParameters),
+                     kj::mv(annotations)).initType().getTarget().setGroup();
+            return DeclParserResult(kj::mv(decl), parsers.structLevelDecl);
+          }),
+      p::transform(
+          p::sequence(keyword("type"), identifier, p::optional(parsers.uid),
+                      p::optional(parenthesizedList(identifier, errorReporter)),
+                      op("="), keyword("union"), p::many(parsers.annotation)),
+          [this](Located<Text::Reader>&& name, kj::Maybe<Orphan<LocatedInteger>>&& id,
+                 kj::Maybe<Located<kj::Array<kj::Maybe<Located<Text::Reader>>>>>&& genericParameters,
+                 kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
+                     -> DeclParserResult {
+            auto decl = orphanage.newOrphan<Declaration>();
+            initDecl(decl.get(), kj::mv(name), kj::mv(id), kj::mv(genericParameters),
+                     kj::mv(annotations)).initType().getTarget().setUnion();
+            return DeclParserResult(kj::mv(decl), parsers.structLevelDecl);
+          }),
+      p::transform(
+          p::sequence(keyword("type"), identifier, p::optional(parsers.uid),
+                      p::optional(parenthesizedList(identifier, errorReporter)),
+                      op("="), parsers.expression, p::many(parsers.annotation)),
+          [this](Located<Text::Reader>&& name, kj::Maybe<Orphan<LocatedInteger>>&& id,
+                 kj::Maybe<Located<kj::Array<kj::Maybe<Located<Text::Reader>>>>>&& genericParameters,
+                 Orphan<Expression>&& target,
+                 kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
+                     -> DeclParserResult {
+            auto decl = orphanage.newOrphan<Declaration>();
+            auto builder = initDecl(decl.get(), kj::mv(name), kj::mv(id),
+                                    kj::mv(genericParameters), kj::mv(annotations)).initType();
+            builder.getTarget().adoptExpression(kj::mv(target));
+            return DeclParserResult(kj::mv(decl));
+          })));
 
   parsers.constDecl = arena.copy(p::transform(
       p::sequence(keyword("const"), identifier, p::optional(parsers.uid),
