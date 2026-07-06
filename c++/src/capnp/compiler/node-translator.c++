@@ -695,18 +695,12 @@ void NodeTranslator::compileNode(Declaration::Reader decl, schema::Node::Builder
         // A newtype's annotations are field-scoped (they describe fields that use the newtype).
         // They are stored on this node so that they can be merged onto referencing fields.
         targetsFlagName = "targetsField";
-      } else if (target.isGroup()) {
-        // Inline `type X = group {...}` newtype. This node stays a `type` node (the newtype
-        // identity / codegen marker); its `Node.type` points at a separate "template" struct
-        // node holding the group's fields, which use sites stamp inline via `@[...]`.
-        compileInlineGroupNewtypeTemplate(decl.getNestedDecls(), builder);
-        targetsFlagName = "targetsGroup";
       } else {
-        // TODO: `type X = union {...}` needs the body wrapped in an unnamed union (discriminant).
-        errorReporter.addErrorOn(decl,
-            "Inline 'type ... = union {...}' newtypes are not yet supported.");
-        builder.initType().setVoid();
-        targetsFlagName = "targetsUnion";
+        // Inline `type X = group {...}` / `union {...}` newtype. This node stays a `type` node
+        // (the newtype identity / codegen marker); its `Node.type` points at a separate
+        // "template" struct node holding the fields, which use sites stamp inline via `@[...]`.
+        compileInlineGroupNewtypeTemplate(decl.getNestedDecls(), builder, target.isUnion());
+        targetsFlagName = target.isUnion() ? "targetsUnion" : "targetsGroup";
       }
       break;
     }
@@ -1380,7 +1374,9 @@ private:
     }
 
     KJ_IF_MAYBE(tmpl, templateNode) {
-      auto templateFields = tmpl->getStruct().getFields();
+      auto templateStruct = tmpl->getStruct();
+      auto templateFields = templateStruct.getFields();
+      bool isUnion = templateStruct.getDiscriminantCount() > 0;
 
       // Flatten the `@[...]` mapping into a list of parent ordinals, in declaration order.
       kj::Vector<uint> ordinals;
@@ -1397,14 +1393,23 @@ private:
       }
 
       // Mint a group node + group MemberInfo for the field; the group field has no ordinal.
+      // (A named union is a group containing an unnamed union, so a union newtype is a group
+      // field with a union scope.)
       auto& groupMember = arena.allocate<MemberInfo>(
           parent, codeOrder++, member.getName().getValue(),
           newGroupNode(parent.node, member.getName().getValue()),
           member.getStartByte(), member.getEndByte(), newtypeId);
       allMembers.add(&groupMember);
 
-      // Stamp each template field as a leaf, remapping its ordinal into the parent's space. The
-      // leaves share the parent layout, so StructLayout allocates fresh offsets for them.
+      StructLayout::Union* unionLayout = nullptr;
+      if (isUnion) {
+        unionLayout = &arena.allocate<StructLayout::Union>(layout);
+        groupMember.unionScope = unionLayout;
+      }
+
+      // Stamp each template field as a leaf, remapping its ordinal into the parent's space. For
+      // a group the leaves share the parent layout (fresh offsets); for a union each leaf gets
+      // its own group within the union scope (overlapping offsets) plus a discriminant value.
       uint n = kj::min(ordinals.size(), templateFields.size());
       for (uint i = 0; i < n; i++) {
         auto templateField = templateFields[i];
@@ -1415,10 +1420,15 @@ private:
           continue;
         }
         groupMember.childCount++;
+        StructLayout::StructOrGroup* leafScope = &layout;
+        if (isUnion) {
+          leafScope = &arena.allocate<StructLayout::Group>(*unionLayout);
+        }
         auto& leaf = arena.allocate<MemberInfo>(
             groupMember, i, templateField.getName(),
             templateField.getSlot().getType(), ordinals[i],
-            layout, member.getStartByte(), member.getEndByte());
+            *leafScope, member.getStartByte(), member.getEndByte());
+        leaf.isInUnion = isUnion;
         allMembers.add(&leaf);
         membersByOrdinal.insert(std::make_pair(ordinals[i], &leaf));
       }
@@ -1718,10 +1728,11 @@ void NodeTranslator::compileStruct(Void decl, List<Declaration>::Reader members,
 }
 
 void NodeTranslator::compileInlineGroupNewtypeTemplate(List<Declaration>::Reader members,
-                                                       schema::Node::Builder builder) {
-  // `builder` is the `type` node. Mint a separate "template" struct node holding the group's
-  // fields and point Node.type at it. The template is a plain (non-group) struct so the loader
-  // accepts it as a standalone node; use sites stamp its fields inline via `@[...]`.
+                                                       schema::Node::Builder builder,
+                                                       bool isUnion) {
+  // `builder` is the `type` node. Mint a separate "template" struct node holding the fields and
+  // point Node.type at it. The template is a plain (non-group) struct so the loader accepts it
+  // as a standalone node; use sites stamp its fields inline via `@[...]`.
   auto parent = builder.asReader();
   auto templateOrphan = orphanage.newOrphan<schema::Node>();
   auto templateSourceInfo = orphanage.newOrphan<schema::Node::SourceInfo>();
@@ -1731,8 +1742,25 @@ void NodeTranslator::compileInlineGroupNewtypeTemplate(List<Declaration>::Reader
   templateBuilder.setScopeId(parent.getId());
   templateBuilder.setIsGeneric(parent.getIsGeneric());
   templateBuilder.initStruct();
-  StructTranslator(*this, ImplicitParams::none())
-      .translate(capnp::VOID, members, templateBuilder, templateSourceInfo.get());
+
+  if (isUnion) {
+    // Wrap the body in an unnamed union so the template gets a discriminant. (A named union is
+    // equivalent to a group containing an unnamed union.)
+    auto wrapper = orphanage.newOrphan<List<Declaration>>(1);
+    auto unionDecl = wrapper.get()[0];
+    unionDecl.initName();  // empty name -> unnamed union
+    unionDecl.setUnion();
+    auto nested = unionDecl.initNestedDecls(members.size());
+    for (auto i: kj::indices(members)) {
+      nested.setWithCaveats(i, members[i]);
+    }
+    StructTranslator(*this, ImplicitParams::none())
+        .translate(capnp::VOID, wrapper.getReader(), templateBuilder, templateSourceInfo.get());
+  } else {
+    StructTranslator(*this, ImplicitParams::none())
+        .translate(capnp::VOID, members, templateBuilder, templateSourceInfo.get());
+  }
+
   uint64_t templateId = templateBuilder.getId();
   groups.add(AuxNode { kj::mv(templateOrphan), kj::mv(templateSourceInfo) });
 
