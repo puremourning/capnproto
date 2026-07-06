@@ -310,6 +310,41 @@ TEST(SchemaParser, InlineGroupNewtypeStamp) {
   }
 }
 
+TEST(SchemaParser, InlineUnionNewtypeStamp) {
+  // A union newtype stamps inline like a group, but with a discriminant: the members overlap
+  // and get discriminant values; the discriminant consumes an offset but no ordinal.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("ustamp.capnp",
+      "@0x8123456789abce04;\n"
+      "type Instruction = union { market @0 :Void; limit @1 :Float32; stop @2 :Float32; }\n"
+      "struct Order {\n"
+      "  id @0 :Int32;\n"
+      "  instr @[1, 2, 3] :Instruction;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("ustamp.capnp", "ustamp.capnp", nullptr);
+  uint64_t instrId = fileSchema.getNested("Instruction").getProto().getId();
+  auto order = fileSchema.getNested("Order").asStruct();
+
+  auto instr = order.getFieldByName("instr").getProto();
+  EXPECT_TRUE(instr.isGroup());
+  EXPECT_EQ(instrId, instr.getTypeId());  // Field.typeId back-reference to the newtype
+
+  auto instrGroup = order.getDependency(instr.getGroup().getTypeId()).asStruct();
+  EXPECT_EQ(3u, instrGroup.getProto().getStruct().getDiscriminantCount());
+
+  auto gf = instrGroup.getFields();
+  ASSERT_EQ(3u, gf.size());
+  EXPECT_EQ(0u, gf[0].getProto().getDiscriminantValue());  // market
+  EXPECT_EQ(1u, gf[1].getProto().getDiscriminantValue());  // limit
+  EXPECT_EQ(2u, gf[2].getProto().getDiscriminantValue());  // stop
+  // limit and stop are mutually exclusive -> they overlap at the same offset.
+  EXPECT_EQ(gf[1].getProto().getSlot().getOffset(), gf[2].getProto().getSlot().getOffset());
+}
+
 TEST(SchemaParser, Constants) {
   // This is actually a test of the full dynamic API stack for constants, because the schemas for
   // constants are not actually accessible from the generated code API, so the only way to ever

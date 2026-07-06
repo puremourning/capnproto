@@ -142,7 +142,7 @@ private:
   void compileStruct(Void decl, List<Declaration>::Reader members,
                      schema::Node::Builder builder);
   void compileInlineGroupNewtypeTemplate(List<Declaration>::Reader members,
-                                         schema::Node::Builder builder);
+                                         schema::Node::Builder builder, bool isUnion);
   void compileInterface(Declaration::Interface::Reader decl,
                         List<Declaration>::Reader members,
                         schema::Node::Builder builder);
