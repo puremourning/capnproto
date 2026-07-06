@@ -517,9 +517,14 @@ kj::Maybe<Compiler::Node::Content&> Compiler::Node::getContent(Content::State mi
             kj::StringPtr name = nestedDecl.getName().getValue();
             content.orderedNestedNodes.add(subNode);
             content.nestedNodes.insert(std::make_pair(name, kj::mv(subNode)));
-            kj::Own<Alias> alias = arena.allocateOwn<Alias>(
-                *module, *this, nestedDecl.getType().getTarget());
-            content.aliases.insert(std::make_pair(name, kj::mv(alias)));
+            if (nestedDecl.getType().getTarget().isExpression()) {
+              // A `type X = <expr>` newtype also resolves transparently via an alias (see
+              // resolveMember). Inline group/union newtypes are resolved differently -- they are
+              // stamped into the parent at use sites -- so they don't get an alias.
+              kj::Own<Alias> alias = arena.allocateOwn<Alias>(
+                  *module, *this, nestedDecl.getType().getTarget().getExpression());
+              content.aliases.insert(std::make_pair(name, kj::mv(alias)));
+            }
             break;
           }
           case Declaration::ENUMERANT:
@@ -1115,7 +1120,10 @@ static void findImports(Declaration::Reader decl, std::set<kj::StringPtr>& outpu
       findImports(decl.getUsing().getTarget(), output);
       break;
     case Declaration::TYPE:
-      findImports(decl.getType().getTarget(), output);
+      if (decl.getType().getTarget().isExpression()) {
+        findImports(decl.getType().getTarget().getExpression(), output);
+      }
+      // Inline group/union bodies live in nestedDecls, walked generically below.
       break;
     case Declaration::CONST:
       findImports(decl.getConst().getType(), output);

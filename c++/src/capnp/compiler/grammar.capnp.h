@@ -44,6 +44,7 @@ CAPNP_DECLARE_SCHEMA(eb971847d617c0b9);
 CAPNP_DECLARE_SCHEMA(c6238c7d62d65173);
 CAPNP_DECLARE_SCHEMA(9cb9e86e3198037f);
 CAPNP_DECLARE_SCHEMA(ef361d4a5abcdf3c);
+CAPNP_DECLARE_SCHEMA(bb61b9b9452ca1a3);
 CAPNP_DECLARE_SCHEMA(84e4f3f5a807605c);
 
 }  // namespace schemas
@@ -522,9 +523,30 @@ struct Declaration::Type {
   class Reader;
   class Builder;
   class Pipeline;
+  struct Target;
 
   struct _capnpPrivate {
     CAPNP_DECLARE_STRUCT_HEADER(ef361d4a5abcdf3c, 2, 8)
+    #if !CAPNP_LITE
+    static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
+    #endif  // !CAPNP_LITE
+  };
+};
+
+struct Declaration::Type::Target {
+  Target() = delete;
+
+  class Reader;
+  class Builder;
+  class Pipeline;
+  enum Which: uint16_t {
+    EXPRESSION,
+    GROUP,
+    UNION,
+  };
+
+  struct _capnpPrivate {
+    CAPNP_DECLARE_STRUCT_HEADER(bb61b9b9452ca1a3, 2, 8)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -3293,8 +3315,7 @@ public:
   }
 #endif  // !CAPNP_LITE
 
-  inline bool hasTarget() const;
-  inline  ::capnp::compiler::Expression::Reader getTarget() const;
+  inline typename Target::Reader getTarget() const;
 
 private:
   ::capnp::_::StructReader _reader;
@@ -3324,12 +3345,8 @@ public:
   inline ::kj::StringTree toString() const { return asReader().toString(); }
 #endif  // !CAPNP_LITE
 
-  inline bool hasTarget();
-  inline  ::capnp::compiler::Expression::Builder getTarget();
-  inline void setTarget( ::capnp::compiler::Expression::Reader value);
-  inline  ::capnp::compiler::Expression::Builder initTarget();
-  inline void adoptTarget(::capnp::Orphan< ::capnp::compiler::Expression>&& value);
-  inline ::capnp::Orphan< ::capnp::compiler::Expression> disownTarget();
+  inline typename Target::Builder getTarget();
+  inline typename Target::Builder initTarget();
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -3349,7 +3366,106 @@ public:
   inline explicit Pipeline(::capnp::AnyPointer::Pipeline&& typeless)
       : _typeless(kj::mv(typeless)) {}
 
-  inline  ::capnp::compiler::Expression::Pipeline getTarget();
+  inline typename Target::Pipeline getTarget();
+private:
+  ::capnp::AnyPointer::Pipeline _typeless;
+  friend class ::capnp::PipelineHook;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+};
+#endif  // !CAPNP_LITE
+
+class Declaration::Type::Target::Reader {
+public:
+  typedef Target Reads;
+
+  Reader() = default;
+  inline explicit Reader(::capnp::_::StructReader base): _reader(base) {}
+
+  inline ::capnp::MessageSize totalSize() const {
+    return _reader.totalSize().asPublic();
+  }
+
+#if !CAPNP_LITE
+  inline ::kj::StringTree toString() const {
+    return ::capnp::_::structString(_reader, *_capnpPrivate::brand());
+  }
+#endif  // !CAPNP_LITE
+
+  inline Which which() const;
+  inline bool isExpression() const;
+  inline bool hasExpression() const;
+  inline  ::capnp::compiler::Expression::Reader getExpression() const;
+
+  inline bool isGroup() const;
+  inline  ::capnp::Void getGroup() const;
+
+  inline bool isUnion() const;
+  inline  ::capnp::Void getUnion() const;
+
+private:
+  ::capnp::_::StructReader _reader;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::_::PointerHelpers;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::List;
+  friend class ::capnp::MessageBuilder;
+  friend class ::capnp::Orphanage;
+};
+
+class Declaration::Type::Target::Builder {
+public:
+  typedef Target Builds;
+
+  Builder() = delete;  // Deleted to discourage incorrect usage.
+                       // You can explicitly initialize to nullptr instead.
+  inline Builder(decltype(nullptr)) {}
+  inline explicit Builder(::capnp::_::StructBuilder base): _builder(base) {}
+  inline operator Reader() const { return Reader(_builder.asReader()); }
+  inline Reader asReader() const { return *this; }
+
+  inline ::capnp::MessageSize totalSize() const { return asReader().totalSize(); }
+#if !CAPNP_LITE
+  inline ::kj::StringTree toString() const { return asReader().toString(); }
+#endif  // !CAPNP_LITE
+
+  inline Which which();
+  inline bool isExpression();
+  inline bool hasExpression();
+  inline  ::capnp::compiler::Expression::Builder getExpression();
+  inline void setExpression( ::capnp::compiler::Expression::Reader value);
+  inline  ::capnp::compiler::Expression::Builder initExpression();
+  inline void adoptExpression(::capnp::Orphan< ::capnp::compiler::Expression>&& value);
+  inline ::capnp::Orphan< ::capnp::compiler::Expression> disownExpression();
+
+  inline bool isGroup();
+  inline  ::capnp::Void getGroup();
+  inline void setGroup( ::capnp::Void value = ::capnp::VOID);
+
+  inline bool isUnion();
+  inline  ::capnp::Void getUnion();
+  inline void setUnion( ::capnp::Void value = ::capnp::VOID);
+
+private:
+  ::capnp::_::StructBuilder _builder;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+  friend class ::capnp::Orphanage;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::_::PointerHelpers;
+};
+
+#if !CAPNP_LITE
+class Declaration::Type::Target::Pipeline {
+public:
+  typedef Target Pipelines;
+
+  inline Pipeline(decltype(nullptr)): _typeless(nullptr) {}
+  inline explicit Pipeline(::capnp::AnyPointer::Pipeline&& typeless)
+      : _typeless(kj::mv(typeless)) {}
+
 private:
   ::capnp::AnyPointer::Pipeline _typeless;
   friend class ::capnp::PipelineHook;
@@ -5666,6 +5782,7 @@ inline typename Declaration::Type::Builder Declaration::Builder::getType() {
 inline typename Declaration::Type::Builder Declaration::Builder::initType() {
   _builder.setDataField<Declaration::Which>(
       ::capnp::bounded<1>() * ::capnp::ELEMENTS, Declaration::TYPE);
+  _builder.setDataField< ::uint16_t>(::capnp::bounded<6>() * ::capnp::ELEMENTS, 0);
   _builder.getPointerField(::capnp::bounded<5>() * ::capnp::POINTERS).clear();
   return typename Declaration::Type::Builder(_builder);
 }
@@ -7190,43 +7307,135 @@ inline void Declaration::Annotation::Builder::setTargetsAnnotation(bool value) {
       ::capnp::bounded<107>() * ::capnp::ELEMENTS, value);
 }
 
-inline bool Declaration::Type::Reader::hasTarget() const {
+inline typename Declaration::Type::Target::Reader Declaration::Type::Reader::getTarget() const {
+  return typename Declaration::Type::Target::Reader(_reader);
+}
+inline typename Declaration::Type::Target::Builder Declaration::Type::Builder::getTarget() {
+  return typename Declaration::Type::Target::Builder(_builder);
+}
+#if !CAPNP_LITE
+inline typename Declaration::Type::Target::Pipeline Declaration::Type::Pipeline::getTarget() {
+  return typename Declaration::Type::Target::Pipeline(_typeless.noop());
+}
+#endif  // !CAPNP_LITE
+inline typename Declaration::Type::Target::Builder Declaration::Type::Builder::initTarget() {
+  _builder.setDataField< ::uint16_t>(::capnp::bounded<6>() * ::capnp::ELEMENTS, 0);
+  _builder.getPointerField(::capnp::bounded<5>() * ::capnp::POINTERS).clear();
+  return typename Declaration::Type::Target::Builder(_builder);
+}
+inline  ::capnp::compiler::Declaration::Type::Target::Which Declaration::Type::Target::Reader::which() const {
+  return _reader.getDataField<Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+inline  ::capnp::compiler::Declaration::Type::Target::Which Declaration::Type::Target::Builder::which() {
+  return _builder.getDataField<Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+
+inline bool Declaration::Type::Target::Reader::isExpression() const {
+  return which() == Declaration::Type::Target::EXPRESSION;
+}
+inline bool Declaration::Type::Target::Builder::isExpression() {
+  return which() == Declaration::Type::Target::EXPRESSION;
+}
+inline bool Declaration::Type::Target::Reader::hasExpression() const {
+  if (which() != Declaration::Type::Target::EXPRESSION) return false;
   return !_reader.getPointerField(
       ::capnp::bounded<5>() * ::capnp::POINTERS).isNull();
 }
-inline bool Declaration::Type::Builder::hasTarget() {
+inline bool Declaration::Type::Target::Builder::hasExpression() {
+  if (which() != Declaration::Type::Target::EXPRESSION) return false;
   return !_builder.getPointerField(
       ::capnp::bounded<5>() * ::capnp::POINTERS).isNull();
 }
-inline  ::capnp::compiler::Expression::Reader Declaration::Type::Reader::getTarget() const {
+inline  ::capnp::compiler::Expression::Reader Declaration::Type::Target::Reader::getExpression() const {
+  KJ_IREQUIRE((which() == Declaration::Type::Target::EXPRESSION),
+              "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::get(_reader.getPointerField(
       ::capnp::bounded<5>() * ::capnp::POINTERS));
 }
-inline  ::capnp::compiler::Expression::Builder Declaration::Type::Builder::getTarget() {
+inline  ::capnp::compiler::Expression::Builder Declaration::Type::Target::Builder::getExpression() {
+  KJ_IREQUIRE((which() == Declaration::Type::Target::EXPRESSION),
+              "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::get(_builder.getPointerField(
       ::capnp::bounded<5>() * ::capnp::POINTERS));
 }
-#if !CAPNP_LITE
-inline  ::capnp::compiler::Expression::Pipeline Declaration::Type::Pipeline::getTarget() {
-  return  ::capnp::compiler::Expression::Pipeline(_typeless.getPointerField(5));
-}
-#endif  // !CAPNP_LITE
-inline void Declaration::Type::Builder::setTarget( ::capnp::compiler::Expression::Reader value) {
+inline void Declaration::Type::Target::Builder::setExpression( ::capnp::compiler::Expression::Reader value) {
+  _builder.setDataField<Declaration::Type::Target::Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, Declaration::Type::Target::EXPRESSION);
   ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::set(_builder.getPointerField(
       ::capnp::bounded<5>() * ::capnp::POINTERS), value);
 }
-inline  ::capnp::compiler::Expression::Builder Declaration::Type::Builder::initTarget() {
+inline  ::capnp::compiler::Expression::Builder Declaration::Type::Target::Builder::initExpression() {
+  _builder.setDataField<Declaration::Type::Target::Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, Declaration::Type::Target::EXPRESSION);
   return ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::init(_builder.getPointerField(
       ::capnp::bounded<5>() * ::capnp::POINTERS));
 }
-inline void Declaration::Type::Builder::adoptTarget(
+inline void Declaration::Type::Target::Builder::adoptExpression(
     ::capnp::Orphan< ::capnp::compiler::Expression>&& value) {
+  _builder.setDataField<Declaration::Type::Target::Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, Declaration::Type::Target::EXPRESSION);
   ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::adopt(_builder.getPointerField(
       ::capnp::bounded<5>() * ::capnp::POINTERS), kj::mv(value));
 }
-inline ::capnp::Orphan< ::capnp::compiler::Expression> Declaration::Type::Builder::disownTarget() {
+inline ::capnp::Orphan< ::capnp::compiler::Expression> Declaration::Type::Target::Builder::disownExpression() {
+  KJ_IREQUIRE((which() == Declaration::Type::Target::EXPRESSION),
+              "Must check which() before get()ing a union member.");
   return ::capnp::_::PointerHelpers< ::capnp::compiler::Expression>::disown(_builder.getPointerField(
       ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+
+inline bool Declaration::Type::Target::Reader::isGroup() const {
+  return which() == Declaration::Type::Target::GROUP;
+}
+inline bool Declaration::Type::Target::Builder::isGroup() {
+  return which() == Declaration::Type::Target::GROUP;
+}
+inline  ::capnp::Void Declaration::Type::Target::Reader::getGroup() const {
+  KJ_IREQUIRE((which() == Declaration::Type::Target::GROUP),
+              "Must check which() before get()ing a union member.");
+  return _reader.getDataField< ::capnp::Void>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+
+inline  ::capnp::Void Declaration::Type::Target::Builder::getGroup() {
+  KJ_IREQUIRE((which() == Declaration::Type::Target::GROUP),
+              "Must check which() before get()ing a union member.");
+  return _builder.getDataField< ::capnp::Void>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+inline void Declaration::Type::Target::Builder::setGroup( ::capnp::Void value) {
+  _builder.setDataField<Declaration::Type::Target::Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, Declaration::Type::Target::GROUP);
+  _builder.setDataField< ::capnp::Void>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool Declaration::Type::Target::Reader::isUnion() const {
+  return which() == Declaration::Type::Target::UNION;
+}
+inline bool Declaration::Type::Target::Builder::isUnion() {
+  return which() == Declaration::Type::Target::UNION;
+}
+inline  ::capnp::Void Declaration::Type::Target::Reader::getUnion() const {
+  KJ_IREQUIRE((which() == Declaration::Type::Target::UNION),
+              "Must check which() before get()ing a union member.");
+  return _reader.getDataField< ::capnp::Void>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+
+inline  ::capnp::Void Declaration::Type::Target::Builder::getUnion() {
+  KJ_IREQUIRE((which() == Declaration::Type::Target::UNION),
+              "Must check which() before get()ing a union member.");
+  return _builder.getDataField< ::capnp::Void>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+inline void Declaration::Type::Target::Builder::setUnion( ::capnp::Void value) {
+  _builder.setDataField<Declaration::Type::Target::Which>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, Declaration::Type::Target::UNION);
+  _builder.setDataField< ::capnp::Void>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
 }
 
 inline bool ParsedFile::Reader::hasRoot() const {

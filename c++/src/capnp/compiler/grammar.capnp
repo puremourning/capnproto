@@ -169,10 +169,15 @@ struct Declaration {
     }
 
     type :group {
-      # A `type X = <expression>` declaration: names a type as an alias for another type.
-      # Unlike `using`, a `type` declaration may also carry annotations (in the shared
-      # `annotations` field above).
-      target @61 :Expression;
+      # A `type X = ...` declaration: names a type. The right-hand side is either a type
+      # expression, or an inline `group {}` / `union {}` body (whose members live in the shared
+      # `nestedDecls` field above). Unlike `using`, a `type` declaration may also carry
+      # annotations (in the shared `annotations` field above).
+      target :union {
+        expression @61 :Expression;  # type X = <type expression>;
+        group @63 :Void;             # type X = group { ... }  (members in nestedDecls)
+        union @64 :Void;             # type X = union { ... }  (members in nestedDecls)
+      }
     }
 
     const :group {
