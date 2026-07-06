@@ -1562,6 +1562,13 @@ SchemaLoader::Impl::makeBrandedDependencies(
           node.getConst().getType(), scopeName, bindings));
       break;
 
+    case schema::Node::TYPE:
+      // A `type` newtype's underlying type is a dependency (e.g. a group newtype's template
+      // struct), reachable via Schema::getDependency().
+      ADD_ENTRY(CONST_TYPE, 0, makeDepSchema(
+          node.getType(), scopeName, bindings));
+      break;
+
     case schema::Node::STRUCT: {
       auto fields = node.getStruct().getFields();
       for (auto i: kj::indices(fields)) {

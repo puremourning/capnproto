@@ -989,7 +989,10 @@ kj::Maybe<Schema> Compiler::Node::resolveBootstrapSchema(
     // Now we actually invoke get() to evaluate the brand.
     return module->getCompiler().getWorkspace().bootstrapLoader.get(id, brand);
   } else {
-    KJ_FAIL_REQUIRE("Tried to get schema for ID we haven't seen before.");
+    // Auxiliary nodes (group nodes, and group-newtype template structs) are loaded into the
+    // bootstrap loader alongside their parent, but are not top-level Compiler nodes, so findNode
+    // misses them. Look them up in the loader directly (returns null if genuinely unknown).
+    return module->getCompiler().getWorkspace().bootstrapLoader.tryGet(id, brand);
   }
 }
 
