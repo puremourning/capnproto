@@ -344,6 +344,31 @@ TEST(SchemaParser, InlineUnionNewtypeStamp) {
   EXPECT_EQ(gf[1].getProto().getSlot().getOffset(), gf[2].getProto().getSlot().getOffset());
 }
 
+TEST(SchemaParser, InlineNewtypePropagatesFieldProperties) {
+  // A stamped leaf must carry the template field's default value, hadExplicitDefault flag and
+  // annotations -- not only its type.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("prop.capnp",
+      "@0x8123456789abce05;\n"
+      "annotation label @0x9123456789abce06 (field) :Text;\n"
+      "type X = group { foo @0 :UInt32 = 100 $label(\"f\"); bar @1 :Int32; }\n"
+      "struct S { a @[0, 1] :X; }\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("prop.capnp", "prop.capnp", nullptr);
+  auto s = fileSchema.getNested("S").asStruct();
+  auto group = s.getFieldByName("a").getType().asStruct();  // this instance's group node
+  auto foo = group.getFieldByName("foo").getProto();
+
+  ASSERT_TRUE(foo.isSlot());
+  EXPECT_TRUE(foo.getSlot().getHadExplicitDefault());
+  EXPECT_EQ(100u, foo.getSlot().getDefaultValue().getUint32());
+  ASSERT_EQ(1u, foo.getAnnotations().size());
+  EXPECT_EQ("f", foo.getAnnotations()[0].getValue().getText());
+}
+
 TEST(SchemaParser, Constants) {
   // This is actually a test of the full dynamic API stack for constants, because the schemas for
   // constants are not actually accessible from the generated code API, so the only way to ever
