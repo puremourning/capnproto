@@ -2992,20 +2992,42 @@ private:
       }
 
       case schema::Node::TYPE: {
-        // A `type` newtype produces no generated code of its own here: fields that use the
-        // newtype already carry the underlying type, so wire-compatible code is generated
-        // without any special handling.
-        return NodeText {
-          kj::strTree(),
-          kj::strTree(),
-          kj::strTree(),
-          kj::strTree(),
+        auto type = proto.getType();
+        if (type.isStruct()) {
+          auto tmplSchema = schemaLoader.getUnbound(type.getStruct().getTypeId());
+          if (tmplSchema.getProto().getScopeId() == proto.getId()) {
+            // Inline group/union newtype: its Node.type points at a template struct scoped to
+            // this node. Emit an offset-parametrized wrapper instead of a plain alias.
+            // TODO(next): generate the wrapper; naive per-use-site groups remain wire-correct
+            // until then.
+            return NodeText {
+              kj::strTree(), kj::strTree(), kj::strTree(), kj::strTree(),
+              kj::strTree(), kj::strTree(), kj::strTree(),
+            };
+          }
+        }
 
-          kj::strTree(),
-          kj::strTree(),
-
-          kj::strTree(),
-        };
+        // Scalar / named newtype: emit `using Name = Underlying;`. This gives the newtype a real
+        // C++ name in signatures (no type-safety beyond that; C++ has no cheap newtype). The
+        // underlying is the immediately-referenced newtype (if the target is itself a `type`) or
+        // the resolved underlying type otherwise.
+        CppTypeName underlying = type.getTypeId() != 0
+            ? cppFullName(schemaLoader.getUnbound(type.getTypeId()), nullptr)
+            : typeName(schemaLoader.getType(type, schema), nullptr);
+        auto def = kj::strTree("using ", name, " = ", kj::mv(underlying), ";\n");
+        if (scope.size() == 0) {
+          // File-level: goes in the namespace body.
+          return NodeText {
+            kj::strTree(), kj::mv(def), kj::strTree(), kj::strTree(),
+            kj::strTree(), kj::strTree(), kj::strTree(),
+          };
+        } else {
+          // Nested in a struct/interface: goes in the enclosing type's body.
+          return NodeText {
+            kj::mv(def), kj::strTree(), kj::strTree(), kj::strTree(),
+            kj::strTree(), kj::strTree(), kj::strTree(),
+          };
+        }
       }
     }
 
