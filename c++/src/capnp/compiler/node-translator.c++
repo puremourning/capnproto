@@ -1391,6 +1391,15 @@ private:
         errorReporter.addErrorOn(member, kj::str(
             "This '@[...]' maps ", ordinals.size(), " ordinals, but the type has only ",
             templateFields.size(), " field(s)."));
+      } else if (ordinals.size() < templateFields.size()) {
+        // An incomplete mapping leaves a suffix of the type's fields unmapped. This is allowed
+        // (it mirrors extending the inlined type later): the unmapped fields read as their
+        // default value and cannot be set here. Warn so the omission isn't silent.
+        errorReporter.addWarningOn(member, kj::str(
+            "This '@[...]' maps ", ordinals.size(), " ordinal(s), but the type has ",
+            templateFields.size(), " field(s). The trailing ",
+            templateFields.size() - ordinals.size(),
+            " field(s) are unmapped here: they read as their default value and cannot be set."));
       }
 
       // Mint a group node + group MemberInfo for the field; the group field has no ordinal.

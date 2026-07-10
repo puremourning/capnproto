@@ -1214,9 +1214,15 @@ private:
           auto group = field.getType().asStruct();
           auto typeNode = schemaLoader.getUnbound(proto.getTypeId()).getProto();
           auto tmpl = schemaLoader.getUnbound(typeNode.getType().getStruct().getTypeId()).asStruct();
+          // One offset per template field, in template order. A field absent from this instance's
+          // group node was left unmapped by an incomplete `@[...]`; emit the sentinel so the
+          // wrapper reads it as a default (and rejects writes) rather than crashing.
           kj::String offsets = kj::strArray(KJ_MAP(tf, tmpl.getFields()) {
-            return kj::str(group.getFieldByName(tf.getProto().getName())
-                .getProto().getSlot().getOffset());
+            KJ_IF_MAYBE(f, group.findFieldByName(tf.getProto().getName())) {
+              return kj::str(f->getProto().getSlot().getOffset());
+            } else {
+              return kj::str("0xffffffffu");
+            }
           }, ", ");
           kj::String wrapName = kj::str(cppFullName(
               schemaLoader.getUnbound(proto.getTypeId()), nullptr));
@@ -2807,18 +2813,33 @@ private:
     // use sites; `asAny()` erases from the templated form to the runtime form.
     auto fields = tmpl.getFields();
 
-    // Reader getters. `templ` selects the compile-time (`offsets_[i]` template arg) vs runtime
-    // (`_offsets[i]` member) offset form.
+    // A field may be unmapped at a use site (incomplete `@[...]`), signalled by the sentinel
+    // offset 0xffffffff. Such a field reads as its default (these wrappers only cover fields
+    // with the implicit zero default -- see hasInlineNewtypeWrapper) and cannot be set. `templ`
+    // selects the compile-time (`offsets_[i]` template arg) vs runtime (`_offsets[i]` member)
+    // form; in the compile-time form the sentinel test folds away, so a mapped field is
+    // zero-cost and an unmapped one compiles to `return T();`.
+    auto slotExpr = [](bool templ, uint i) {
+      return templ ? kj::strTree("offsets_[", i, "]") : kj::strTree("_offsets[", i, "]");
+    };
+    // Offset passed to getDataField/setDataField. In the compile-time form it is guarded so the
+    // `bounded<>` constant stays in range even for an (unreachable) sentinel field.
+    auto offExpr = [](bool templ, uint i) {
+      return templ
+          ? kj::strTree("::capnp::bounded<(offsets_[", i, "] == 0xffffffffu ? 0u : offsets_[", i,
+                        "])>()")
+          : kj::strTree("::capnp::bounded(_offsets[", i, "])");
+    };
     auto readerGetters = [&](bool templ) {
       return kj::strTree(KJ_MAP(field, fields) {
         uint i = field.getIndex();
         CppTypeName type = typeName(field.getType(), nullptr);
         auto title = toTitleCase(protoName(field.getProto()));
-        auto off = templ ? kj::strTree("::capnp::bounded<offsets_[", i, "]>()")
-                         : kj::strTree("::capnp::bounded(_offsets[", i, "])");
         return kj::strTree(
             "    inline ", type, " get", title, "() const {\n"
-            "      return _reader.getDataField<", type, ">(", kj::mv(off), " * ::capnp::ELEMENTS);\n"
+            "      return ", slotExpr(templ, i), " == 0xffffffffu ? ", type, "()\n"
+            "          : _reader.getDataField<", type, ">(",
+                    offExpr(templ, i), " * ::capnp::ELEMENTS);\n"
             "    }\n");
       });
     };
@@ -2827,16 +2848,22 @@ private:
         uint i = field.getIndex();
         CppTypeName type = typeName(field.getType(), nullptr);
         auto title = toTitleCase(protoName(field.getProto()));
-        auto offG = templ ? kj::strTree("::capnp::bounded<offsets_[", i, "]>()")
-                          : kj::strTree("::capnp::bounded(_offsets[", i, "])");
-        auto offS = templ ? kj::strTree("::capnp::bounded<offsets_[", i, "]>()")
-                          : kj::strTree("::capnp::bounded(_offsets[", i, "])");
+        kj::StringPtr fieldName = protoName(field.getProto());
+        auto guard = templ
+            ? kj::strTree("      static_assert(offsets_[", i, "] != 0xffffffffu,\n"
+                          "          \"field '", fieldName, "' is not mapped at this use site\");\n")
+            : kj::strTree("      KJ_REQUIRE(_offsets[", i, "] != 0xffffffffu,\n"
+                          "          \"field '", fieldName, "' is not mapped at this use site\");\n");
         return kj::strTree(
             "    inline ", type, " get", title, "() {\n"
-            "      return _builder.getDataField<", type, ">(", kj::mv(offG), " * ::capnp::ELEMENTS);\n"
+            "      return ", slotExpr(templ, i), " == 0xffffffffu ? ", type, "()\n"
+            "          : _builder.getDataField<", type, ">(",
+                    offExpr(templ, i), " * ::capnp::ELEMENTS);\n"
             "    }\n"
-            "    inline void set", title, "(", type, " value) {\n"
-            "      _builder.setDataField<", type, ">(", kj::mv(offS), " * ::capnp::ELEMENTS, value);\n"
+            "    inline void set", title, "(", type, " value) {\n",
+            kj::mv(guard),
+            "      _builder.setDataField<", type, ">(",
+                offExpr(templ, i), " * ::capnp::ELEMENTS, value);\n"
             "    }\n");
       });
     };
@@ -2865,7 +2892,7 @@ private:
         "    ::capnp::_::StructBuilder _builder;\n"
         "    const ::uint16_t* _offsets = nullptr;\n"
         "  };\n"
-        "  template <::uint16_t... capnpOffsets_>\n"
+        "  template <::uint32_t... capnpOffsets_>\n"
         "  class Reader {\n"
         "  public:\n"
         "    Reader() = default;\n"
@@ -2873,10 +2900,10 @@ private:
         readerGetters(true),
         "    inline AnyReader asAny() const { return AnyReader(_reader, offsets_); }\n"
         "  private:\n"
-        "    static constexpr ::uint16_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
+        "    static constexpr ::uint32_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
         "    ::capnp::_::StructReader _reader;\n"
         "  };\n"
-        "  template <::uint16_t... capnpOffsets_>\n"
+        "  template <::uint32_t... capnpOffsets_>\n"
         "  class Builder {\n"
         "  public:\n"
         "    Builder() = default;\n"
@@ -2887,7 +2914,7 @@ private:
         "    }\n"
         "    inline AnyBuilder asAny() { return AnyBuilder(_builder, offsets_); }\n"
         "  private:\n"
-        "    static constexpr ::uint16_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
+        "    static constexpr ::uint32_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
         "    ::capnp::_::StructBuilder _builder;\n"
         "  };\n"
         "};\n");
@@ -2895,11 +2922,11 @@ private:
     // The two `offsets_` arrays are ODR-used by asAny() (their address is taken), so class
     // templates need an out-of-line definition; template statics may live in the header.
     auto outOfLine = kj::strTree(
-        "template <::uint16_t... capnpOffsets_>\n"
-        "constexpr ::uint16_t ", scope, name,
+        "template <::uint32_t... capnpOffsets_>\n"
+        "constexpr ::uint32_t ", scope, name,
             "::Reader<capnpOffsets_...>::offsets_[sizeof...(capnpOffsets_)];\n"
-        "template <::uint16_t... capnpOffsets_>\n"
-        "constexpr ::uint16_t ", scope, name,
+        "template <::uint32_t... capnpOffsets_>\n"
+        "constexpr ::uint32_t ", scope, name,
             "::Builder<capnpOffsets_...>::offsets_[sizeof...(capnpOffsets_)];\n");
 
     if (scope.size() == 0) {
@@ -3335,6 +3362,7 @@ private:
           "#pragma once\n"
           "\n"
           "#include <capnp/generated-header-support.h>\n"
+          "#include <kj/debug.h>\n"  // for KJ_REQUIRE in inline-newtype-wrapper runtime accessors
           "#include <kj/windows-sanity.h>\n",  // work-around macro conflict with VOID
           hasInterfaces ? kj::strTree(
             "#if !CAPNP_LITE\n"
