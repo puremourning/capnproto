@@ -1849,6 +1849,28 @@ public:
     hadErrors_ = true;
   }
 
+  void addWarning(const kj::ReadableDirectory& directory, kj::PathPtr path,
+                  SourcePos start, SourcePos end,
+                  kj::StringPtr message) override {
+    auto file = getDisplayName(directory, path);
+
+    kj::String wholeMessage;
+    if (end.line == start.line) {
+      if (end.column == start.column) {
+        wholeMessage = kj::str(file, ":", start.line + 1, ":", start.column + 1,
+                               ": warning: ", message, "\n");
+      } else {
+        wholeMessage = kj::str(file, ":", start.line + 1, ":", start.column + 1,
+                               "-", end.column + 1, ": warning: ", message, "\n");
+      }
+    } else {
+      wholeMessage = kj::str(file, ":", start.line + 1, ": warning: ", message, "\n");
+    }
+
+    // Deliberately does not set hadErrors_: warnings don't fail the build or inhibit codegen.
+    context.warning(wholeMessage);
+  }
+
   bool hadErrors() override {
     return hadErrors_;
   }
