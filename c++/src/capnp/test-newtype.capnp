@@ -52,6 +52,15 @@ type Named = group {                 # Text/Data pointer fields (mixed with a da
   count @1 :Int32;
 }
 
+struct Coord { lat @0 :Float64; lng @1 :Float64; }
+
+type Boxed = group {                 # struct + list + text + data fields
+  at @0 :Coord;
+  tags @1 :List(Int32);
+  note @2 :Text;
+  id @3 :Int32;
+}
+
 type OrderPrices = group {           # newtype built from other newtypes -> nested wrapper
   limit @[0-1] :Price;
   stop @[2-3] :Price;
@@ -67,4 +76,5 @@ struct Shapes {
   priced @[14, 15] :Priced;          # explicit-default field, complete mapping
   pricedPartial @[16] :Priced;       # incomplete: scale unmapped -> reads its explicit default
   named @[17, 18] :Named;            # Text pointer field + data field
+  boxed @[19, 20, 21, 22] :Boxed;    # struct + list + text + data fields
 }
