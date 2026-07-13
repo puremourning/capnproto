@@ -66,6 +66,12 @@ type OrderPrices = group {           # newtype built from other newtypes -> nest
   stop @[2-3] :Price;
 }
 
+type OrderType = union {             # union newtype -> wrapper with which()/isX()/getX()
+  limit @[0-1] :Price;               # group arm (nested newtype)
+  market @2 :Void;                   # void arm
+  cancel @3 :Int32;                  # data arm
+}
+
 struct Shapes {
   id @0 :Uuid;
   age @1 :Age;
@@ -77,4 +83,5 @@ struct Shapes {
   pricedPartial @[16] :Priced;       # incomplete: scale unmapped -> reads its explicit default
   named @[17, 18] :Named;            # Text pointer field + data field
   boxed @[19, 20, 21, 22] :Boxed;    # struct + list + text + data fields
+  order @[23, 24, 25, 26] :OrderType;  # union newtype
 }
