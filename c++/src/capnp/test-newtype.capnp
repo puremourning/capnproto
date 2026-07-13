@@ -47,6 +47,11 @@ type Priced = group {                # a field with an explicit default
   scale @1 :UInt16 = 100;
 }
 
+type Named = group {                 # Text/Data pointer fields (mixed with a data field)
+  label @0 :Text;
+  count @1 :Int32;
+}
+
 type OrderPrices = group {           # newtype built from other newtypes -> nested wrapper
   limit @[0-1] :Price;
   stop @[2-3] :Price;
@@ -61,4 +66,5 @@ struct Shapes {
   prices @[10, 11, 12, 13] :OrderPrices;
   priced @[14, 15] :Priced;          # explicit-default field, complete mapping
   pricedPartial @[16] :Priced;       # incomplete: scale unmapped -> reads its explicit default
+  named @[17, 18] :Named;            # Text pointer field + data field
 }

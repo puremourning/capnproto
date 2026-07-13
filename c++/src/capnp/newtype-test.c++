@@ -105,6 +105,19 @@ TEST(Newtype, ExplicitDefaults) {
   EXPECT_EQ(9, shapes.asReader().getPriced().getScale());
 }
 
+TEST(Newtype, PointerFields) {
+  // A group newtype with Text/Data pointer fields gets wrapper accessors (get/set/init/has).
+  ::capnp::MallocMessageBuilder message;
+  auto shapes = message.initRoot<Shapes>();
+  auto named = shapes.getNamed();
+  named.setLabel("widget");
+  named.setCount(5);
+  auto r = shapes.asReader().getNamed();
+  EXPECT_TRUE(r.getLabel() == "widget");
+  EXPECT_TRUE(r.hasLabel());
+  EXPECT_EQ(5, r.getCount());
+}
+
 TEST(Newtype, AnyReaderErasure) {
   // asAny() erases the templated wrapper to one concrete AnyReader that composes across use sites.
   ::capnp::MallocMessageBuilder message;
