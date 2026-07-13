@@ -164,6 +164,37 @@ TEST(Newtype, AnyReaderErasure) {
   EXPECT_EQ(100, pricesAny.getLimit().getValue());
 }
 
+TEST(Newtype, UnionWrapper) {
+  // A union newtype gets an offset-parametrized wrapper with which()/isX()/getX(); arms include a
+  // nested group newtype (limit -> Price), a void arm (market) and a data arm (cancel).
+  ::capnp::MallocMessageBuilder message;
+  auto shapes = message.initRoot<Shapes>();
+  auto order = shapes.getOrder();               // OrderType::Builder<...>
+
+  auto limit = order.initLimit();               // selects LIMIT arm, returns Price::Builder<...>
+  limit.setValue(100);
+  limit.setScale(2);
+  {
+    auto r = shapes.asReader().getOrder();
+    EXPECT_EQ(OrderType::LIMIT, r.which());
+    EXPECT_TRUE(r.isLimit());
+    EXPECT_EQ(100, r.getLimit().getValue());    // getLimit() -> Price wrapper
+    EXPECT_EQ(2, r.getLimit().getScale());
+  }
+
+  order.setCancel(7);                           // switch to the CANCEL data arm
+  {
+    auto r = shapes.asReader().getOrder();
+    EXPECT_EQ(OrderType::CANCEL, r.which());
+    EXPECT_TRUE(r.isCancel());
+    EXPECT_FALSE(r.isLimit());
+    EXPECT_EQ(7, r.getCancel());
+  }
+
+  order.setMarket(::capnp::VOID);               // switch to the MARKET void arm
+  EXPECT_EQ(OrderType::MARKET, shapes.asReader().getOrder().which());
+}
+
 }  // namespace
 }  // namespace newtype
 }  // namespace capnp
