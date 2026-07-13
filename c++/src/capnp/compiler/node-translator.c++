@@ -1347,6 +1347,81 @@ private:
     traverseTopOrGroup(members, parent, layout);
   }
 
+  kj::Maybe<StructSchema> resolveStampSchema(uint64_t id) {
+    // Resolve a template / nested-group node (both are auxiliary nodes) to its StructSchema.
+    auto emptyBrand = translator.orphanage.newOrphan<schema::Brand>();
+    KJ_IF_MAYBE(s, translator.resolver.resolveBootstrapSchema(id, emptyBrand.getReader())) {
+      if (s->getProto().isStruct()) return s->asStruct();
+    }
+    return nullptr;
+  }
+
+  uint countTemplateLeaves(StructSchema tmplStruct) {
+    // Number of leaf (slot) fields in the template tree -- how many parent ordinals an `@[...]`
+    // must supply to fully map it.
+    uint n = 0;
+    for (auto f: tmplStruct.getFields()) {
+      if (f.getProto().isSlot()) {
+        n += 1;
+      } else KJ_IF_MAYBE(sub, resolveStampSchema(f.getProto().getGroup().getTypeId())) {
+        n += countTemplateLeaves(*sub);
+      }
+    }
+    return n;
+  }
+
+  void stampTemplateFields(StructSchema tmplStruct, MemberInfo& groupMember,
+                           StructLayout::StructOrGroup& layout,
+                           kj::ArrayPtr<const uint> ordinals, uint& ordinalIndex,
+                           Declaration::Reader member) {
+    // Structurally copy a (fully-resolved) template into `groupMember`: allocate each leaf's
+    // remapped ordinal from `ordinals` in tree order, and recreate nested groups/unions. Called
+    // recursively for nested groups, so an inline newtype built from other inline newtypes (which
+    // were already inlined into this template at definition time) stamps in one flat pass.
+    bool isUnion = tmplStruct.getProto().getStruct().getDiscriminantCount() > 0;
+    StructLayout::Union* unionLayout = nullptr;
+    if (isUnion) {
+      unionLayout = &arena.allocate<StructLayout::Union>(layout);
+      groupMember.unionScope = unionLayout;
+    }
+    uint codeOrder = 0;
+    for (auto tf: tmplStruct.getFields()) {
+      auto tfProto = tf.getProto();
+      if (tfProto.isSlot()) {
+        if (ordinalIndex >= ordinals.size()) continue;  // unmapped suffix (incomplete mapping)
+        groupMember.childCount++;
+        uint ord = ordinals[ordinalIndex++];
+        StructLayout::StructOrGroup* leafScope = &layout;
+        if (isUnion) leafScope = &arena.allocate<StructLayout::Group>(*unionLayout);
+        auto& leaf = arena.allocate<MemberInfo>(
+            groupMember, codeOrder++, tfProto.getName(),
+            tfProto, ord, *leafScope, member.getStartByte(), member.getEndByte());
+        leaf.isInUnion = isUnion;
+        allMembers.add(&leaf);
+        membersByOrdinal.insert(std::make_pair(ord, &leaf));
+      } else {
+        // Nested group: recreate it (a discriminated member if we're in a union) and recurse.
+        groupMember.childCount++;
+        auto& subMember = arena.allocate<MemberInfo>(
+            groupMember, codeOrder++, tfProto.getName(),
+            newGroupNode(groupMember.node, tfProto.getName()),
+            member.getStartByte(), member.getEndByte(), tfProto.getTypeId());
+        subMember.isInUnion = isUnion;
+        allMembers.add(&subMember);
+        KJ_IF_MAYBE(sub, resolveStampSchema(tfProto.getGroup().getTypeId())) {
+          if (isUnion) {
+            // A group that is itself a union member gets its own slot of the union's space.
+            StructLayout::Group& subScope = arena.allocate<StructLayout::Group>(*unionLayout);
+            stampTemplateFields(*sub, subMember, subScope, ordinals, ordinalIndex, member);
+          } else {
+            // A group nested in a struct/group: its fields take fresh offsets in the same layout.
+            stampTemplateFields(*sub, subMember, layout, ordinals, ordinalIndex, member);
+          }
+        }
+      }
+    }
+  }
+
   void stampInlineNewtype(Declaration::Reader member, MemberInfo& parent, uint& codeOrder,
                           StructLayout::StructOrGroup& layout, bool groupIsInUnion = false) {
     // Resolve the field's type; it must be an inline `type ... = group {...}` newtype, which
@@ -1356,7 +1431,7 @@ private:
     // `limit @[0-1] :Price` inside a union): the minted group becomes a discriminated member,
     // and `layout` should be its singleton group within the enclosing union.
     uint64_t newtypeId = 0;
-    kj::Maybe<schema::Node::Reader> templateNode;
+    kj::Maybe<StructSchema> templateStruct;
     auto brandOrphan = translator.orphanage.newOrphan<schema::Brand>();
     KJ_IF_MAYBE(decl, translator.compileDeclExpression(
         member.getField().getType(), ImplicitParams::none())) {
@@ -1376,7 +1451,7 @@ private:
               KJ_IF_MAYBE(tmpl, translator.resolver.resolveBootstrapSchema(
                   templateId, emptyBrand.getReader())) {
                 if (tmpl->getProto().isStruct()) {
-                  templateNode = tmpl->getProto();
+                  templateStruct = tmpl->asStruct();
                 }
               }
             }
@@ -1385,10 +1460,9 @@ private:
       }
     }
 
-    KJ_IF_MAYBE(tmpl, templateNode) {
-      auto templateStruct = tmpl->getStruct();
-      auto templateFields = templateStruct.getFields();
-      bool isUnion = templateStruct.getDiscriminantCount() > 0;
+    KJ_IF_MAYBE(tmpl, templateStruct) {
+      // Number of leaf slots across the whole template tree -- what `@[...]` must map.
+      uint leafCount = countTemplateLeaves(*tmpl);
 
       // Flatten the `@[...]` mapping into a list of parent ordinals, in declaration order.
       kj::Vector<uint> ordinals;
@@ -1398,24 +1472,21 @@ private:
         }
       }
 
-      if (ordinals.size() > templateFields.size()) {
+      if (ordinals.size() > leafCount) {
         errorReporter.addErrorOn(member, kj::str(
             "This '@[...]' maps ", ordinals.size(), " ordinals, but the type has only ",
-            templateFields.size(), " field(s)."));
-      } else if (ordinals.size() < templateFields.size()) {
+            leafCount, " field(s)."));
+      } else if (ordinals.size() < leafCount) {
         // An incomplete mapping leaves a suffix of the type's fields unmapped. This is allowed
         // (it mirrors extending the inlined type later): the unmapped fields read as their
         // default value and cannot be set here. Warn so the omission isn't silent.
         errorReporter.addWarningOn(member, kj::str(
             "This '@[...]' maps ", ordinals.size(), " ordinal(s), but the type has ",
-            templateFields.size(), " field(s). The trailing ",
-            templateFields.size() - ordinals.size(),
+            leafCount, " field(s). The trailing ", leafCount - ordinals.size(),
             " field(s) are unmapped here: they read as their default value and cannot be set."));
       }
 
       // Mint a group node + group MemberInfo for the field; the group field has no ordinal.
-      // (A named union is a group containing an unnamed union, so a union newtype is a group
-      // field with a union scope.)
       auto& groupMember = arena.allocate<MemberInfo>(
           parent, codeOrder++, member.getName().getValue(),
           newGroupNode(parent.node, member.getName().getValue()),
@@ -1423,37 +1494,11 @@ private:
       groupMember.isInUnion = groupIsInUnion;
       allMembers.add(&groupMember);
 
-      StructLayout::Union* unionLayout = nullptr;
-      if (isUnion) {
-        unionLayout = &arena.allocate<StructLayout::Union>(layout);
-        groupMember.unionScope = unionLayout;
-      }
-
-      // Stamp each template field as a leaf, remapping its ordinal into the parent's space. For
-      // a group the leaves share the parent layout (fresh offsets); for a union each leaf gets
-      // its own group within the union scope (overlapping offsets) plus a discriminant value.
-      uint n = kj::min(ordinals.size(), templateFields.size());
-      for (uint i = 0; i < n; i++) {
-        auto templateField = templateFields[i];
-        if (!templateField.isSlot()) {
-          errorReporter.addErrorOn(member,
-              "Stamping inline newtypes whose templates contain nested groups/unions is not yet "
-              "supported.");
-          continue;
-        }
-        groupMember.childCount++;
-        StructLayout::StructOrGroup* leafScope = &layout;
-        if (isUnion) {
-          leafScope = &arena.allocate<StructLayout::Group>(*unionLayout);
-        }
-        auto& leaf = arena.allocate<MemberInfo>(
-            groupMember, i, templateField.getName(),
-            templateField, ordinals[i],
-            *leafScope, member.getStartByte(), member.getEndByte());
-        leaf.isInUnion = isUnion;
-        allMembers.add(&leaf);
-        membersByOrdinal.insert(std::make_pair(ordinals[i], &leaf));
-      }
+      // Recursively copy the (already fully-resolved) template tree into the group, drawing each
+      // leaf's remapped ordinal from `@[...]` in tree order and recreating nested groups/unions
+      // (which carry their own newtype identity via Field.typeId).
+      uint ordinalIndex = 0;
+      stampTemplateFields(*tmpl, groupMember, layout, ordinals.asPtr(), ordinalIndex, member);
     } else {
       errorReporter.addErrorOn(member,
           "A '@[...]' ordinal mapping requires a field whose type is an inline "

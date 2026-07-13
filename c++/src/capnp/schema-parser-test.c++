@@ -413,6 +413,47 @@ TEST(SchemaParser, NestedNewtypeUnionMember) {
   EXPECT_EQ("scale", limitGroup.getFields()[1].getProto().getName());
 }
 
+TEST(SchemaParser, RecursiveNestedNewtypeStamp) {
+  // A group newtype built from other group newtypes stamps recursively, preserving each level's
+  // newtype identity (Field.typeId): `prices` is an OrderPrices whose `limit`/`stop` are each a
+  // Price of value/scale.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("rec.capnp",
+      "@0x8123456789abce08;\n"
+      "type Price = group { value @0 :Int64; scale @1 :UInt16; }\n"
+      "type OrderPrices = group { limit @[0, 1] :Price; stop @[2, 3] :Price; }\n"
+      "struct Order { prices @[0, 1, 2, 3] :OrderPrices; }\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("rec.capnp", "rec.capnp", nullptr);
+  uint64_t priceId = fileSchema.getNested("Price").getProto().getId();
+  uint64_t orderPricesId = fileSchema.getNested("OrderPrices").getProto().getId();
+  auto order = fileSchema.getNested("Order").asStruct();
+
+  auto byId = [&](uint64_t id) -> Schema {
+    for (auto s: parser.getAllLoaded()) {
+      if (s.getProto().getId() == id) return s;
+    }
+    KJ_FAIL_REQUIRE("schema not loaded", id);
+  };
+
+  auto prices = order.getFieldByName("prices").getProto();
+  EXPECT_TRUE(prices.isGroup());
+  EXPECT_EQ(orderPricesId, prices.getTypeId());          // prices is an OrderPrices
+
+  auto pricesGroup = byId(prices.getGroup().getTypeId()).asStruct();
+  auto limit = pricesGroup.getFieldByName("limit").getProto();
+  EXPECT_TRUE(limit.isGroup());
+  EXPECT_EQ(priceId, limit.getTypeId());                 // ...whose limit is a Price
+
+  auto limitGroup = byId(limit.getGroup().getTypeId()).asStruct();
+  ASSERT_EQ(2u, limitGroup.getFields().size());          // ...of value + scale
+  EXPECT_EQ("value", limitGroup.getFields()[0].getProto().getName());
+  EXPECT_TRUE(limitGroup.getFields()[0].getProto().isSlot());
+}
+
 TEST(SchemaParser, Constants) {
   // This is actually a test of the full dynamic API stack for constants, because the schemas for
   // constants are not actually accessible from the generated code API, so the only way to ever
