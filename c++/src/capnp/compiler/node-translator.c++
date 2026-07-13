@@ -1275,10 +1275,17 @@ private:
           // For layout purposes, pretend this field is enclosed in a one-member group.
           StructLayout::Group& singletonGroup =
               arena.allocate<StructLayout::Group>(layout);
-          memberInfo = &arena.allocate<MemberInfo>(parent, codeOrder++, member, singletonGroup,
-                                                   true);
-          allMembers.add(memberInfo);
-          ordinal = member.getId().getOrdinal().getValue();
+          if (member.getId().isOrdinalRanges()) {
+            // A union member that stamps an inline newtype, e.g. `limit @[0-1] :Price`. The
+            // minted group becomes the discriminated member; its leaves live in the singleton
+            // group (this union member's slot of the enclosing union's space).
+            stampInlineNewtype(member, parent, codeOrder, singletonGroup, /*groupIsInUnion=*/true);
+          } else {
+            memberInfo = &arena.allocate<MemberInfo>(parent, codeOrder++, member, singletonGroup,
+                                                     true);
+            allMembers.add(memberInfo);
+            ordinal = member.getId().getOrdinal().getValue();
+          }
           break;
         }
 
@@ -1341,9 +1348,13 @@ private:
   }
 
   void stampInlineNewtype(Declaration::Reader member, MemberInfo& parent, uint& codeOrder,
-                          StructLayout::StructOrGroup& layout) {
+                          StructLayout::StructOrGroup& layout, bool groupIsInUnion = false) {
     // Resolve the field's type; it must be an inline `type ... = group {...}` newtype, which
     // compiles to a struct node -- the "template" whose fields we stamp into the parent.
+    //
+    // `groupIsInUnion` is set when the stamped field is itself a union member (e.g.
+    // `limit @[0-1] :Price` inside a union): the minted group becomes a discriminated member,
+    // and `layout` should be its singleton group within the enclosing union.
     uint64_t newtypeId = 0;
     kj::Maybe<schema::Node::Reader> templateNode;
     auto brandOrphan = translator.orphanage.newOrphan<schema::Brand>();
@@ -1409,6 +1420,7 @@ private:
           parent, codeOrder++, member.getName().getValue(),
           newGroupNode(parent.node, member.getName().getValue()),
           member.getStartByte(), member.getEndByte(), newtypeId);
+      groupMember.isInUnion = groupIsInUnion;
       allMembers.add(&groupMember);
 
       StructLayout::Union* unionLayout = nullptr;
