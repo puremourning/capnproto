@@ -132,3 +132,9 @@ $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -ofoo $TESTDATA/error
 # but must warn about the unmapped trailing field(s) and still compile successfully (exit 0).
 INCOMPLETE_WARN=$($CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/incomplete-mapping.capnp.nobuild 2>&1 >/dev/null) || fail "incomplete mapping should compile"
 echo "$INCOMPLETE_WARN" | grep -q "warning: .*unmapped" || fail "incomplete mapping should warn about unmapped fields"
+
+# Over-mapping (more ordinals than the inline newtype has fields) is a clean error.
+$CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-over-mapping.capnp.nobuild 2>&1 | grep -q "maps 4 ordinals, but the type has only 3" || fail "over-mapping should error"
+
+# Under-mapping a union below two members is a clean error, NOT an internal validation assert.
+$CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-union-undermap.capnp.nobuild 2>&1 | grep -q "union needs at least two" || fail "union under-mapping should error cleanly"
