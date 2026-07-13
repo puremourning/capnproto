@@ -1214,16 +1214,12 @@ private:
           auto group = field.getType().asStruct();
           auto typeNode = schemaLoader.getUnbound(proto.getTypeId()).getProto();
           auto tmpl = schemaLoader.getUnbound(typeNode.getType().getStruct().getTypeId()).asStruct();
-          // One offset per template field, in template order. A field absent from this instance's
-          // group node was left unmapped by an incomplete `@[...]`; emit the sentinel so the
-          // wrapper reads it as a default (and rejects writes) rather than crashing.
-          kj::String offsets = kj::strArray(KJ_MAP(tf, tmpl.getFields()) {
-            KJ_IF_MAYBE(f, group.findFieldByName(tf.getProto().getName())) {
-              return kj::str(f->getProto().getSlot().getOffset());
-            } else {
-              return kj::str("0xffffffffu");
-            }
-          }, ", ");
+          // One offset per template leaf, in tree order (recursing through nested newtype groups),
+          // matched against this instance's stamped group; a leaf absent from it was left unmapped
+          // by an incomplete `@[...]` and gets the sentinel.
+          kj::Vector<kj::String> offsetList(countWrapperLeaves(tmpl));
+          collectLeafOffsets(tmpl, group, offsetList);
+          kj::String offsets = kj::strArray(offsetList, ", ");
           kj::String wrapName = kj::str(cppFullName(
               schemaLoader.getUnbound(proto.getTypeId()), nullptr));
           kj::String readerType = kj::str(wrapName, "::Reader<", offsets, ">");
@@ -2786,9 +2782,10 @@ private:
 
   bool hasInlineNewtypeWrapper(uint64_t typeId) {
     // True if `typeId` names a group newtype we can emit an offset-parametrized wrapper for: a
-    // `type` node whose template is a plain group (no discriminant) of primitive data fields with
-    // no explicit defaults. Unions, pointer fields and defaulted fields fall back to the naive
-    // (wire-correct) per-use-site group.
+    // `type` node whose template is a plain group (no discriminant) whose fields are each either
+    // a primitive, non-defaulted slot, or a nested group that is itself a wrapper-able newtype
+    // (so wrappers nest -- `OrderPrices`'s `limit`/`stop` become `Price` wrappers). Unions,
+    // pointer fields, defaulted fields and anonymous groups fall back to the naive group.
     if (typeId == 0) return false;
     auto node = schemaLoader.getUnbound(typeId).getProto();
     if (!node.isType()) return false;
@@ -2799,11 +2796,49 @@ private:
     auto s = tmpl.getStruct();
     if (s.getDiscriminantCount() != 0) return false;
     for (auto f: s.getFields()) {
-      if (!f.isSlot()) return false;
-      if (!isPrimitiveDataType(f.getSlot().getType())) return false;
-      if (f.getSlot().getHadExplicitDefault()) return false;
+      if (f.isSlot()) {
+        if (!isPrimitiveDataType(f.getSlot().getType())) return false;
+        if (f.getSlot().getHadExplicitDefault()) return false;
+      } else if (f.isGroup()) {
+        if (!hasInlineNewtypeWrapper(f.getTypeId())) return false;
+      } else {
+        return false;
+      }
     }
     return true;
+  }
+
+  uint countWrapperLeaves(StructSchema tmpl) {
+    // Number of leaf (slot) fields in the wrapper template tree -- the wrapper is parametrized on
+    // one offset per leaf, in tree order.
+    uint n = 0;
+    for (auto f: tmpl.getFields()) {
+      if (f.getProto().isSlot()) n += 1;
+      else n += countWrapperLeaves(f.getType().asStruct());
+    }
+    return n;
+  }
+
+  void collectLeafOffsets(StructSchema tmpl, kj::Maybe<StructSchema> inst,
+                          kj::Vector<kj::String>& out) {
+    // Flatten this use site's leaf offsets in template tree order, to instantiate the wrapper.
+    // `inst` is the matching subtree of the stamped group; a field missing from it was left
+    // unmapped by an incomplete `@[...]` and gets the sentinel.
+    for (auto tf: tmpl.getFields()) {
+      kj::Maybe<StructSchema::Field> instField;
+      KJ_IF_MAYBE(i, inst) { instField = i->findFieldByName(tf.getProto().getName()); }
+      if (tf.getProto().isSlot()) {
+        KJ_IF_MAYBE(f, instField) {
+          out.add(kj::str(f->getProto().getSlot().getOffset()));
+        } else {
+          out.add(kj::str("0xffffffffu"));
+        }
+      } else {
+        kj::Maybe<StructSchema> subInst;
+        KJ_IF_MAYBE(f, instField) { subInst = f->getType().asStruct(); }
+        collectLeafOffsets(tf.getType().asStruct(), subInst, out);
+      }
+    }
   }
 
   NodeText makeInlineNewtypeWrapper(kj::StringPtr scope, kj::StringPtr name, StructSchema tmpl) {
@@ -2830,42 +2865,93 @@ private:
                         "])>()")
           : kj::strTree("::capnp::bounded(_offsets[", i, "])");
     };
+    // A nested-newtype group field consumes `count` consecutive leaf offsets; its accessor hands
+    // that slice to the nested wrapper. `offsets_[start..start+count-1]` for the compile-time form.
+    auto sliceArgs = [](uint start, uint count) {
+      kj::Vector<kj::String> parts(count);
+      for (uint k = 0; k < count; k++) parts.add(kj::str("offsets_[", start + k, "]"));
+      return kj::strArray(parts, ", ");
+    };
     auto readerGetters = [&](bool templ) {
-      return kj::strTree(KJ_MAP(field, fields) {
-        uint i = field.getIndex();
-        CppTypeName type = typeName(field.getType(), nullptr);
-        auto title = toTitleCase(protoName(field.getProto()));
-        return kj::strTree(
-            "    inline ", type, " get", title, "() const {\n"
-            "      return ", slotExpr(templ, i), " == 0xffffffffu ? ", type, "()\n"
-            "          : _reader.getDataField<", type, ">(",
-                    offExpr(templ, i), " * ::capnp::ELEMENTS);\n"
-            "    }\n");
-      });
+      kj::Vector<kj::StringTree> out(fields.size());
+      uint leafIdx = 0;
+      for (auto field: fields) {
+        auto fp = field.getProto();
+        auto title = toTitleCase(protoName(fp));
+        if (fp.isSlot()) {
+          CppTypeName type = typeName(field.getType(), nullptr);
+          out.add(kj::strTree(
+              "    inline ", type, " get", title, "() const {\n"
+              "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", type, "()\n"
+              "          : _reader.getDataField<", type, ">(",
+                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS);\n"
+              "    }\n"));
+          leafIdx += 1;
+        } else {
+          kj::String wrap = kj::str(cppFullName(schemaLoader.getUnbound(fp.getTypeId()), nullptr));
+          uint count = countWrapperLeaves(field.getType().asStruct());
+          if (templ) {
+            kj::String args = sliceArgs(leafIdx, count);
+            out.add(kj::strTree(
+                "    inline ", wrap, "::Reader<", args, "> get", title, "() const {\n"
+                "      return ", wrap, "::Reader<", args, ">(_reader);\n"
+                "    }\n"));
+          } else {
+            out.add(kj::strTree(
+                "    inline ", wrap, "::AnyReader get", title, "() const {\n"
+                "      return ", wrap, "::AnyReader(_reader, _offsets + ", leafIdx, ");\n"
+                "    }\n"));
+          }
+          leafIdx += count;
+        }
+      }
+      return kj::strTree(out.releaseAsArray());
     };
     auto builderAccessors = [&](bool templ) {
-      return kj::strTree(KJ_MAP(field, fields) {
-        uint i = field.getIndex();
-        CppTypeName type = typeName(field.getType(), nullptr);
-        auto title = toTitleCase(protoName(field.getProto()));
-        kj::StringPtr fieldName = protoName(field.getProto());
-        auto guard = templ
-            ? kj::strTree("      static_assert(offsets_[", i, "] != 0xffffffffu,\n"
-                          "          \"field '", fieldName, "' is not mapped at this use site\");\n")
-            : kj::strTree("      KJ_REQUIRE(_offsets[", i, "] != 0xffffffffu,\n"
-                          "          \"field '", fieldName, "' is not mapped at this use site\");\n");
-        return kj::strTree(
-            "    inline ", type, " get", title, "() {\n"
-            "      return ", slotExpr(templ, i), " == 0xffffffffu ? ", type, "()\n"
-            "          : _builder.getDataField<", type, ">(",
-                    offExpr(templ, i), " * ::capnp::ELEMENTS);\n"
-            "    }\n"
-            "    inline void set", title, "(", type, " value) {\n",
-            kj::mv(guard),
-            "      _builder.setDataField<", type, ">(",
-                offExpr(templ, i), " * ::capnp::ELEMENTS, value);\n"
-            "    }\n");
-      });
+      kj::Vector<kj::StringTree> out(fields.size());
+      uint leafIdx = 0;
+      for (auto field: fields) {
+        auto fp = field.getProto();
+        auto title = toTitleCase(protoName(fp));
+        if (fp.isSlot()) {
+          CppTypeName type = typeName(field.getType(), nullptr);
+          kj::StringPtr fieldName = protoName(fp);
+          auto guard = templ
+              ? kj::strTree("      static_assert(offsets_[", leafIdx, "] != 0xffffffffu,\n"
+                    "          \"field '", fieldName, "' is not mapped at this use site\");\n")
+              : kj::strTree("      KJ_REQUIRE(_offsets[", leafIdx, "] != 0xffffffffu,\n"
+                    "          \"field '", fieldName, "' is not mapped at this use site\");\n");
+          out.add(kj::strTree(
+              "    inline ", type, " get", title, "() {\n"
+              "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", type, "()\n"
+              "          : _builder.getDataField<", type, ">(",
+                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS);\n"
+              "    }\n"
+              "    inline void set", title, "(", type, " value) {\n",
+              kj::mv(guard),
+              "      _builder.setDataField<", type, ">(",
+                  offExpr(templ, leafIdx), " * ::capnp::ELEMENTS, value);\n"
+              "    }\n"));
+          leafIdx += 1;
+        } else {
+          kj::String wrap = kj::str(cppFullName(schemaLoader.getUnbound(fp.getTypeId()), nullptr));
+          uint count = countWrapperLeaves(field.getType().asStruct());
+          if (templ) {
+            kj::String args = sliceArgs(leafIdx, count);
+            out.add(kj::strTree(
+                "    inline ", wrap, "::Builder<", args, "> get", title, "() {\n"
+                "      return ", wrap, "::Builder<", args, ">(_builder);\n"
+                "    }\n"));
+          } else {
+            out.add(kj::strTree(
+                "    inline ", wrap, "::AnyBuilder get", title, "() {\n"
+                "      return ", wrap, "::AnyBuilder(_builder, _offsets + ", leafIdx, ");\n"
+                "    }\n"));
+          }
+          leafIdx += count;
+        }
+      }
+      return kj::strTree(out.releaseAsArray());
     };
 
     auto body = kj::strTree(
@@ -2894,17 +2980,19 @@ private:
         "  };\n"
         "  template <::uint32_t... capnpOffsets_>\n"
         "  class Reader {\n"
+        // offsets_ is declared first so nested-group getters can name it in their return type.
+        "    static constexpr ::uint32_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
         "  public:\n"
         "    Reader() = default;\n"
         "    explicit Reader(::capnp::_::StructReader reader): _reader(reader) {}\n",
         readerGetters(true),
         "    inline AnyReader asAny() const { return AnyReader(_reader, offsets_); }\n"
         "  private:\n"
-        "    static constexpr ::uint32_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
         "    ::capnp::_::StructReader _reader;\n"
         "  };\n"
         "  template <::uint32_t... capnpOffsets_>\n"
         "  class Builder {\n"
+        "    static constexpr ::uint32_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
         "  public:\n"
         "    Builder() = default;\n"
         "    explicit Builder(::capnp::_::StructBuilder builder): _builder(builder) {}\n",
@@ -2914,7 +3002,6 @@ private:
         "    }\n"
         "    inline AnyBuilder asAny() { return AnyBuilder(_builder, offsets_); }\n"
         "  private:\n"
-        "    static constexpr ::uint32_t offsets_[sizeof...(capnpOffsets_)] = {capnpOffsets_...};\n"
         "    ::capnp::_::StructBuilder _builder;\n"
         "  };\n"
         "};\n");
