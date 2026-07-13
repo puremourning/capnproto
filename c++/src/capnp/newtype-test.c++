@@ -90,6 +90,21 @@ TEST(Newtype, NestedWrapperRoundTrip) {
   EXPECT_EQ(5, rp.getStop().getScale());
 }
 
+TEST(Newtype, ExplicitDefaults) {
+  // `Priced.scale` has an explicit default of 100. An unset-but-mapped scale reads it (via the
+  // load mask), an unmapped scale reads it too (via unmask), and setting round-trips.
+  ::capnp::MallocMessageBuilder message;
+  auto shapes = message.initRoot<Shapes>();
+  shapes.getPriced().setAmount(7);            // scale left unset
+  auto r = shapes.asReader();
+  EXPECT_EQ(7, r.getPriced().getAmount());
+  EXPECT_EQ(100, r.getPriced().getScale());          // mapped-but-unset -> default via mask
+  EXPECT_EQ(100, r.getPricedPartial().getScale());   // unmapped -> default via unmask
+
+  shapes.getPriced().setScale(9);
+  EXPECT_EQ(9, shapes.asReader().getPriced().getScale());
+}
+
 TEST(Newtype, AnyReaderErasure) {
   // asAny() erases the templated wrapper to one concrete AnyReader that composes across use sites.
   ::capnp::MallocMessageBuilder message;

@@ -2798,7 +2798,6 @@ private:
     for (auto f: s.getFields()) {
       if (f.isSlot()) {
         if (!isPrimitiveDataType(f.getSlot().getType())) return false;
-        if (f.getSlot().getHadExplicitDefault()) return false;
       } else if (f.isGroup()) {
         if (!hasInlineNewtypeWrapper(f.getTypeId())) return false;
       } else {
@@ -2817,6 +2816,35 @@ private:
       else n += countWrapperLeaves(f.getType().asStruct());
     }
     return n;
+  }
+
+  kj::String wrapperDefaultMask(schema::Type::Reader type, schema::Value::Reader v) {
+    // The default value's bit pattern, passed to getDataField/setDataField so an unset field
+    // reads its default (mirrors the primitive cases in makeFieldText). Empty if the default is
+    // zero. Used both as the get/set mask and, via unmask(0, mask), for the unmapped-leaf read.
+    switch (type.which()) {
+      case schema::Type::BOOL:   return v.getBool()       ? kj::str(v.getBool())          : kj::str();
+      case schema::Type::INT8:   return v.getInt8()   != 0 ? kj::str(v.getInt8())          : kj::str();
+      case schema::Type::INT16:  return v.getInt16()  != 0 ? kj::str(v.getInt16())         : kj::str();
+      case schema::Type::INT32:  return v.getInt32()  != 0 ? kj::str(v.getInt32())         : kj::str();
+      case schema::Type::INT64:  return v.getInt64()  != 0 ? kj::str(v.getInt64(), "ll")   : kj::str();
+      case schema::Type::UINT8:  return v.getUint8()  != 0 ? kj::str(v.getUint8(), "u")    : kj::str();
+      case schema::Type::UINT16: return v.getUint16() != 0 ? kj::str(v.getUint16(), "u")   : kj::str();
+      case schema::Type::UINT32: return v.getUint32() != 0 ? kj::str(v.getUint32(), "u")   : kj::str();
+      case schema::Type::UINT64: return v.getUint64() != 0 ? kj::str(v.getUint64(), "ull") : kj::str();
+      case schema::Type::FLOAT32: {
+        float f = v.getFloat32();
+        if (f == 0) return kj::str();
+        uint32_t m; memcpy(&m, &f, sizeof(m)); return kj::str(m, "u");
+      }
+      case schema::Type::FLOAT64: {
+        double d = v.getFloat64();
+        if (d == 0) return kj::str();
+        uint64_t m; memcpy(&m, &d, sizeof(m)); return kj::str(m, "ull");
+      }
+      case schema::Type::ENUM:   return v.getEnum() != 0 ? kj::str(v.getEnum(), "u") : kj::str();
+      default: return kj::str();
+    }
   }
 
   void collectLeafOffsets(StructSchema tmpl, kj::Maybe<StructSchema> inst,
@@ -2880,11 +2908,15 @@ private:
         auto title = toTitleCase(protoName(fp));
         if (fp.isSlot()) {
           CppTypeName type = typeName(field.getType(), nullptr);
+          kj::String mask = wrapperDefaultMask(fp.getSlot().getType(), fp.getSlot().getDefaultValue());
+          kj::String maskParam = mask.size() > 0 ? kj::str(", ", mask) : kj::str();
+          kj::String dflt = mask.size() > 0
+              ? kj::str("::capnp::_::unmask<", type, ">(0, ", mask, ")") : kj::str(type, "()");
           out.add(kj::strTree(
               "    inline ", type, " get", title, "() const {\n"
-              "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", type, "()\n"
+              "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", dflt, "\n"
               "          : _reader.getDataField<", type, ">(",
-                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS);\n"
+                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS", maskParam, ");\n"
               "    }\n"));
           leafIdx += 1;
         } else {
@@ -2916,6 +2948,10 @@ private:
         if (fp.isSlot()) {
           CppTypeName type = typeName(field.getType(), nullptr);
           kj::StringPtr fieldName = protoName(fp);
+          kj::String mask = wrapperDefaultMask(fp.getSlot().getType(), fp.getSlot().getDefaultValue());
+          kj::String maskParam = mask.size() > 0 ? kj::str(", ", mask) : kj::str();
+          kj::String dflt = mask.size() > 0
+              ? kj::str("::capnp::_::unmask<", type, ">(0, ", mask, ")") : kj::str(type, "()");
           auto guard = templ
               ? kj::strTree("      static_assert(offsets_[", leafIdx, "] != 0xffffffffu,\n"
                     "          \"field '", fieldName, "' is not mapped at this use site\");\n")
@@ -2923,14 +2959,14 @@ private:
                     "          \"field '", fieldName, "' is not mapped at this use site\");\n");
           out.add(kj::strTree(
               "    inline ", type, " get", title, "() {\n"
-              "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", type, "()\n"
+              "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", dflt, "\n"
               "          : _builder.getDataField<", type, ">(",
-                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS);\n"
+                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS", maskParam, ");\n"
               "    }\n"
               "    inline void set", title, "(", type, " value) {\n",
               kj::mv(guard),
               "      _builder.setDataField<", type, ">(",
-                  offExpr(templ, leafIdx), " * ::capnp::ELEMENTS, value);\n"
+                  offExpr(templ, leafIdx), " * ::capnp::ELEMENTS, value", maskParam, ");\n"
               "    }\n"));
           leafIdx += 1;
         } else {
