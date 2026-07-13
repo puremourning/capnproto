@@ -1,0 +1,5 @@
+# Under-mapping a union below its two-member minimum -> clean error (not an internal assert).
+@0xe1000000000f0002;
+type Price = group { value @0 :Int64; scale @1 :UInt16; }
+type OrderPrices = union { limit @[0-1] :Price; stop @[2-3] :Price; }
+struct S { p @[0, 1] :OrderPrices; }

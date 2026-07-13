@@ -229,6 +229,7 @@ if(BUILD_TESTING)
     test.capnp
     test-import.capnp
     test-import2.capnp
+    test-newtype.capnp
     compat/json-test.capnp
   )
 
@@ -264,6 +265,7 @@ if(BUILD_TESTING)
     any-test.c++
     message-test.c++
     encoding-test.c++
+    newtype-test.c++
     orphan-test.c++
     serialize-test.c++
     serialize-packed-test.c++
