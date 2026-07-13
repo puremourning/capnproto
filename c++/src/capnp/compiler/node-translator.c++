@@ -1383,6 +1383,28 @@ private:
     // recursively for nested groups, so an inline newtype built from other inline newtypes (which
     // were already inlined into this template at definition time) stamps in one flat pass.
     bool isUnion = tmplStruct.getProto().getStruct().getDiscriminantCount() > 0;
+    if (isUnion) {
+      // A union needs >= 2 members. An incomplete `@[...]` maps a prefix of the leaves, so it can
+      // drop trailing union members; if it reaches fewer than two, the result would be an invalid
+      // union. Report a clear error and fall back to a plain group (compilation fails anyway) so
+      // the bootstrap schema stays valid instead of tripping an internal validation assert.
+      uint reached = 0;
+      uint pos = ordinalIndex;
+      for (auto tf: tmplStruct.getFields()) {
+        if (pos < ordinals.size()) reached += 1;
+        if (tf.getProto().isSlot()) {
+          pos += 1;
+        } else KJ_IF_SOME(sub, resolveStampSchema(tf.getProto().getGroup().getTypeId())) {
+          pos += countTemplateLeaves(sub);
+        }
+      }
+      if (reached < 2) {
+        errorReporter.addErrorOn(member, kj::str(
+            "This '@[...]' reaches only ", reached, " member(s) of an inline union newtype, but a "
+            "union needs at least two. Map all of the union's fields."));
+        isUnion = false;
+      }
+    }
     StructLayout::Union* unionLayout = nullptr;
     if (isUnion) {
       unionLayout = &arena.allocate<StructLayout::Union>(layout);
