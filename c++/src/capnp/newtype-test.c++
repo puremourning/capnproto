@@ -118,6 +118,34 @@ TEST(Newtype, PointerFields) {
   EXPECT_EQ(5, r.getCount());
 }
 
+TEST(Newtype, StructListPointerFields) {
+  // A group newtype with struct, list, text and data fields -- all wrapped (via out-of-lined
+  // accessor definitions), including init/get/set/has and asAny() erasure.
+  ::capnp::MallocMessageBuilder message;
+  auto shapes = message.initRoot<Shapes>();
+  auto boxed = shapes.getBoxed();
+  auto at = boxed.initAt();                     // struct field
+  at.setLat(51.5);
+  at.setLng(-0.1);
+  auto tags = boxed.initTags(2);                // list field
+  tags.set(0, 10); tags.set(1, 20);
+  boxed.setNote("hello");                       // text field
+  boxed.setId(99);                              // data field
+
+  auto r = shapes.asReader().getBoxed();
+  EXPECT_EQ(51.5, r.getAt().getLat());
+  EXPECT_EQ(-0.1, r.getAt().getLng());
+  EXPECT_EQ(2u, r.getTags().size());
+  EXPECT_EQ(20, r.getTags()[1]);
+  EXPECT_TRUE(r.getNote() == "hello");
+  EXPECT_EQ(99, r.getId());
+  EXPECT_TRUE(r.hasAt() && r.hasTags() && r.hasNote());
+
+  auto any = r.asAny();                          // erased form works for pointer-field wrappers too
+  EXPECT_EQ(99, any.getId());
+  EXPECT_TRUE(any.getNote() == "hello");
+}
+
 TEST(Newtype, AnyReaderErasure) {
   // asAny() erases the templated wrapper to one concrete AnyReader that composes across use sites.
   ::capnp::MallocMessageBuilder message;
