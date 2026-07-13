@@ -2780,6 +2780,21 @@ private:
     }
   }
 
+  bool isWrapperablePointer(schema::Type::Reader t) {
+    // Pointer-section types the wrapper can handle via PointerHelpers. Text/Data are complete
+    // built-in types, so their accessors work in the wrapper's inline methods. Struct and List
+    // return user Reader/Builder types that aren't complete where the wrapper is defined -- they'd
+    // need out-of-lined method definitions -- so they stay on the naive fallback for now.
+    // Interface and AnyPointer are not wrapped.
+    switch (t.which()) {
+      case schema::Type::TEXT:
+      case schema::Type::DATA:
+        return true;
+      default:
+        return false;
+    }
+  }
+
   bool hasInlineNewtypeWrapper(uint64_t typeId) {
     // True if `typeId` names a group newtype we can emit an offset-parametrized wrapper for: a
     // `type` node whose template is a plain group (no discriminant) whose fields are each either
@@ -2797,7 +2812,10 @@ private:
     if (s.getDiscriminantCount() != 0) return false;
     for (auto f: s.getFields()) {
       if (f.isSlot()) {
-        if (!isPrimitiveDataType(f.getSlot().getType())) return false;
+        auto st = f.getSlot().getType();
+        if (!isPrimitiveDataType(st) && !isWrapperablePointer(st)) return false;
+        // Pointer fields with an explicit (non-null) default aren't wrapped yet.
+        if (isWrapperablePointer(st) && f.getSlot().getHadExplicitDefault()) return false;
       } else if (f.isGroup()) {
         if (!hasInlineNewtypeWrapper(f.getTypeId())) return false;
       } else {
@@ -2816,6 +2834,22 @@ private:
       else n += countWrapperLeaves(f.getType().asStruct());
     }
     return n;
+  }
+
+  bool wrapperHasPointerField(StructSchema tmpl) {
+    // Whether the wrapper tree contains a pointer field whose accessor references an
+    // incomplete-at-definition user type (currently none -- struct/list fields aren't wrapper-
+    // eligible; Text/Data are complete built-ins). Kept as the gate that would omit the concrete
+    // AnyReader/AnyBuilder if such a field were ever wrapped inline.
+    for (auto f: tmpl.getFields()) {
+      if (f.getProto().isSlot()) {
+        auto t = f.getProto().getSlot().getType();
+        if (t.isStruct() || t.isList()) return true;
+      } else if (wrapperHasPointerField(f.getType().asStruct())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   kj::String wrapperDefaultMask(schema::Type::Reader type, schema::Value::Reader v) {
@@ -2893,6 +2927,13 @@ private:
                         "])>()")
           : kj::strTree("::capnp::bounded(_offsets[", i, "])");
     };
+    // Same, in POINTERS units, for pointer-section fields (getPointerField).
+    auto ptrOffExpr = [](bool templ, uint i) {
+      return templ
+          ? kj::strTree("::capnp::bounded<(offsets_[", i, "] == 0xffffffffu ? 0u : offsets_[", i,
+                        "])>() * ::capnp::POINTERS")
+          : kj::strTree("::capnp::bounded(_offsets[", i, "]) * ::capnp::POINTERS");
+    };
     // A nested-newtype group field consumes `count` consecutive leaf offsets; its accessor hands
     // that slice to the nested wrapper. `offsets_[start..start+count-1]` for the compile-time form.
     auto sliceArgs = [](uint start, uint count) {
@@ -2906,7 +2947,7 @@ private:
       for (auto field: fields) {
         auto fp = field.getProto();
         auto title = toTitleCase(protoName(fp));
-        if (fp.isSlot()) {
+        if (fp.isSlot() && isPrimitiveDataType(fp.getSlot().getType())) {
           CppTypeName type = typeName(field.getType(), nullptr);
           kj::String mask = wrapperDefaultMask(fp.getSlot().getType(), fp.getSlot().getDefaultValue());
           kj::String maskParam = mask.size() > 0 ? kj::str(", ", mask) : kj::str();
@@ -2917,6 +2958,21 @@ private:
               "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", dflt, "\n"
               "          : _reader.getDataField<", type, ">(",
                       offExpr(templ, leafIdx), " * ::capnp::ELEMENTS", maskParam, ");\n"
+              "    }\n"));
+          leafIdx += 1;
+        } else if (fp.isSlot()) {
+          // Pointer-section field (Text/Data/List/Struct): reads null/empty when unmapped.
+          CppTypeName type = typeName(field.getType(), nullptr);
+          CppTypeName readerType = type; readerType.addMemberType("Reader");
+          out.add(kj::strTree(
+              "    inline bool has", title, "() const {\n"
+              "      return ", slotExpr(templ, leafIdx), " != 0xffffffffu && !_reader.getPointerField(",
+                      ptrOffExpr(templ, leafIdx), ").isNull();\n"
+              "    }\n"
+              "    inline ", readerType, " get", title, "() const {\n"
+              "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", readerType, "()\n"
+              "          : ::capnp::_::PointerHelpers< ", type, " >::get(_reader.getPointerField(",
+                      ptrOffExpr(templ, leafIdx), "));\n"
               "    }\n"));
           leafIdx += 1;
         } else {
@@ -2945,18 +3001,18 @@ private:
       for (auto field: fields) {
         auto fp = field.getProto();
         auto title = toTitleCase(protoName(fp));
-        if (fp.isSlot()) {
+        kj::StringPtr fieldName = protoName(fp);
+        kj::String guard = templ
+            ? kj::str("      static_assert(offsets_[", leafIdx, "] != 0xffffffffu,\n"
+                  "          \"field '", fieldName, "' is not mapped at this use site\");\n")
+            : kj::str("      KJ_REQUIRE(_offsets[", leafIdx, "] != 0xffffffffu,\n"
+                  "          \"field '", fieldName, "' is not mapped at this use site\");\n");
+        if (fp.isSlot() && isPrimitiveDataType(fp.getSlot().getType())) {
           CppTypeName type = typeName(field.getType(), nullptr);
-          kj::StringPtr fieldName = protoName(fp);
           kj::String mask = wrapperDefaultMask(fp.getSlot().getType(), fp.getSlot().getDefaultValue());
           kj::String maskParam = mask.size() > 0 ? kj::str(", ", mask) : kj::str();
           kj::String dflt = mask.size() > 0
               ? kj::str("::capnp::_::unmask<", type, ">(0, ", mask, ")") : kj::str(type, "()");
-          auto guard = templ
-              ? kj::strTree("      static_assert(offsets_[", leafIdx, "] != 0xffffffffu,\n"
-                    "          \"field '", fieldName, "' is not mapped at this use site\");\n")
-              : kj::strTree("      KJ_REQUIRE(_offsets[", leafIdx, "] != 0xffffffffu,\n"
-                    "          \"field '", fieldName, "' is not mapped at this use site\");\n");
           out.add(kj::strTree(
               "    inline ", type, " get", title, "() {\n"
               "      return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", dflt, "\n"
@@ -2964,9 +3020,49 @@ private:
                       offExpr(templ, leafIdx), " * ::capnp::ELEMENTS", maskParam, ");\n"
               "    }\n"
               "    inline void set", title, "(", type, " value) {\n",
-              kj::mv(guard),
+              guard,
               "      _builder.setDataField<", type, ">(",
                   offExpr(templ, leafIdx), " * ::capnp::ELEMENTS, value", maskParam, ");\n"
+              "    }\n"));
+          leafIdx += 1;
+        } else if (fp.isSlot()) {
+          // Pointer-section field: get returns the builder; init/set/adopt/disown are guarded
+          // (no storage at an unmapped site). List/Data/Text init takes a size; struct init doesn't.
+          CppTypeName type = typeName(field.getType(), nullptr);
+          CppTypeName readerType = type; readerType.addMemberType("Reader");
+          CppTypeName builderType = type; builderType.addMemberType("Builder");
+          bool isStruct = fp.getSlot().getType().isStruct();
+          out.add(kj::strTree(
+              "    inline bool has", title, "() {\n"
+              "      return ", slotExpr(templ, leafIdx), " != 0xffffffffu && !_builder.getPointerField(",
+                      ptrOffExpr(templ, leafIdx), ").isNull();\n"
+              "    }\n"
+              "    inline ", builderType, " get", title, "() {\n", guard,
+              "      return ::capnp::_::PointerHelpers< ", type, " >::get(_builder.getPointerField(",
+                      ptrOffExpr(templ, leafIdx), "));\n"
+              "    }\n",
+              isStruct
+                ? kj::strTree(
+                    "    inline ", builderType, " init", title, "() {\n", guard,
+                    "      return ::capnp::_::PointerHelpers< ", type, " >::init(_builder.getPointerField(",
+                            ptrOffExpr(templ, leafIdx), "));\n"
+                    "    }\n")
+                : kj::strTree(
+                    "    inline ", builderType, " init", title, "(unsigned int size) {\n", guard,
+                    "      return ::capnp::_::PointerHelpers< ", type, " >::init(_builder.getPointerField(",
+                            ptrOffExpr(templ, leafIdx), "), size);\n"
+                    "    }\n"),
+              "    inline void set", title, "(", readerType, " value) {\n", guard,
+              "      ::capnp::_::PointerHelpers< ", type, " >::set(_builder.getPointerField(",
+                      ptrOffExpr(templ, leafIdx), "), value);\n"
+              "    }\n"
+              "    inline void adopt", title, "(::capnp::Orphan< ", type, " >&& value) {\n", guard,
+              "      ::capnp::_::PointerHelpers< ", type, " >::adopt(_builder.getPointerField(",
+                      ptrOffExpr(templ, leafIdx), "), ::kj::mv(value));\n"
+              "    }\n"
+              "    inline ::capnp::Orphan< ", type, " > disown", title, "() {\n", guard,
+              "      return ::capnp::_::PointerHelpers< ", type, " >::disown(_builder.getPointerField(",
+                      ptrOffExpr(templ, leafIdx), "));\n"
               "    }\n"));
           leafIdx += 1;
         } else {
@@ -2990,9 +3086,8 @@ private:
       return kj::strTree(out.releaseAsArray());
     };
 
-    auto body = kj::strTree(
-        "struct ", name, " {\n",
-        "  ", name, "() = delete;\n",
+    bool hasPtr = wrapperHasPointerField(tmpl);
+    auto anyReaderClass = hasPtr ? kj::strTree() : kj::strTree(
         "  class AnyReader {\n"
         "  public:\n"
         "    AnyReader() = default;\n"
@@ -3002,7 +3097,8 @@ private:
         "  private:\n"
         "    ::capnp::_::StructReader _reader;\n"
         "    const ::uint32_t* _offsets = nullptr;\n"
-        "  };\n"
+        "  };\n");
+    auto anyBuilderClass = hasPtr ? kj::strTree() : kj::strTree(
         "  class AnyBuilder {\n"
         "  public:\n"
         "    AnyBuilder() = default;\n"
@@ -3013,7 +3109,17 @@ private:
         "  private:\n"
         "    ::capnp::_::StructBuilder _builder;\n"
         "    const ::uint32_t* _offsets = nullptr;\n"
-        "  };\n"
+        "  };\n");
+    kj::StringPtr readerAsAny = hasPtr ? ""
+        : "    inline AnyReader asAny() const { return AnyReader(_reader, offsets_); }\n";
+    kj::StringPtr builderAsAny = hasPtr ? ""
+        : "    inline AnyBuilder asAny() { return AnyBuilder(_builder, offsets_); }\n";
+
+    auto body = kj::strTree(
+        "struct ", name, " {\n",
+        "  ", name, "() = delete;\n",
+        kj::mv(anyReaderClass),
+        kj::mv(anyBuilderClass),
         "  template <::uint32_t... capnpOffsets_>\n"
         "  class Reader {\n"
         // offsets_ is declared first so nested-group getters can name it in their return type.
@@ -3022,7 +3128,7 @@ private:
         "    Reader() = default;\n"
         "    explicit Reader(::capnp::_::StructReader reader): _reader(reader) {}\n",
         readerGetters(true),
-        "    inline AnyReader asAny() const { return AnyReader(_reader, offsets_); }\n"
+        readerAsAny,
         "  private:\n"
         "    ::capnp::_::StructReader _reader;\n"
         "  };\n"
@@ -3035,8 +3141,8 @@ private:
         builderAccessors(true),
         "    inline Reader<capnpOffsets_...> asReader() const {\n"
         "      return Reader<capnpOffsets_...>(_builder.asReader());\n"
-        "    }\n"
-        "    inline AnyBuilder asAny() { return AnyBuilder(_builder, offsets_); }\n"
+        "    }\n",
+        builderAsAny,
         "  private:\n"
         "    ::capnp::_::StructBuilder _builder;\n"
         "  };\n"
