@@ -370,6 +370,49 @@ TEST(SchemaParser, InlineNewtypePropagatesFieldProperties) {
   EXPECT_EQ("f", foo.getAnnotations()[0].getValue().getText());
 }
 
+TEST(SchemaParser, NestedNewtypeUnionMember) {
+  // A group newtype used as a union member (`limit @[0,1] :Price`) must stamp as a discriminated
+  // group member of the union newtype's template -- previously this crashed the compiler.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("nest.capnp",
+      "@0x8123456789abce07;\n"
+      "type Price = group { value @0 :Int64; scale @1 :UInt16; }\n"
+      "type OrderType = union {\n"
+      "  limit @[0, 1] :Price;\n"
+      "  market @2 :Void;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("nest.capnp", "nest.capnp", nullptr);
+  uint64_t priceId = fileSchema.getNested("Price").getProto().getId();
+  auto orderType = fileSchema.getNested("OrderType");
+
+  // Follow the `type` node to its template struct: a union with `limit` (a Price group) + market.
+  // The template and group nodes are auxiliary (not top-level), so find them among all loaded.
+  auto byId = [&](uint64_t id) -> Schema {
+    for (auto s: parser.getAllLoaded()) {
+      if (s.getProto().getId() == id) return s;
+    }
+    KJ_FAIL_REQUIRE("schema not loaded", id);
+  };
+
+  uint64_t tmplId = orderType.getProto().getType().getStruct().getTypeId();
+  auto tmpl = byId(tmplId).asStruct();
+  EXPECT_EQ(2u, tmpl.getProto().getStruct().getDiscriminantCount());
+
+  auto limit = tmpl.getFieldByName("limit").getProto();
+  EXPECT_TRUE(limit.isGroup());
+  EXPECT_EQ(priceId, limit.getTypeId());          // limit is a Price newtype
+  EXPECT_EQ(0u, limit.getDiscriminantValue());    // ...and a union member (tag 0)
+
+  auto limitGroup = byId(limit.getGroup().getTypeId()).asStruct();
+  ASSERT_EQ(2u, limitGroup.getFields().size());   // value, scale stamped in
+  EXPECT_EQ("value", limitGroup.getFields()[0].getProto().getName());
+  EXPECT_EQ("scale", limitGroup.getFields()[1].getProto().getName());
+}
+
 TEST(SchemaParser, Constants) {
   // This is actually a test of the full dynamic API stack for constants, because the schemas for
   // constants are not actually accessible from the generated code API, so the only way to ever
