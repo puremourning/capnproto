@@ -42,6 +42,11 @@ type Price = group {
   scale @1 :UInt16;
 }
 
+type Priced = group {                # a field with an explicit default
+  amount @0 :Int64;
+  scale @1 :UInt16 = 100;
+}
+
 type OrderPrices = group {           # newtype built from other newtypes -> nested wrapper
   limit @[0-1] :Price;
   stop @[2-3] :Price;
@@ -54,4 +59,6 @@ struct Shapes {
   bottomRight @[5-7] :Vec3;
   partial @[8-9] :Vec3;              # incomplete: z is unmapped -> reads default
   prices @[10, 11, 12, 13] :OrderPrices;
+  priced @[14, 15] :Priced;          # explicit-default field, complete mapping
+  pricedPartial @[16] :Priced;       # incomplete: scale unmapped -> reads its explicit default
 }
