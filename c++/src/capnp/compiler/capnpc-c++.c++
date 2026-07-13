@@ -2874,23 +2874,23 @@ private:
         "  class AnyReader {\n"
         "  public:\n"
         "    AnyReader() = default;\n"
-        "    AnyReader(::capnp::_::StructReader reader, const ::uint16_t* offsets)\n"
+        "    AnyReader(::capnp::_::StructReader reader, const ::uint32_t* offsets)\n"
         "        : _reader(reader), _offsets(offsets) {}\n",
         readerGetters(false),
         "  private:\n"
         "    ::capnp::_::StructReader _reader;\n"
-        "    const ::uint16_t* _offsets = nullptr;\n"
+        "    const ::uint32_t* _offsets = nullptr;\n"
         "  };\n"
         "  class AnyBuilder {\n"
         "  public:\n"
         "    AnyBuilder() = default;\n"
-        "    AnyBuilder(::capnp::_::StructBuilder builder, const ::uint16_t* offsets)\n"
+        "    AnyBuilder(::capnp::_::StructBuilder builder, const ::uint32_t* offsets)\n"
         "        : _builder(builder), _offsets(offsets) {}\n",
         builderAccessors(false),
         "    inline AnyReader asReader() const { return AnyReader(_builder.asReader(), _offsets); }\n"
         "  private:\n"
         "    ::capnp::_::StructBuilder _builder;\n"
-        "    const ::uint16_t* _offsets = nullptr;\n"
+        "    const ::uint32_t* _offsets = nullptr;\n"
         "  };\n"
         "  template <::uint32_t... capnpOffsets_>\n"
         "  class Reader {\n"
