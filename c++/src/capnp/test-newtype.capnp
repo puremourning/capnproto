@@ -28,6 +28,8 @@
 using Cxx = import "c++.capnp";
 $Cxx.namespace("capnproto_test::capnp::newtype");
 
+using Import = import "test-newtype-import.capnp";
+
 type Uuid = Data;                    # scalar newtype -> `using`
 type Age = UInt16;                   # scalar newtype -> `using`
 
@@ -84,4 +86,13 @@ struct Shapes {
   named @[17, 18] :Named;            # Text pointer field + data field
   boxed @[19, 20, 21, 22] :Boxed;    # struct + list + text + data fields
   order @[23, 24, 25, 26] :OrderType;  # union newtype
+}
+
+struct CrossFile {
+  # Newtypes imported from test-newtype-import.capnp: their `type` node and template live in the
+  # other file, so this exercises the compiler pulling cross-file newtype nodes into the request.
+  id @0 :Import.ImportedId;             # scalar pointer newtype -> ImportedId::Reader
+  age @1 :Import.ImportedAge;           # scalar value newtype -> ImportedAge
+  corner @[2, 3, 4] :Import.ImportedVec;   # group newtype -> ImportedVec::Reader<...>
+  choice @[5, 6, 7] :Import.ImportedChoice;  # union newtype
 }

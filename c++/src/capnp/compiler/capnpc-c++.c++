@@ -798,6 +798,8 @@ private:
       case schema::Node::ENUM:
       case schema::Node::ANNOTATION:
       case schema::Node::TYPE:
+        // A `type` newtype is an alias; any brand dependencies belong to the underlying type's
+        // own node, not to this one.
         break;
 
       case schema::Node::STRUCT:
@@ -1345,6 +1347,13 @@ private:
 
     FieldKind kind = FieldKind::PRIMITIVE;
     CppTypeName type = typeName(typeSchema, kj::none);
+    if (slot.getType().getTypeId() != 0) {
+      // A scalar `type` newtype used at this field records its identity in the slot type's
+      // typeId back-reference. Emit the newtype's own C++ name (a `using` alias declared for the
+      // `type` node) instead of the resolved underlying type, so signatures carry the newtype
+      // identity. Referencing that name also marks its declaring file as a used import.
+      type = cppFullName(schemaLoader.getUnbound(slot.getType().getTypeId()), kj::none);
+    }
     kj::StringPtr setterDefault;  // only for void
     kj::String defaultMask;    // primitives only
     size_t defaultOffset = 0;    // pointers only: offset of the default value within the schema.
