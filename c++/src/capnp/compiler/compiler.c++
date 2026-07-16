@@ -756,6 +756,13 @@ void Compiler::Node::traverseNodeDependencies(
             break;
         }
 
+        // An inline group/union `type` newtype stamped at this field records its identity as a
+        // back-reference on the field. That `type` node may live in another file, so pull it in
+        // explicitly; otherwise importers would be missing its schema and template.
+        if (field.getTypeId() != 0) {
+          traverseDependency(field.getTypeId(), eagerness, seen, finalLoader, sourceInfo);
+        }
+
         traverseAnnotations(field.getAnnotations(), eagerness, seen, finalLoader, sourceInfo);
       }
       break;
@@ -806,6 +813,13 @@ void Compiler::Node::traverseType(const schema::Type::Reader& type, uint eagerne
                                   std::unordered_map<Node*, uint>& seen,
                                   const SchemaLoader& finalLoader,
                                   kj::Vector<schema::Node::SourceInfo::Reader>& sourceInfo) {
+  // A `type` newtype records its identity as a back-reference on the underlying type. Pull in
+  // that node so importers receive its schema (and, for a group newtype, its template). This
+  // field is present regardless of the underlying `which()`, so check it before the switch.
+  if (type.getTypeId() != 0) {
+    traverseDependency(type.getTypeId(), eagerness, seen, finalLoader, sourceInfo);
+  }
+
   uint64_t id = 0;
   schema::Brand::Reader brand;
   switch (type.which()) {

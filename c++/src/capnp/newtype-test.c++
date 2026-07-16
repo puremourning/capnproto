@@ -195,6 +195,41 @@ TEST(Newtype, UnionWrapper) {
   EXPECT_EQ(OrderType::MARKET, shapes.asReader().getOrder().which());
 }
 
+TEST(Newtype, CrossFileNewtypes) {
+  // The newtypes here are defined in test-newtype-import.capnp. This only compiles/links if the
+  // compiler pulled their `type` nodes (and, for groups, their templates) into this file's request.
+  ::capnp::MallocMessageBuilder message;
+  auto cf = message.initRoot<CrossFile>();
+
+  // Scalar newtypes keep their imported names in signatures.
+  cf.setAge(77);
+  ImportedAge age = cf.getAge();
+  EXPECT_EQ(77, age);
+  ImportedId::Reader id = cf.asReader().getId();
+  EXPECT_EQ(0u, id.size());
+
+  // Group newtype wrapper works cross-file.
+  auto corner = cf.getCorner();                 // ImportedVec::Builder<2, 3, 4>
+  corner.setX(1.25f); corner.setY(2.5f); corner.setZ(3.75f);
+  auto r = cf.asReader();
+  EXPECT_EQ(1.25f, r.getCorner().getX());
+  EXPECT_EQ(2.5f, r.getCorner().getY());
+  EXPECT_EQ(3.75f, r.getCorner().getZ());
+  ImportedVec::AnyReader anyCorner = r.getCorner().asAny();   // erasure works cross-file too
+  EXPECT_EQ(3.75f, anyCorner.getZ());
+
+  // Union newtype wrapper works cross-file.
+  cf.getChoice().setCode(-5);
+  {
+    auto c = cf.asReader().getChoice();
+    EXPECT_EQ(ImportedChoice::CODE, c.which());
+    EXPECT_TRUE(c.isCode());
+    EXPECT_EQ(-5, c.getCode());
+  }
+  cf.getChoice().setNone(::capnp::VOID);
+  EXPECT_EQ(ImportedChoice::NONE, cf.asReader().getChoice().which());
+}
+
 }  // namespace
 }  // namespace newtype
 }  // namespace capnp
