@@ -228,6 +228,7 @@ if(BUILD_TESTING)
     test-import.capnp
     test-import2.capnp
     test-newtype.capnp
+    test-newtype-import.capnp
     compat/json-test.capnp
   )
 
