@@ -23,6 +23,11 @@
 #include "message.h"
 #include <kj/compat/gtest.h>
 
+#if !CAPNP_LITE
+#include <capnp/capability.h>
+#include <kj/async.h>
+#endif  // !CAPNP_LITE
+
 namespace capnproto_test {
 namespace capnp {
 namespace newtype {
@@ -229,6 +234,74 @@ TEST(Newtype, CrossFileNewtypes) {
   cf.getChoice().setNone(::capnp::VOID);
   EXPECT_EQ(ImportedChoice::NONE, cf.asReader().getChoice().which());
 }
+
+#if !CAPNP_LITE
+
+class RegistryImpl final: public Registry::Server {
+  // Reads newtype-typed parameters and writes newtype-typed results. The parameter/result accessors
+  // naming the newtypes (Uuid::Reader, Age, Vec3::Builder<...>, OrderType::Builder<...>) only
+  // compile if the newtype codegen reaches a method's implicit parameter/result structs.
+public:
+  kj::Promise<void> lookup(LookupContext context) override {
+    auto params = context.getParams();
+    Uuid::Reader id = params.getId();          // scalar pointer newtype parameter
+    Age age = params.getAge();                 // scalar value newtype parameter
+    auto results = context.getResults();
+    results.setFoundId(id);                    // echo the Uuid straight back
+    results.setFoundAge(age + 1);              // Age is uint16_t: arithmetic uses the underlying type
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> place(PlaceContext context) override {
+    auto params = context.getParams();
+    auto spot = params.getSpot();              // Vec3::Reader<...> group newtype parameter
+    auto results = context.getResults();
+    auto echo = results.initEcho();            // Vec3::Builder<...> group newtype result
+    echo.setX(spot.getX() * 2);
+    echo.setY(spot.getY() * 2);
+    echo.setZ(spot.getZ() * 2);
+    results.initKind().setCancel(99);          // union newtype result
+    return kj::READY_NOW;
+  }
+};
+
+TEST(Newtype, CapabilityParamsAndResults) {
+  // Newtypes in interface method parameter/result slots, exercised through a real capability call:
+  // the client marshals newtype parameters into the request, the server reads them and writes
+  // newtype results, and the client reads the results back.
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  Registry::Client client(kj::heap<RegistryImpl>());
+
+  // Scalar newtypes (Uuid = Data, Age = UInt16) in an inline parameter/result list.
+  static const kj::byte idBytes[] = { 0x01, 0x02, 0x03, 0x04 };
+  auto lreq = client.lookupRequest();
+  lreq.setId(Uuid::Reader(idBytes, sizeof(idBytes)));
+  lreq.setAge(41);
+  auto lresp = lreq.send().wait(waitScope);
+  EXPECT_EQ(4u, lresp.getFoundId().size());   // Uuid round-tripped through the call
+  EXPECT_EQ(0x03, lresp.getFoundId()[2]);
+  Age foundAge = lresp.getFoundAge();
+  EXPECT_EQ(42, foundAge);
+
+  // Group + union newtypes via named parameter/result structs.
+  auto preq = client.placeRequest();
+  auto spot = preq.initSpot();                // Vec3::Builder<...>
+  spot.setX(1.0f); spot.setY(2.0f); spot.setZ(3.0f);
+  preq.setTag(Uuid::Reader(idBytes, sizeof(idBytes)));
+  auto presp = preq.send().wait(waitScope);
+  auto echo = presp.getEcho();                // Vec3::Reader<...>
+  EXPECT_EQ(2.0f, echo.getX());
+  EXPECT_EQ(4.0f, echo.getY());
+  EXPECT_EQ(6.0f, echo.getZ());
+  auto kind = presp.getKind();                // OrderType::Reader<...>
+  EXPECT_EQ(OrderType::CANCEL, kind.which());
+  EXPECT_TRUE(kind.isCancel());
+  EXPECT_EQ(99, kind.getCancel());
+}
+
+#endif  // !CAPNP_LITE
 
 }  // namespace
 }  // namespace newtype
