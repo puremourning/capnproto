@@ -2958,8 +2958,8 @@ private:
     auto fields = tmpl.getFields();
     bool isUnion = isUnionWrapper(tmpl);
     auto discOffExpr = [](bool templ) {
-      return templ ? kj::strTree("::capnp::bounded<discOffset_>()")
-                   : kj::strTree("::capnp::bounded(_discOffset)");
+      return templ ? kj::strTree("::capnp::bounded<discOffset_>() * ::capnp::ELEMENTS")
+                   : kj::strTree("::capnp::assumeDataOffset(_discOffset)");
     };
 
     // A field may be unmapped at a use site (incomplete `@[...]`), signalled by the sentinel
@@ -2971,20 +2971,23 @@ private:
     auto slotExpr = [](bool templ, uint i) {
       return templ ? kj::strTree("offsets_[", i, "]") : kj::strTree("_offsets[", i, "]");
     };
-    // Offset passed to getDataField/setDataField. In the compile-time form it is guarded so the
-    // `bounded<>` constant stays in range even for an (unreachable) sentinel field.
+    // Offset (in ELEMENTS) passed to getDataField/setDataField. In the compile-time form it is
+    // guarded so the `bounded<>` constant stays in range even for an (unreachable) sentinel field.
+    // The runtime form goes through `assumeDataOffset`, which asserts the offset into the proper
+    // `StructDataOffset` bound -- `bounded(runtimeU32)` would instead widen to the full uint32 range
+    // and trip getDataField's overflow static_assert.
     auto offExpr = [](bool templ, uint i) {
       return templ
           ? kj::strTree("::capnp::bounded<(offsets_[", i, "] == 0xffffffffu ? 0u : offsets_[", i,
-                        "])>()")
-          : kj::strTree("::capnp::bounded(_offsets[", i, "])");
+                        "])>() * ::capnp::ELEMENTS")
+          : kj::strTree("::capnp::assumeDataOffset(_offsets[", i, "])");
     };
     // Same, in POINTERS units, for pointer-section fields (getPointerField).
     auto ptrOffExpr = [](bool templ, uint i) {
       return templ
           ? kj::strTree("::capnp::bounded<(offsets_[", i, "] == 0xffffffffu ? 0u : offsets_[", i,
                         "])>() * ::capnp::POINTERS")
-          : kj::strTree("::capnp::bounded(_offsets[", i, "]) * ::capnp::POINTERS");
+          : kj::strTree("::capnp::assumePointerOffset(_offsets[", i, "])");
     };
     // A nested-newtype group field consumes `count` consecutive leaf offsets; its accessor hands
     // that slice to the nested wrapper. `offsets_[start..start+count-1]` for the compile-time form.
@@ -3003,8 +3006,7 @@ private:
       uint leafIdx = 0;
       if (isUnion) {
         out.add(Method { kj::str("Which"), kj::str("which() const"),
-            kj::str("  return _reader.getDataField<Which>(", discOffExpr(templ),
-                    " * ::capnp::ELEMENTS);\n") });
+            kj::str("  return _reader.getDataField<Which>(", discOffExpr(templ), ");\n") });
       }
       for (auto field: fields) {
         auto fp = field.getProto();
@@ -3022,7 +3024,7 @@ private:
           out.add(Method { kj::str(type), kj::str("get", title, "() const"),
               kj::str("  return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", dflt, "\n"
                       "      : _reader.getDataField<", type, ">(",
-                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS", maskParam, ");\n") });
+                      offExpr(templ, leafIdx), maskParam, ");\n") });
           leafIdx += 1;
         } else if (fp.isSlot()) {
           CppTypeName type = typeName(field.getType(), kj::none);
@@ -3056,8 +3058,7 @@ private:
       uint leafIdx = 0;
       if (isUnion) {
         out.add(Method { kj::str("Which"), kj::str("which()"),
-            kj::str("  return _builder.getDataField<Which>(", discOffExpr(templ),
-                    " * ::capnp::ELEMENTS);\n") });
+            kj::str("  return _builder.getDataField<Which>(", discOffExpr(templ), ");\n") });
       }
       for (auto field: fields) {
         auto fp = field.getProto();
@@ -3071,7 +3072,7 @@ private:
         // In a union, get is unconditional but any setter/init first selects this arm.
         kj::String discSet = isUnion ? kj::str(
             "  _builder.setDataField<::uint16_t>(", discOffExpr(templ),
-            " * ::capnp::ELEMENTS, ", fp.getDiscriminantValue(), ");\n") : kj::str();
+            ", ", fp.getDiscriminantValue(), ");\n") : kj::str();
         if (isUnion) {
           out.add(Method { kj::str("bool"), kj::str("is", title, "()"),
               kj::str("  return which() == Which::", toUpperCase(protoName(fp)), ";\n") });
@@ -3085,10 +3086,10 @@ private:
           out.add(Method { kj::str(type), kj::str("get", title, "()"),
               kj::str("  return ", slotExpr(templ, leafIdx), " == 0xffffffffu ? ", dflt, "\n"
                       "      : _builder.getDataField<", type, ">(",
-                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS", maskParam, ");\n") });
+                      offExpr(templ, leafIdx), maskParam, ");\n") });
           out.add(Method { kj::str("void"), kj::str("set", title, "(", type, " value)"),
               kj::str(guard, discSet, "  _builder.setDataField<", type, ">(",
-                      offExpr(templ, leafIdx), " * ::capnp::ELEMENTS, value", maskParam, ");\n") });
+                      offExpr(templ, leafIdx), ", value", maskParam, ");\n") });
           leafIdx += 1;
         } else if (fp.isSlot()) {
           CppTypeName type = typeName(field.getType(), kj::none);
