@@ -19,7 +19,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#include <capnp/test-newtype.capnp.h>
+#include "capnp/dynamic.h"
+#include "capnp/test-newtype.capnp.h"
 #include "message.h"
 #include <kj/compat/gtest.h>
 
@@ -43,6 +44,39 @@ TEST(Newtype, ScalarUsingAliases) {
   EXPECT_EQ(42, age);
   Uuid::Reader id = shapes.getId();
   EXPECT_EQ(0u, id.size());
+}
+
+// Ids of test-newtype.capnp's `voidAnno` and `structAnno`. Annotation nodes generate no C++
+// declaration, so their ids are spelled out here; they are derived from the file id plus the
+// annotation name, and can be re-read with `capnp compile -ocapnp capnp/test-newtype.capnp`.
+static constexpr uint64_t VOID_ANNO_ID = 0xd3a27aab171949d7ull;
+static constexpr uint64_t STRUCT_ANNO_ID = 0xba3806704b92bc7cull;
+
+TEST(Newtype, NewTypeAnnotationsArePropagatedToTheirStampings) {
+  // `type Uuid = Data $structAnno(width=10, name="Hello") $voidAnno;` -- a field declared as
+  // `id @0 :Uuid` inherits the newtype's annotations, and a struct-valued annotation must arrive
+  // with its *contents*, not as an empty struct.
+  auto field = ::capnp::Schema::from<Shapes>().getFieldByName("id");
+
+  bool sawVoidAnno = false;
+  kj::Maybe<::capnp::schema::Value::Reader> structAnnoValue;
+  for (auto anno: field.getProto().getAnnotations()) {
+    if (anno.getId() == VOID_ANNO_ID) sawVoidAnno = true;
+    if (anno.getId() == STRUCT_ANNO_ID) structAnnoValue = anno.getValue();
+  }
+
+  // Both annotations propagate...
+  EXPECT_TRUE(sawVoidAnno);
+  auto value = KJ_ASSERT_NONNULL(structAnnoValue, "structAnno did not propagate to Shapes.id");
+  ASSERT_TRUE(value.isStruct());
+
+  // ...and the struct-valued one carries its contents, not an empty struct.  (A struct value is
+  // only interpreted once every node has a bootstrap schema, so a naive copy out of the newtype's
+  // bootstrap schema would pick up the placeholder that stands in for it until then.)
+  auto annoStruct = value.getStruct().as<StructAnno>();
+  EXPECT_TRUE(annoStruct.hasName());
+  EXPECT_EQ(10, annoStruct.getWidth());
+  EXPECT_TRUE(annoStruct.getName() == "Hello");
 }
 
 TEST(Newtype, GroupWrapperRoundTrip) {

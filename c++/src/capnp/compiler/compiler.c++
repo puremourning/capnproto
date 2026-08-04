@@ -79,6 +79,7 @@ public:
 
   kj::Maybe<Schema> getBootstrapSchema();
   kj::Maybe<schema::Node::Reader> getFinalSchema();
+  kj::Maybe<schema::Node::Reader> getFinalAuxSchema(uint64_t auxId);
   void loadFinalSchema(const SchemaLoader& loader);
 
   void traverse(uint eagerness, std::unordered_map<Node*, uint>& seen,
@@ -100,6 +101,8 @@ public:
   kj::Maybe<Schema> resolveBootstrapSchema(
       uint64_t id, schema::Brand::Reader brand) override;
   kj::Maybe<schema::Node::Reader> resolveFinalSchema(uint64_t id) override;
+  kj::Maybe<schema::Node::Reader> resolveFinalAuxSchema(
+      uint64_t parentId, uint64_t auxId) override;
   kj::Maybe<ResolvedDecl> resolveImport(kj::StringPtr name) override;
   kj::Maybe<kj::Array<const byte>> readEmbed(kj::StringPtr name) override;
   kj::Maybe<Type> resolveBootstrapType(schema::Type::Reader type, Schema scope) override;
@@ -666,6 +669,19 @@ kj::Maybe<schema::Node::Reader> Compiler::Node::getFinalSchema() {
     return kj::none;
   }
 }
+kj::Maybe<schema::Node::Reader> Compiler::Node::getFinalAuxSchema(uint64_t auxId) {
+  // Note that unlike getFinalSchema(), there's no `loadedFinalSchema` shortcut for aux nodes; we
+  // have to go through the content, which finishes this node if it hasn't been finished already.
+  KJ_IF_SOME(content, getContent(Content::FINISHED)) {
+    for (auto aux: content.auxSchemas) {
+      if (aux.getId() == auxId) {
+        return aux;
+      }
+    }
+  }
+  return kj::none;
+}
+
 void Compiler::Node::loadFinalSchema(const SchemaLoader& loader) {
   KJ_IF_SOME(content, getContent(Content::FINISHED)) {
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&](){
@@ -1013,6 +1029,15 @@ kj::Maybe<Schema> Compiler::Node::resolveBootstrapSchema(
 kj::Maybe<schema::Node::Reader> Compiler::Node::resolveFinalSchema(uint64_t id) {
   KJ_IF_SOME(node, module->getCompiler().findNode(id)) {
     return node.getFinalSchema();
+  } else {
+    KJ_FAIL_REQUIRE("Tried to get schema for ID we haven't seen before.");
+  }
+}
+
+kj::Maybe<schema::Node::Reader> Compiler::Node::resolveFinalAuxSchema(
+    uint64_t parentId, uint64_t auxId) {
+  KJ_IF_SOME(node, module->getCompiler().findNode(parentId)) {
+    return node.getFinalAuxSchema(auxId);
   } else {
     KJ_FAIL_REQUIRE("Tried to get schema for ID we haven't seen before.");
   }

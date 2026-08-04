@@ -632,6 +632,8 @@ NodeTranslator::NodeSet NodeTranslator::finish(Schema selfBootstrapSchema) {
                  value.target, false);
   }
 
+  finishNewtypeValues();
+
   return getBootstrapNode();
 }
 
@@ -1073,6 +1075,11 @@ private:
     // annotations are copied onto the leaf, rather than re-compiled from `fieldType`).
     uint stampedOrdinal = 0;
     // The parent ordinal assigned to a stamped leaf field (its position in the `@[...]` mapping).
+    uint64_t stampedFromNewtypeId = 0;
+    uint64_t stampedFromTemplateId = 0;
+    // For a stamped leaf: the `type` newtype the field came from, and the template (or nested
+    // group) node within it which declared the field.  Used to re-read the field's annotations and
+    // default value once that newtype has been finished.
     uint64_t stampedNewtypeId = 0;
     // For the group field that stamps a newtype: the newtype's node ID, recorded as Field.typeId.
     List<Declaration::AnnotationApplication>::Reader declAnnotations;
@@ -1128,7 +1135,8 @@ private:
     }
     inline MemberInfo(MemberInfo& parent, uint codeOrder, kj::StringPtr name,
                       schema::Field::Reader stampedFieldParam, uint stampedOrdinalParam,
-                      StructLayout::StructOrGroup& fieldScope, uint startByte, uint endByte)
+                      StructLayout::StructOrGroup& fieldScope, uint startByte, uint endByte,
+                      uint64_t stampedFromNewtypeIdParam, uint64_t stampedFromTemplateIdParam)
         : parent(&parent), codeOrder(codeOrder), isInUnion(false),
           name(name), declKind(Declaration::FIELD),
           startByte(startByte), endByte(endByte),
@@ -1136,6 +1144,8 @@ private:
       // A leaf field stamped from a group/union newtype template.
       stampedField = stampedFieldParam;
       stampedOrdinal = stampedOrdinalParam;
+      stampedFromNewtypeId = stampedFromNewtypeIdParam;
+      stampedFromTemplateId = stampedFromTemplateIdParam;
     }
     inline MemberInfo(MemberInfo& parent, uint codeOrder, kj::StringPtr name,
                       NodeSourceInfoBuilderPair builderPair, uint startByte, uint endByte,
@@ -1377,7 +1387,7 @@ private:
   void stampTemplateFields(StructSchema tmplStruct, MemberInfo& groupMember,
                            StructLayout::StructOrGroup& layout,
                            kj::ArrayPtr<const uint> ordinals, uint& ordinalIndex,
-                           Declaration::Reader member) {
+                           Declaration::Reader member, uint64_t newtypeId) {
     // Structurally copy a (fully-resolved) template into `groupMember`: allocate each leaf's
     // remapped ordinal from `ordinals` in tree order, and recreate nested groups/unions. Called
     // recursively for nested groups, so an inline newtype built from other inline newtypes (which
@@ -1421,7 +1431,8 @@ private:
         if (isUnion) leafScope = &arena.allocate<StructLayout::Group>(*unionLayout);
         auto& leaf = arena.allocate<MemberInfo>(
             groupMember, codeOrder++, tfProto.getName(),
-            tfProto, ord, *leafScope, member.getStartByte(), member.getEndByte());
+            tfProto, ord, *leafScope, member.getStartByte(), member.getEndByte(),
+            newtypeId, tmplStruct.getProto().getId());
         leaf.isInUnion = isUnion;
         allMembers.add(&leaf);
         membersByOrdinal.insert(std::make_pair(ord, &leaf));
@@ -1438,10 +1449,12 @@ private:
           if (isUnion) {
             // A group that is itself a union member gets its own slot of the union's space.
             StructLayout::Group& subScope = arena.allocate<StructLayout::Group>(*unionLayout);
-            stampTemplateFields(sub, subMember, subScope, ordinals, ordinalIndex, member);
+            stampTemplateFields(sub, subMember, subScope, ordinals, ordinalIndex, member,
+                                newtypeId);
           } else {
             // A group nested in a struct/group: its fields take fresh offsets in the same layout.
-            stampTemplateFields(sub, subMember, layout, ordinals, ordinalIndex, member);
+            stampTemplateFields(sub, subMember, layout, ordinals, ordinalIndex, member,
+                                newtypeId);
           }
         }
       }
@@ -1524,7 +1537,8 @@ private:
       // leaf's remapped ordinal from `@[...]` in tree order and recreating nested groups/unions
       // (which carry their own newtype identity via Field.typeId).
       uint ordinalIndex = 0;
-      stampTemplateFields(tmpl, groupMember, layout, ordinals.asPtr(), ordinalIndex, member);
+      stampTemplateFields(tmpl, groupMember, layout, ordinals.asPtr(), ordinalIndex, member,
+                          newtypeId);
     } else {
       errorReporter.addErrorOn(member,
           "A '@[...]' ordinal mapping requires a field whose type is an inline "
@@ -1801,6 +1815,9 @@ private:
           // Stamped leaf: copy the template field's annotations, which were already merged with
           // that field's own newtype chain when the template was compiled.
           member->getSchema().setAnnotations(stamped.getAnnotations());
+          translator.deferStampedFieldFixups(
+              member->stampedFromNewtypeId, member->stampedFromTemplateId, member->name,
+              member->getSchema());
         } else {
           // A field written as a `type` newtype inherits that newtype's (field-scoped)
           // annotations, merged with any specified at the use site.
@@ -1855,7 +1872,11 @@ void NodeTranslator::compileInlineGroupNewtypeTemplate(List<Declaration>::Reader
   if (isUnion) {
     // Wrap the body in an unnamed union so the template gets a discriminant. (A named union is
     // equivalent to a group containing an unnamed union.)
-    auto wrapper = orphanage.newOrphan<List<Declaration>>(1);
+    // Held by the translator, not by this scope: a lazily-interpreted value inside `members`
+    // (e.g. a list-typed default or annotation value) is remembered as a reader into this copy
+    // of the AST and isn't read until finish().
+    synthesizedDecls.add(orphanage.newOrphan<List<Declaration>>(1));
+    auto& wrapper = synthesizedDecls.back();
     auto unionDecl = wrapper.get()[0];
     unionDecl.initName();  // empty name -> unnamed union
     unionDecl.setUnion();
@@ -2732,7 +2753,8 @@ kj::Maybe<kj::Array<const byte>> NodeTranslator::readEmbed(LocatedText::Reader f
 
 Orphan<List<schema::Annotation>> NodeTranslator::compileAnnotationApplications(
     List<Declaration::AnnotationApplication>::Reader annotations,
-    kj::StringPtr targetsFlagName) {
+    kj::StringPtr targetsFlagName,
+    kj::Maybe<kj::Vector<uint>&> deferredIndices) {
   if (annotations.size() == 0 || !compileAnnotations) {
     // Return null.
     return Orphan<List<schema::Annotation>>();
@@ -2780,11 +2802,18 @@ Orphan<List<schema::Annotation>> NodeTranslator::compileAnnotationApplications(
                 }
                 break;
 
-              case Declaration::AnnotationApplication::Value::EXPRESSION:
+              case Declaration::AnnotationApplication::Value::EXPRESSION: {
+                size_t unfinishedCountBefore = unfinishedValues.size();
                 compileBootstrapValue(value.getExpression(), node.getType(),
                                       annotationBuilder.getValue(),
                                       annotationSchema);
+                if (unfinishedValues.size() > unfinishedCountBefore) {
+                  KJ_IF_SOME(indices, deferredIndices) {
+                    indices.add(i);
+                  }
+                }
                 break;
+              }
             }
           }
         }
@@ -2798,12 +2827,29 @@ Orphan<List<schema::Annotation>> NodeTranslator::compileAnnotationApplications(
   return result;
 }
 
+static bool isDeferredValue(schema::Value::Reader value) {
+  // Is this the kind of value which compileBootstrapValue() interprets lazily?  Such a value reads
+  // as an empty placeholder until the node declaring it has been finished.
+  switch (value.which()) {
+    case schema::Value::LIST:
+    case schema::Value::STRUCT:
+    case schema::Value::INTERFACE:
+    case schema::Value::ANY_POINTER:
+      return true;
+    default:
+      return false;
+  }
+}
+
 Orphan<List<schema::Annotation>> NodeTranslator::compileFieldAnnotations(
     List<Declaration::AnnotationApplication>::Reader fieldAnnotations,
     uint64_t newtypeId) {
-  // Compile the field's own (use-site) annotations.
+  // Compile the field's own (use-site) annotations.  Track which of them have values that are
+  // being interpreted lazily, in case we have to move the list below.
+  kj::Vector<uint> deferredIndices;
+  size_t unfinishedStart = unfinishedValues.size();
   Orphan<List<schema::Annotation>> own =
-      compileAnnotationApplications(fieldAnnotations, "targetsField");
+      compileAnnotationApplications(fieldAnnotations, "targetsField", deferredIndices);
 
   if (newtypeId == 0 || !compileAnnotations) {
     return own;
@@ -2824,14 +2870,20 @@ Orphan<List<schema::Annotation>> NodeTranslator::compileFieldAnnotations(
   }
 
   // Walk the newtype chain, collecting field-scoped annotations that aren't already present.
-  kj::Vector<schema::Annotation::Reader> inherited;
+  struct InheritedAnnotation {
+    schema::Annotation::Reader annotation;
+    uint64_t sourceNodeId;
+    // The newtype node the annotation was declared on -- remembered so that a pointer-typed value
+    // can be re-read from that node's *final* schema in finish().
+  };
+  kj::Vector<InheritedAnnotation> inherited;
   uint64_t cur = newtypeId;
   for (uint hops = 0; cur != 0 && hops < 64; hops++) {  // hop limit guards against cycles
     KJ_IF_SOME(schema, resolver.resolveBootstrapSchema(cur, schema::Brand::Reader())) {
       auto node = schema.getProto();
       for (auto ann: node.getAnnotations()) {
         if (markSeen(ann.getId())) {
-          inherited.add(ann);
+          inherited.add(InheritedAnnotation { ann, cur });
         }
       }
       cur = node.isType() ? node.getType().getTypeId() : 0;
@@ -2852,10 +2904,75 @@ Orphan<List<schema::Annotation>> NodeTranslator::compileFieldAnnotations(
   for (uint i = 0; i < ownSize; i++) {
     builder.setWithCaveats(i, ownReader[i]);
   }
+
+  // `own` is about to be discarded, so any of its values that are still waiting to be interpreted
+  // must now be written to their copies in `combined` instead.  (compileAnnotationApplications()
+  // appended those entries in `deferredIndices` order.)
+  for (auto i: kj::indices(deferredIndices)) {
+    unfinishedValues[unfinishedStart + i].target = builder[deferredIndices[i]].getValue();
+  }
+
   for (auto i: kj::indices(inherited)) {
-    builder.setWithCaveats(ownSize + i, inherited[i]);
+    uint index = ownSize + i;
+    builder.setWithCaveats(index, inherited[i].annotation);
+    if (isDeferredValue(inherited[i].annotation.getValue())) {
+      // The newtype's own schema is only at the bootstrap stage, where a pointer-typed annotation
+      // value is still an empty placeholder.  Copy the real value in finish().
+      unfinishedInheritedAnnotations.add(UnfinishedInheritedAnnotation {
+          inherited[i].sourceNodeId, inherited[i].annotation.getId(), builder[index] });
+    }
   }
   return combined;
+}
+
+void NodeTranslator::deferStampedFieldFixups(
+    uint64_t newtypeId, uint64_t templateId, kj::StringPtr fieldName,
+    schema::Field::Builder target) {
+  if (newtypeId == 0 || templateId == 0) return;
+
+  auto reader = target.asReader();
+  bool needsFixup = reader.isSlot() && isDeferredValue(reader.getSlot().getDefaultValue());
+  if (!needsFixup) {
+    for (auto ann: reader.getAnnotations()) {
+      if (isDeferredValue(ann.getValue())) {
+        needsFixup = true;
+        break;
+      }
+    }
+  }
+
+  if (needsFixup) {
+    unfinishedStampedFields.add(UnfinishedStampedField {
+        newtypeId, templateId, fieldName, target });
+  }
+}
+
+void NodeTranslator::finishNewtypeValues() {
+  for (auto& entry: unfinishedStampedFields) {
+    KJ_IF_SOME(node, resolver.resolveFinalAuxSchema(entry.newtypeId, entry.templateId)) {
+      if (!node.isStruct()) continue;
+      for (auto field: node.getStruct().getFields()) {
+        if (field.getName() == entry.fieldName) {
+          entry.target.setAnnotations(field.getAnnotations());
+          if (entry.target.isSlot() && field.isSlot()) {
+            entry.target.getSlot().setDefaultValue(field.getSlot().getDefaultValue());
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  for (auto& entry: unfinishedInheritedAnnotations) {
+    KJ_IF_SOME(node, resolver.resolveFinalSchema(entry.sourceNodeId)) {
+      for (auto ann: node.getAnnotations()) {
+        if (ann.getId() == entry.annotationId) {
+          entry.target.setValue(ann.getValue());
+          break;
+        }
+      }
+    }
+  }
 }
 
 }  // namespace compiler
