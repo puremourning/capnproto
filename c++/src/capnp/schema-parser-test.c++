@@ -262,6 +262,89 @@ TEST(SchemaParser, TypeNewtypeAnnotationMerge) {
   EXPECT_EQ(0u, fields[3].getProto().getAnnotations().size());
 }
 
+TEST(SchemaParser, TypeNewtypePointerValues) {
+  // Pointer-typed values (structs, lists) are interpreted lazily, after all nodes have bootstrap
+  // schemas.  Everything a `type` newtype hands to a use site -- inherited annotations, and the
+  // annotations and defaults of a stamped inline group -- must carry those values, not the empty
+  // placeholders that stand in for them until the newtype has been finished.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("ptrann.capnp",
+      "@0x8123456789abce05;\n"
+      "struct Sa { width @0 :UInt16; name @1 :Text; }\n"
+      "annotation sa(field) :Sa;\n"
+      "annotation la(field) :List(UInt16);\n"
+      "type Uuid = Data $sa(width = 10, name = \"Hi\") $la([1, 2]);\n"
+      "type Boxed = group {\n"
+      "  inner @0 :Uuid;                      # annotations reach the stamp through Boxed\n"
+      "  tags @1 :List(Int32) = [3, 4];       # a pointer-typed default reaches it too\n"
+      "}\n"
+      "type Choice = union {\n"
+      "  xs @0 :List(Int32) = [5, 6];         # same, through the synthesized unnamed union\n"
+      "  n @1 :Int32;\n"
+      "}\n"
+      "struct S {\n"
+      "  plain @0 :Uuid;                                     # inherits sa and la\n"
+      "  overridden @1 :Uuid $sa(width = 32, name = \"Bye\");   # use-site sa, inherited la\n"
+      "  boxed @[2, 3] :Boxed;\n"
+      "  choice @[4, 5] :Choice;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("ptrann.capnp", "ptrann.capnp", nullptr);
+
+  StructSchema saSchema = fileSchema.getNested("Sa").asStruct();
+  uint64_t saId = fileSchema.getNested("sa").getProto().getId();
+  uint64_t laId = fileSchema.getNested("la").getProto().getId();
+  auto s = fileSchema.getNested("S").asStruct();
+
+  auto annValue = [](StructSchema::Field f, uint64_t id) -> schema::Value::Reader {
+    for (auto a: f.getProto().getAnnotations()) {
+      if (a.getId() == id) return a.getValue();
+    }
+    KJ_FAIL_EXPECT("annotation not found on field", f.getProto().getName(), id);
+    return schema::Value::Reader();
+  };
+  auto expectSa = [&](StructSchema::Field f, uint16_t width, kj::StringPtr name) {
+    auto value = annValue(f, saId).getStruct().as<DynamicStruct>(saSchema);
+    EXPECT_EQ(width, value.get("width").as<uint16_t>());
+    EXPECT_EQ(name, value.get("name").as<Text>());
+  };
+  auto expectLa = [&](StructSchema::Field f) {
+    auto value = annValue(f, laId).getList().as<List<uint16_t>>();
+    ASSERT_EQ(2u, value.size());
+    EXPECT_EQ(1u, value[0]);
+    EXPECT_EQ(2u, value[1]);
+  };
+
+  // The struct- and list-valued annotations inherited from Uuid arrive with their contents.
+  expectSa(s.getFieldByName("plain"), 10, "Hi");
+  expectLa(s.getFieldByName("plain"));
+
+  // A use-site annotation survives being merged with the inherited ones.
+  expectSa(s.getFieldByName("overridden"), 32, "Bye");
+  expectLa(s.getFieldByName("overridden"));
+
+  // Stamped group: the inner field keeps Uuid's annotations, and the list default is preserved.
+  auto boxed = s.getFieldByName("boxed").getType().asStruct();
+  expectSa(boxed.getFieldByName("inner"), 10, "Hi");
+  expectLa(boxed.getFieldByName("inner"));
+  auto tags = boxed.getFieldByName("tags").getProto().getSlot()
+      .getDefaultValue().getList().as<List<int32_t>>();
+  ASSERT_EQ(2u, tags.size());
+  EXPECT_EQ(3, tags[0]);
+  EXPECT_EQ(4, tags[1]);
+
+  // Same for a union newtype, whose body is translated through a synthesized unnamed union.
+  auto choice = s.getFieldByName("choice").getType().asStruct();
+  auto xs = choice.getFieldByName("xs").getProto().getSlot()
+      .getDefaultValue().getList().as<List<int32_t>>();
+  ASSERT_EQ(2u, xs.size());
+  EXPECT_EQ(5, xs[0]);
+  EXPECT_EQ(6, xs[1]);
+}
+
 TEST(SchemaParser, InlineGroupNewtypeStamp) {
   // A field written `@[...] :Vec3` where `type Vec3 = group {...}` stamps the newtype's fields
   // inline into the parent struct's data space (no pointer), remapping ordinals, and records

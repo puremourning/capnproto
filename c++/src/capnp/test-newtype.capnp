@@ -30,7 +30,15 @@ $Cxx.namespace("capnproto_test::capnp::newtype");
 
 using Import = import "test-newtype-import.capnp";
 
-type Uuid = Data;                    # scalar newtype -> `using`
+struct StructAnno {
+  width @0 :UInt16;
+  name @1 :Text;
+}
+
+annotation voidAnno(field) :Void;
+annotation structAnno(field) :StructAnno;
+
+type Uuid = Data $structAnno(width=10, name="Hello") $voidAnno; # scalar newtype -> `using`
 type Age = UInt16;                   # scalar newtype -> `using`
 
 type Vec3 = group {                  # group newtype -> offset-parametrized wrapper

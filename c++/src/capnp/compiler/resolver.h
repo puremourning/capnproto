@@ -122,6 +122,13 @@ public:
   // traversing other schemas.  Returns null if the ID is recognized, but the corresponding
   // schema node failed to be built for reasons that were already reported.
 
+  virtual kj::Maybe<schema::Node::Reader> resolveFinalAuxSchema(
+      uint64_t parentId, uint64_t auxId) = 0;
+  // Like resolveFinalSchema(), but for an auxiliary node -- a group node or an inline group/union
+  // newtype's template struct.  Auxiliary nodes are produced as a side effect of translating the
+  // node that contains them and have no identity of their own, so the containing node must be
+  // named as well.  Returns null if `parentId` produced no such node.
+
   virtual kj::Maybe<ResolvedDecl> resolveImport(kj::StringPtr name) = 0;
   // Get the ID of an imported file given the import path.
 
