@@ -72,6 +72,12 @@ public:
     // using the target type. This happens when the decl resolved to an alias; all other fields
     // of `ResolvedDecl` refer to the target of the alias, except for `scopeId` which is the
     // scope that contained the alias.
+
+    uint64_t newtypeId = 0;
+    // If non-zero, the name resolved through a `type` alias (newtype) with this node ID.  As
+    // with `brand`, the other fields describe the *underlying* target type; this ID lets the
+    // resulting schema::Type record a `typeId` back-reference so that code generators can
+    // recover the newtype's name.  Zero means the name did not resolve through a `type`.
   };
 
   struct ResolvedParameter {
@@ -115,6 +121,13 @@ public:
   // Throws an exception if the id is not one that was found by calling resolve() or by
   // traversing other schemas.  Returns null if the ID is recognized, but the corresponding
   // schema node failed to be built for reasons that were already reported.
+
+  virtual kj::Maybe<schema::Node::Reader> resolveFinalAuxSchema(
+      uint64_t parentId, uint64_t auxId) = 0;
+  // Like resolveFinalSchema(), but for an auxiliary node -- a group node or an inline group/union
+  // newtype's template struct.  Auxiliary nodes are produced as a side effect of translating the
+  // node that contains them and have no identity of their own, so the containing node must be
+  // named as well.  Returns null if `parentId` produced no such node.
 
   virtual kj::Maybe<ResolvedDecl> resolveImport(kj::StringPtr name) = 0;
   // Get the ID of an imported file given the import path.

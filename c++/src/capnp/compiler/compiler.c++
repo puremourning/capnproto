@@ -79,6 +79,7 @@ public:
 
   kj::Maybe<Schema> getBootstrapSchema();
   kj::Maybe<schema::Node::Reader> getFinalSchema();
+  kj::Maybe<schema::Node::Reader> getFinalAuxSchema(uint64_t auxId);
   void loadFinalSchema(const SchemaLoader& loader);
 
   void traverse(uint eagerness, std::unordered_map<Node*, uint>& seen,
@@ -100,6 +101,8 @@ public:
   kj::Maybe<Schema> resolveBootstrapSchema(
       uint64_t id, schema::Brand::Reader brand) override;
   kj::Maybe<schema::Node::Reader> resolveFinalSchema(uint64_t id) override;
+  kj::Maybe<schema::Node::Reader> resolveFinalAuxSchema(
+      uint64_t parentId, uint64_t auxId) override;
   kj::Maybe<ResolvedDecl> resolveImport(kj::StringPtr name) override;
   kj::Maybe<kj::Array<const byte>> readEmbed(kj::StringPtr name) override;
   kj::Maybe<Type> resolveBootstrapType(schema::Type::Reader type, Schema scope) override;
@@ -504,6 +507,29 @@ kj::Maybe<Compiler::Node::Content&> Compiler::Node::getContent(Content::State mi
             content.aliases.insert(std::make_pair(name, kj::mv(alias)));
             break;
           }
+
+          case Declaration::TYPE: {
+            // A `type X = <expr>` declaration is represented two ways at once:
+            //   * as a real Node, so that it survives into the schema and code generators can
+            //     see the newtype; and
+            //   * as an Alias, so that references to the name resolve transparently to the
+            //     underlying target type.
+            // resolveMember() finds the node, resolves through the alias, and stamps the
+            // node's ID onto the result as a `newtypeId` back-reference.
+            kj::Own<Node> subNode = arena.allocateOwn<Node>(*this, nestedDecl);
+            kj::StringPtr name = nestedDecl.getName().getValue();
+            content.orderedNestedNodes.add(subNode);
+            content.nestedNodes.insert(std::make_pair(name, kj::mv(subNode)));
+            if (nestedDecl.getType().getTarget().isExpression()) {
+              // A `type X = <expr>` newtype also resolves transparently via an alias (see
+              // resolveMember). Inline group/union newtypes are resolved differently -- they are
+              // stamped into the parent at use sites -- so they don't get an alias.
+              kj::Own<Alias> alias = arena.allocateOwn<Alias>(
+                  *module, *this, nestedDecl.getType().getTarget().getExpression());
+              content.aliases.insert(std::make_pair(name, kj::mv(alias)));
+            }
+            break;
+          }
           case Declaration::ENUMERANT:
           case Declaration::FIELD:
           case Declaration::UNION:
@@ -643,6 +669,19 @@ kj::Maybe<schema::Node::Reader> Compiler::Node::getFinalSchema() {
     return kj::none;
   }
 }
+kj::Maybe<schema::Node::Reader> Compiler::Node::getFinalAuxSchema(uint64_t auxId) {
+  // Note that unlike getFinalSchema(), there's no `loadedFinalSchema` shortcut for aux nodes; we
+  // have to go through the content, which finishes this node if it hasn't been finished already.
+  KJ_IF_SOME(content, getContent(Content::FINISHED)) {
+    for (auto aux: content.auxSchemas) {
+      if (aux.getId() == auxId) {
+        return aux;
+      }
+    }
+  }
+  return kj::none;
+}
+
 void Compiler::Node::loadFinalSchema(const SchemaLoader& loader) {
   KJ_IF_SOME(content, getContent(Content::FINISHED)) {
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&](){
@@ -733,6 +772,13 @@ void Compiler::Node::traverseNodeDependencies(
             break;
         }
 
+        // An inline group/union `type` newtype stamped at this field records its identity as a
+        // back-reference on the field. That `type` node may live in another file, so pull it in
+        // explicitly; otherwise importers would be missing its schema and template.
+        if (field.getTypeId() != 0) {
+          traverseDependency(field.getTypeId(), eagerness, seen, finalLoader, sourceInfo);
+        }
+
         traverseAnnotations(field.getAnnotations(), eagerness, seen, finalLoader, sourceInfo);
       }
       break;
@@ -783,6 +829,13 @@ void Compiler::Node::traverseType(const schema::Type::Reader& type, uint eagerne
                                   std::unordered_map<Node*, uint>& seen,
                                   const SchemaLoader& finalLoader,
                                   kj::Vector<schema::Node::SourceInfo::Reader>& sourceInfo) {
+  // A `type` newtype records its identity as a back-reference on the underlying type. Pull in
+  // that node so importers receive its schema (and, for a group newtype, its template). This
+  // field is present regardless of the underlying `which()`, so check it before the switch.
+  if (type.getTypeId() != 0) {
+    traverseDependency(type.getTypeId(), eagerness, seen, finalLoader, sourceInfo);
+  }
+
   uint64_t id = 0;
   schema::Brand::Reader brand;
   switch (type.which()) {
@@ -901,6 +954,21 @@ Compiler::Node::resolveMember(kj::StringPtr name) {
       auto iter = content.nestedNodes.find(name);
       if (iter != content.nestedNodes.end()) {
         Node* node = iter->second;
+        if (node->kind == Declaration::TYPE) {
+          // A `type` newtype resolves transparently to its underlying target (via the alias
+          // created alongside the node), but records the node's ID so that the resulting
+          // schema::Type carries a `typeId` back-reference to the newtype.
+          auto aliasIter = content.aliases.find(name);
+          if (aliasIter != content.aliases.end()) {
+            KJ_IF_SOME(aliasResult, aliasIter->second->compile()) {
+              if (aliasResult.is<ResolvedDecl>()) {
+                aliasResult.get<ResolvedDecl>().newtypeId = node->id;
+              }
+              return kj::mv(aliasResult);
+            }
+            return kj::none;
+          }
+        }
         ResolveResult result;
         result.init<ResolvedDecl>(ResolvedDecl {
             node->id, node->genericParamCount, id, node->kind, node, kj::none });
@@ -951,13 +1019,25 @@ kj::Maybe<Schema> Compiler::Node::resolveBootstrapSchema(
     // Now we actually invoke get() to evaluate the brand.
     return module->getCompiler().getWorkspace().bootstrapLoader.get(id, brand);
   } else {
-    KJ_FAIL_REQUIRE("Tried to get schema for ID we haven't seen before.");
+    // Auxiliary nodes (group nodes, and group-newtype template structs) are loaded into the
+    // bootstrap loader alongside their parent, but are not top-level Compiler nodes, so findNode
+    // misses them. Look them up in the loader directly (returns null if genuinely unknown).
+    return module->getCompiler().getWorkspace().bootstrapLoader.tryGet(id, brand);
   }
 }
 
 kj::Maybe<schema::Node::Reader> Compiler::Node::resolveFinalSchema(uint64_t id) {
   KJ_IF_SOME(node, module->getCompiler().findNode(id)) {
     return node.getFinalSchema();
+  } else {
+    KJ_FAIL_REQUIRE("Tried to get schema for ID we haven't seen before.");
+  }
+}
+
+kj::Maybe<schema::Node::Reader> Compiler::Node::resolveFinalAuxSchema(
+    uint64_t parentId, uint64_t auxId) {
+  KJ_IF_SOME(node, module->getCompiler().findNode(parentId)) {
+    return node.getFinalAuxSchema(auxId);
   } else {
     KJ_FAIL_REQUIRE("Tried to get schema for ID we haven't seen before.");
   }
@@ -1080,6 +1160,12 @@ static void findImports(Declaration::Reader decl, std::set<kj::StringPtr>& outpu
   switch (decl.which()) {
     case Declaration::USING:
       findImports(decl.getUsing().getTarget(), output);
+      break;
+    case Declaration::TYPE:
+      if (decl.getType().getTarget().isExpression()) {
+        findImports(decl.getType().getTarget().getExpression(), output);
+      }
+      // Inline group/union bodies live in nestedDecls, walked generically below.
       break;
     case Declaration::CONST:
       findImports(decl.getConst().getType(), output);
@@ -1239,7 +1325,14 @@ kj::Maybe<uint64_t> Compiler::Impl::lookup(uint64_t parent, kj::StringPtr childN
   KJ_IF_SOME(parentNode, findNode(parent)) {
     KJ_IF_SOME(child, parentNode.resolveMember(childName)) {
       if (child.is<Resolver::ResolvedDecl>()) {
-        return child.get<Resolver::ResolvedDecl>().id;
+        auto& decl = child.get<Resolver::ResolvedDecl>();
+        // A `type` newtype resolves transparently to its underlying type, but records its own
+        // node ID in `newtypeId`. Name lookup / navigation wants the newtype node itself (which
+        // does exist in the schema), not the underlying type.
+        if (decl.newtypeId != 0) {
+          return decl.newtypeId;
+        }
+        return decl.id;
       } else {
         // An alias. We don't support looking up aliases with this method.
         return kj::none;

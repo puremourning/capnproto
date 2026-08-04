@@ -249,6 +249,10 @@ public:
       case schema::Node::ANNOTATION:
         validate(node.getAnnotation());
         break;
+      case schema::Node::TYPE:
+        // A `type` newtype is an alias for its underlying type; it carries no layout of its
+        // own to validate.
+        break;
     }
 
     // We accept and pass through node types we don't recognize.
@@ -734,6 +738,10 @@ private:
         break;
       case schema::Node::ANNOTATION:
         checkCompatibility(node.getAnnotation(), replacement.getAnnotation());
+        break;
+      case schema::Node::TYPE:
+        // A `type` newtype is an alias; compatibility of the underlying type is checked
+        // through the fields that reference it.
         break;
     }
   }
@@ -1427,6 +1435,10 @@ _::RawSchema* SchemaLoader::Impl::loadEmpty(
     case schema::Node::ANNOTATION:
       KJ_FAIL_REQUIRE("Not a type.");
       break;
+
+    case schema::Node::TYPE:
+      KJ_FAIL_REQUIRE("Cannot synthesize a placeholder for a `type` newtype.");
+      break;
   }
 
   return load(node, isPlaceholder);
@@ -1559,6 +1571,13 @@ SchemaLoader::Impl::makeBrandedDependencies(
     case schema::Node::CONST:
       ADD_ENTRY(CONST_TYPE, 0, makeDepSchema(
           node.getConst().getType(), scopeName, bindings));
+      break;
+
+    case schema::Node::TYPE:
+      // A `type` newtype's underlying type is a dependency (e.g. a group newtype's template
+      // struct), reachable via Schema::getDependency().
+      ADD_ENTRY(CONST_TYPE, 0, makeDepSchema(
+          node.getType(), scopeName, bindings));
       break;
 
     case schema::Node::STRUCT: {

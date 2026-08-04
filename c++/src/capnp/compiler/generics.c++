@@ -98,6 +98,16 @@ Resolver::ResolvedParameter BrandedDecl::asVariable() {
 
 bool BrandedDecl::compileAsType(
     ErrorReporter& errorReporter, schema::Type::Builder target) {
+  if (body.is<Resolver::ResolvedDecl>()) {
+    // If the name resolved through a `type` newtype, record a back-reference to that node.
+    // The union filled below still describes the underlying type (for layout and wire format);
+    // `typeId` is a separate, non-union field, so setting it here is order-independent.
+    uint64_t newtypeId = body.get<Resolver::ResolvedDecl>().newtypeId;
+    if (newtypeId != 0) {
+      target.setTypeId(newtypeId);
+    }
+  }
+
   KJ_IF_SOME(kind, getKind()) {
     switch (kind) {
       case Declaration::ENUM: {
@@ -182,6 +192,11 @@ bool BrandedDecl::compileAsType(
         target.initAnyPointer().initUnconstrained().setCapability();
         return true;
 
+      case Declaration::TYPE:
+        // `type` names resolve transparently to their target before reaching here, so a
+        // `type` declaration is not expected in type position at this point; listed for
+        // switch exhaustiveness.
+        KJ_FALLTHROUGH;
       case Declaration::FILE:
       case Declaration::USING:
       case Declaration::CONST:

@@ -463,6 +463,8 @@ test_capnpc_inputs =                                           \
   src/capnp/test.capnp                                         \
   src/capnp/test-import.capnp                                  \
   src/capnp/test-import2.capnp                                 \
+  src/capnp/test-newtype.capnp                                 \
+  src/capnp/test-newtype-import.capnp                          \
   src/capnp/compat/json-test.capnp
 
 test_capnpc_outputs =                                          \
@@ -472,6 +474,10 @@ test_capnpc_outputs =                                          \
   src/capnp/test-import.capnp.h                                \
   src/capnp/test-import2.capnp.c++                             \
   src/capnp/test-import2.capnp.h                               \
+  src/capnp/test-newtype.capnp.c++                             \
+  src/capnp/test-newtype.capnp.h                               \
+  src/capnp/test-newtype-import.capnp.c++                      \
+  src/capnp/test-newtype-import.capnp.h                        \
   src/capnp/compat/json-test.capnp.c++                         \
   src/capnp/compat/json-test.capnp.h
 
@@ -601,6 +607,7 @@ capnp_test_SOURCES =                                           \
   src/capnp/any-test.c++                                       \
   src/capnp/message-test.c++                                   \
   src/capnp/encoding-test.c++                                  \
+  src/capnp/newtype-test.c++                                   \
   src/capnp/orphan-test.c++                                    \
   src/capnp/serialize-test.c++                                 \
   src/capnp/serialize-packed-test.c++                          \

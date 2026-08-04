@@ -116,6 +116,12 @@ private:
   // If this is a struct node and it contains groups, these are the nodes for those groups,  which
   // must be loaded together with the top-level node.
 
+  kj::Vector<Orphan<List<Declaration>>> synthesizedDecls;
+  // Declaration ASTs synthesized during translation (currently, the unnamed union wrapping a
+  // union newtype's body).  These must outlive translation: a value expression which is
+  // interpreted lazily (see `unfinishedValues`) is remembered as a reader into the AST it came
+  // from, and is not read until finish().
+
   kj::Vector<AuxNode> paramStructs;
   // If this is an interface, these are the auto-generated structs representing params and results.
 
@@ -131,6 +137,33 @@ private:
   // of the dynamic API).  Once bootstrap schemas have been built, they can be used to interpret
   // these values.
 
+  struct UnfinishedInheritedAnnotation {
+    uint64_t sourceNodeId;
+    // The `type` newtype node which declared the annotation.
+    uint64_t annotationId;
+    schema::Annotation::Builder target;
+    // The copy of the annotation which was stamped onto a field in `wipNode`.
+  };
+  kj::Vector<UnfinishedInheritedAnnotation> unfinishedInheritedAnnotations;
+  // Annotations which a field inherited from a `type` newtype and whose values are pointer-typed.
+  // Such values are themselves interpreted lazily (see `unfinishedValues`), so at the time the
+  // annotation was copied out of the newtype's *bootstrap* schema the value was still an empty
+  // placeholder.  finish() re-copies them from the newtype's final schema.
+
+  struct UnfinishedStampedField {
+    uint64_t newtypeId;
+    // The `type` newtype node whose template the field was stamped from.
+    uint64_t templateId;
+    // The template (or nested group) node within that newtype which declared the field.
+    kj::StringPtr fieldName;
+    schema::Field::Builder target;
+    // The stamped copy of the field in `wipNode`.
+  };
+  kj::Vector<UnfinishedStampedField> unfinishedStampedFields;
+  // Fields stamped from an inline group/union newtype template whose annotation values or default
+  // value are pointer-typed.  Same problem as `unfinishedInheritedAnnotations`: they were copied
+  // out of the template's bootstrap schema, where such values are still placeholders.
+
   void compileNode(Declaration::Reader decl, schema::Node::Builder builder);
 
   void compileConst(Declaration::Const::Reader decl, schema::Node::Const::Builder builder);
@@ -141,6 +174,8 @@ private:
                    schema::Node::Builder builder);
   void compileStruct(Void decl, List<Declaration>::Reader members,
                      schema::Node::Builder builder);
+  void compileInlineGroupNewtypeTemplate(List<Declaration>::Reader members,
+                                         schema::Node::Builder builder, bool isUnion);
   void compileInterface(Declaration::Interface::Reader decl,
                         List<Declaration>::Reader members,
                         schema::Node::Builder builder);
@@ -189,7 +224,30 @@ private:
 
   Orphan<List<schema::Annotation>> compileAnnotationApplications(
       List<Declaration::AnnotationApplication>::Reader annotations,
-      kj::StringPtr targetsFlagName);
+      kj::StringPtr targetsFlagName,
+      kj::Maybe<kj::Vector<uint>&> deferredIndices = kj::none);
+  // If `deferredIndices` is given, it receives the index of each annotation whose value was added
+  // to `unfinishedValues` (rather than compiled immediately).  The corresponding `unfinishedValues`
+  // entries are appended in the same order, which lets the caller re-point them if it moves the
+  // resulting list.
+
+  Orphan<List<schema::Annotation>> compileFieldAnnotations(
+      List<Declaration::AnnotationApplication>::Reader fieldAnnotations,
+      uint64_t newtypeId);
+  // Like compileAnnotationApplications() with "targetsField", but also merges in the
+  // (field-scoped) annotations of the `type` newtype that the field was written as, following
+  // the newtype chain.  Use-site annotations, then nearer newtypes, win over farther ones (by
+  // annotation ID).  `newtypeId` is the field's resolved slot-type `typeId` (0 if none).
+
+  void deferStampedFieldFixups(uint64_t newtypeId, uint64_t templateId, kj::StringPtr fieldName,
+                               schema::Field::Builder target);
+  // If `target` (just copied from a newtype template's field) has an annotation value or a default
+  // value which is pointer-typed, arrange for those to be re-copied from the template's final
+  // schema in finish().
+
+  void finishNewtypeValues();
+  // Fill in the annotation and default values which a field took from a `type` newtype and which
+  // could only be copied as empty placeholders at bootstrap time.  Called from finish().
 };
 
 class ValueTranslator {
