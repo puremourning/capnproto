@@ -208,6 +208,8 @@ cc_capnp_library(
         "test.capnp",
         "test-import.capnp",
         "test-import2.capnp",
+        "test-newtype.capnp",
+        "test-newtype-import.capnp",
     ],
     data = [
         "c++.capnp",
@@ -251,6 +253,7 @@ cc_library(
     "layout-test.c++",
     "membrane-test.c++",
     "message-test.c++",
+    "newtype-test.c++",
     "orphan-test.c++",
     "reconnect-test.c++",
     "rpc-test.c++",
