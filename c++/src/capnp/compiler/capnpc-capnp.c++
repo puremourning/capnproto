@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <stdlib.h>
 #include <capnp/schema.capnp.h>
 #include "../serialize.h"
 #include <kj/debug.h>
@@ -88,14 +89,21 @@ inline Indent KJ_STRINGIFY(const Indent& indent) {
 
 class CapnpcCapnpMain {
 public:
-  CapnpcCapnpMain(kj::ProcessContext& context): context(context) {}
+  CapnpcCapnpMain(kj::ProcessContext& context): context(context) {
+    auto compatVersion = getenv("CAPNPC_CAPNP_COMPAT_VERSION");
+    v1Compat = compatVersion != nullptr && strcmp(compatVersion, "1") == 0;
+  }
 
   kj::MainFunc getMain() {
     return kj::MainBuilder(context, "Cap'n Proto loopback plugin version " VERSION,
           "This is a Cap'n Proto compiler plugin which \"de-compiles\" the schema back into "
           "Cap'n Proto schema language format, with comments showing the offsets chosen by the "
           "compiler.  This is meant to be run using the Cap'n Proto compiler, e.g.:\n"
-          "    capnp compile -ocapnp foo.capnp")
+          "    capnp compile -ocapnp foo.capnp\n\n"
+          "The following environment variables control the behavior of the output:\n"
+          "    CAPNPC_CAPNP_COMPAT_VERSION=<version>\n"
+          "        If set, the output will be compatible with the given major version of the Cap'n Proto compiler. "
+          "        In particular, if set to 1, then the output will not included newtypes, only their flattened results.")
         .callAfterParsing(KJ_BIND_METHOD(*this, run))
         .build();
   }
@@ -103,6 +111,8 @@ public:
 private:
   kj::ProcessContext& context;
   SchemaLoader schemaLoader;
+
+  bool v1Compat = false;
 
   Text::Reader getUnqualifiedName(Schema schema) {
     auto proto = schema.getProto();
@@ -198,9 +208,10 @@ private:
 
   kj::StringTree genType(schema::Type::Reader type, Schema scope,
                          kj::Maybe<InterfaceSchema::Method> method) {
-    if (type.getTypeId() != 0) {
+    if (type.getTypeId() != 0 && !v1Compat) {
       // This type was written as a `type` newtype; show the newtype's name rather than the
       // underlying type it resolves to.
+      // In v1 compatibility mode, we skip this and print the raw type.
       return nodeName(schemaLoader.get(type.getTypeId()), scope, schema::Brand::Reader(), method);
     }
     switch (type.which()) {
@@ -485,7 +496,7 @@ private:
         return kj::strTree(
             indent, proto.getName(),
             " :group", genAnnotations(proto.getAnnotations(), scope), " {",
-            proto.getTypeId() != 0
+            proto.getTypeId() != 0 && !v1Compat
                 ? kj::strTree("  # type ", getUnqualifiedName(
                       schemaLoader.get(proto.getTypeId()))) : kj::strTree(),
             hasDiscriminantValue(proto)
@@ -642,6 +653,11 @@ private:
             genType(annotationProto.getType(), schema, kj::none), genAnnotations(schema), ";\n");
       }
       case schema::Node::TYPE: {
+        if (v1Compat) {
+          // In v1 compatibility mode, we don't emit newtype declarations at all.  Instead, we
+          // inline the underlying type wherever the newtype is used.
+          return kj::strTree();
+        }
         auto type = proto.getType();
         if (type.isStruct()) {
           auto templateSchema = schemaLoader.get(type.getStruct().getTypeId());
