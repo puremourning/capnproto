@@ -2853,13 +2853,19 @@ private:
     // slot, or a nested group/union that is itself a wrapper-able newtype (so wrappers nest --
     // `OrderPrices`'s `limit`/`stop` become `Price` wrappers). Interface/AnyPointer fields and
     // pointer fields with explicit defaults still fall back to the naive group.
+    //
+    // A newtype aliasing one (`type Bar = Foo`) shares Foo's template, and has a wrapper iff Foo
+    // does: its `using Bar = Foo;` makes `Bar::Reader<...>` name Foo's wrapper.
     if (typeId == 0) return false;
     auto node = schemaLoader.getUnbound(typeId).getProto();
     if (!node.isType()) return false;
     auto type = node.getType();
     if (!type.isStruct()) return false;
     auto tmpl = schemaLoader.getUnbound(type.getStruct().getTypeId()).getProto();
-    if (tmpl.getScopeId() != typeId) return false;  // must be this node's own template
+    if (tmpl.getScopeId() != typeId) {
+      // Not this node's own template: an alias of the inline newtype that owns it.
+      return type.getTypeId() != 0 && hasInlineNewtypeWrapper(type.getTypeId());
+    }
     auto s = tmpl.getStruct();
     for (auto f: s.getFields()) {
       if (f.isSlot()) {

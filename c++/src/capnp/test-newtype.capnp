@@ -105,6 +105,35 @@ struct CrossFile {
   choice @[5, 6, 7] :Import.ImportedChoice;  # union newtype
 }
 
+# `type Bar = Foo` where Foo is a group/union newtype: Bar is another newtype sharing Foo's template.
+# Use sites stamp the same layout, record Bar as Field.typeId, and merge annotations along the chain
+# (use site, then Bar, then Foo; nearer wins by annotation ID). In C++, `using Bar = Foo;` means
+# Bar's use sites get Foo's wrapper.
+
+annotation groupAnno(group, union) :Text;
+
+type Point = Vec3 $groupAnno("point");          # alias of a group newtype
+type OrderKind = OrderType;                     # alias of a union newtype
+type ChainedPoint = Point $groupAnno("chained");  # alias of an alias; overrides Point's groupAnno
+type ImportedPoint = Import.ImportedVec;        # alias of a cross-file group newtype
+
+type Segment = group {                          # template built from an alias
+  from @[0-2] :Point;
+  to @[3-5] :Point;
+}
+
+struct Aliases {
+  corner @[0-2] :Point;
+  late @[3-5] :LatePoint;                       # alias declared after this struct
+  order @[6-9] :OrderKind;
+  chained @[10-12] :ChainedPoint;
+  overridden @[13-15] :ChainedPoint $groupAnno("use-site");
+  imported @[16-18] :ImportedPoint;
+  segment @[19-24] :Segment;
+}
+
+type LatePoint = Vec3;
+
 struct PlaceParams {
   # A method's parameters are an ordinary struct, so group/union newtypes reach a method through a
   # named parameter struct like this one. (The `@[...]` ordinal-mapping syntax is only valid on

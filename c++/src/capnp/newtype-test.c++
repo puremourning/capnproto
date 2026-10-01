@@ -269,6 +269,73 @@ TEST(Newtype, CrossFileNewtypes) {
   EXPECT_EQ(ImportedChoice::NONE, cf.asReader().getChoice().which());
 }
 
+kj::Maybe<kj::StringPtr> groupAnno(::capnp::StructSchema::Field field) {
+  // The value of `$groupAnno` on `field`, asserting it appears at most once (an alias's annotation
+  // must replace, not duplicate, the one it overrides).
+  kj::Maybe<kj::StringPtr> result;
+  for (auto anno: field.getProto().getAnnotations()) {
+    auto value = anno.getValue();
+    if (value.isText()) {
+      KJ_EXPECT(result == kj::none, "duplicate annotation", field.getProto().getName());
+      result = value.getText();
+    }
+  }
+  return result;
+}
+
+TEST(Newtype, AliasOfGroupOrUnionNewtype) {
+  ::capnp::MallocMessageBuilder message;
+  auto a = message.initRoot<Aliases>();
+
+  // Aliases of group/union newtypes get the aliased newtype's wrapper; these only compile if
+  // `Point::Builder<...>` etc. name Vec3's wrapper.
+  auto corner = a.getCorner();
+  corner.setX(1); corner.setY(2); corner.setZ(3);
+  auto late = a.getLate();
+  late.setZ(4);
+  a.getChained().setY(5);
+  a.getOverridden().setX(6);
+  a.getImported().setZ(7);
+  a.getOrder().setCancel(8);
+  auto segment = a.getSegment();
+  segment.getFrom().setX(9);
+  segment.getTo().setZ(10);
+
+  auto r = a.asReader();
+  Point::AnyReader anyCorner = r.getCorner().asAny();
+  Vec3::AnyReader sameType = anyCorner;  // Point is Vec3
+  EXPECT_EQ(1, sameType.getX());
+  EXPECT_EQ(2, r.getCorner().getY());
+  EXPECT_EQ(3, r.getCorner().getZ());
+  EXPECT_EQ(4, r.getLate().getZ());
+  EXPECT_EQ(5, r.getChained().getY());
+  EXPECT_EQ(6, r.getOverridden().getX());
+  EXPECT_EQ(7, r.getImported().getZ());
+  EXPECT_EQ(OrderKind::CANCEL, r.getOrder().which());
+  EXPECT_EQ(8, r.getOrder().getCancel());
+  EXPECT_EQ(9, r.getSegment().getFrom().getX());
+  EXPECT_EQ(10, r.getSegment().getTo().getZ());
+  // Distinct use sites don't overlap.
+  EXPECT_EQ(0, r.getChained().getX());
+  EXPECT_EQ(0, r.getSegment().getTo().getX());
+
+  // Each use site records the newtype it named (the alias), not the newtype it aliases.
+  auto schema = ::capnp::Schema::from<Aliases>();
+  auto typeIdOf = [&](kj::StringPtr name) {
+    return schema.getFieldByName(name).getProto().getTypeId();
+  };
+  EXPECT_NE(0u, typeIdOf("corner"));
+  EXPECT_NE(typeIdOf("corner"), typeIdOf("late"));
+  EXPECT_NE(typeIdOf("corner"), typeIdOf("chained"));
+  EXPECT_EQ(typeIdOf("chained"), typeIdOf("overridden"));
+
+  // Annotations merge along the chain: nearest wins.
+  EXPECT_EQ(groupAnno(schema.getFieldByName("corner")), kj::StringPtr("point"));
+  EXPECT_EQ(groupAnno(schema.getFieldByName("chained")), kj::StringPtr("chained"));
+  EXPECT_EQ(groupAnno(schema.getFieldByName("overridden")), kj::StringPtr("use-site"));
+  EXPECT_TRUE(groupAnno(schema.getFieldByName("late")) == kj::none);
+}
+
 #if !CAPNP_LITE
 
 class RegistryImpl final: public Registry::Server {

@@ -76,6 +76,14 @@ kj::Maybe<Declaration::Which> BrandedDecl::getKind() {
   }
 }
 
+uint64_t BrandedDecl::getNewtypeId() {
+  if (body.is<Resolver::ResolvedParameter>()) {
+    return 0;
+  } else {
+    return body.get<Resolver::ResolvedDecl>().newtypeId;
+  }
+}
+
 kj::Maybe<BrandedDecl&> BrandedDecl::getListParam() {
   KJ_REQUIRE(body.is<Resolver::ResolvedDecl>());
 
@@ -193,9 +201,9 @@ bool BrandedDecl::compileAsType(
         return true;
 
       case Declaration::TYPE:
-        // `type` names resolve transparently to their target before reaching here, so a
-        // `type` declaration is not expected in type position at this point; listed for
-        // switch exhaustiveness.
+        // Expression newtypes resolve transparently to their target before reaching here; only an
+        // inline group/union newtype (or a newtype aliasing one) stays a `type` declaration, and
+        // it can only be used via an `@[...]` field, not in type position.
         KJ_FALLTHROUGH;
       case Declaration::FILE:
       case Declaration::USING:

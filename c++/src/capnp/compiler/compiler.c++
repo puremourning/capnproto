@@ -818,6 +818,17 @@ void Compiler::Node::traverseNodeDependencies(
       traverseType(schemaNode.getAnnotation().getType(), eagerness, seen, finalLoader, sourceInfo);
       break;
 
+    case schema::Node::TYPE: {
+      // A newtype aliasing another newtype (`type Bar = Foo`) records Foo as Node.type.typeId.
+      // Pull it in so importers can follow the chain -- for an inline group/union newtype, to the
+      // node owning the template that Node.type points at.
+      uint64_t aliasedId = schemaNode.getType().getTypeId();
+      if (aliasedId != 0) {
+        traverseDependency(aliasedId, eagerness, seen, finalLoader, sourceInfo);
+      }
+      break;
+    }
+
     default:
       break;
   }

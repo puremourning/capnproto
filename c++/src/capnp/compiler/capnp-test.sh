@@ -138,3 +138,32 @@ $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype
 
 # Under-mapping a union below two members is a clean error, NOT an internal validation assert.
 $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-union-undermap.capnp.nobuild 2>&1 | grep -q "union needs at least two" || fail "union under-mapping should error cleanly"
+
+# capnpc-capnp output for schemas using newtypes must recompile, both natively and in v1
+# compatibility mode (which expands newtypes away, so a v1 compiler can read it). This covers
+# aliases of group/union newtypes (`type Bar = Foo`) and named unions carrying union-only
+# annotations (printed as `name :union $ann {...}`).
+if test -f ./capnpc-capnp; then
+  CAPNPC_CAPNP=${CAPNPC_CAPNP:-./capnpc-capnp}
+elif test -f ./capnpc-capnp.exe; then
+  CAPNPC_CAPNP=${CAPNPC_CAPNP:-./capnpc-capnp.exe}
+else
+  CAPNPC_CAPNP=${CAPNPC_CAPNP:-capnpc-capnp}
+fi
+REGEN_DIR=`mktemp -d`
+for compat in "" 1; do
+  for f in capnp/c++.capnp capnp/compat/json.capnp capnp/test-newtype-import.capnp \
+           capnp/test-newtype.capnp capnp/compat/json-test.capnp; do
+    mkdir -p "$REGEN_DIR/m$compat/`dirname $f`"
+    CAPNPC_CAPNP_COMPAT_VERSION=$compat $CAPNP compile --src-prefix="$SRCDIR" -I"$SRCDIR" \
+        -o"$CAPNPC_CAPNP" "$SRCDIR/$f" 2>/dev/null | sed 1d > "$REGEN_DIR/m$compat/$f" ||
+        fail "capnpc-capnp $f (compat='$compat')"
+  done
+  for f in capnp/test-newtype.capnp capnp/compat/json-test.capnp; do
+    $CAPNP compile --no-standard-import -I"$REGEN_DIR/m$compat" -o- "$REGEN_DIR/m$compat/$f" \
+        > /dev/null || fail "capnpc-capnp output for $f does not recompile (compat='$compat')"
+  done
+done
+! grep -q '^type \|@\[' "$REGEN_DIR/m1/capnp/test-newtype.capnp" ||
+    fail "capnpc-capnp v1 compat output still contains newtype syntax"
+rm -rf "$REGEN_DIR"

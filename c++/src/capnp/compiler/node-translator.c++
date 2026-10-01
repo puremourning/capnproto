@@ -692,12 +692,27 @@ void NodeTranslator::compileNode(Declaration::Reader decl, schema::Node::Builder
     case Declaration::TYPE: {
       auto target = decl.getType().getTarget();
       if (target.isExpression()) {
-        // A `type X = <expr>` newtype. Record the underlying type; references to the newtype
-        // resolve to this same underlying type but carry a `typeId` back-reference to this node.
-        compileType(target.getExpression(), builder.initType(), ImplicitParams::none());
-        // A newtype's annotations are field-scoped (they describe fields that use the newtype).
-        // They are stored on this node so that they can be merged onto referencing fields.
         targetsFlagName = "targetsField";
+        KJ_IF_SOME(decl, compileDeclExpression(target.getExpression(), ImplicitParams::none())) {
+          KJ_IF_SOME(ref, resolveInlineNewtype(decl)) {
+            // `type X = Y` where Y is an inline group/union newtype (or an alias of one): X is
+            // another inline newtype sharing Y's template. Node.type points at that template (so
+            // use sites stamp it) and records Y as `typeId`, which chains X's annotations onto
+            // Y's. Like Y's, X's annotations target the group/union.
+            auto type = builder.initType();
+            type.initStruct().setTypeId(ref.templateStruct.getProto().getId());
+            type.setTypeId(ref.newtypeId);
+            bool isUnion = ref.templateStruct.getProto().getStruct().getDiscriminantCount() > 0;
+            targetsFlagName = isUnion ? "targetsUnion" : "targetsGroup";
+          } else {
+            // A `type X = <expr>` newtype. Record the underlying type; references to the newtype
+            // resolve to this same underlying type but carry a `typeId` back-reference to this
+            // node. A newtype's annotations are field-scoped (they describe fields that use the
+            // newtype). They are stored on this node so that they can be merged onto referencing
+            // fields.
+            decl.compileAsType(errorReporter, builder.initType());
+          }
+        }
       } else {
         // Inline `type X = group {...}` / `union {...}` newtype. This node stays a `type` node
         // (the newtype identity / codegen marker); its `Node.type` points at a separate
@@ -1082,6 +1097,9 @@ private:
     // default value once that newtype has been finished.
     uint64_t stampedNewtypeId = 0;
     // For the group field that stamps a newtype: the newtype's node ID, recorded as Field.typeId.
+    kj::Maybe<schema::Field::Reader> stampedGroupField;
+    // If set, this GROUP was recreated from a nested group of an inline newtype template; this is
+    // the template's group field, whose (already-merged) annotations are copied onto the group.
     List<Declaration::AnnotationApplication>::Reader declAnnotations;
     uint startByte = 0;
     uint endByte = 0;
@@ -1419,6 +1437,8 @@ private:
     if (isUnion) {
       unionLayout = &arena.allocate<StructLayout::Union>(layout);
       groupMember.unionScope = unionLayout;
+      // So that annotations on the stamped member are checked against `targetsUnion`.
+      groupMember.declKind = Declaration::UNION;
     }
     uint codeOrder = 0;
     for (auto tf: tmplStruct.getFields()) {
@@ -1444,6 +1464,9 @@ private:
             newGroupNode(groupMember.node, member),
             member.getStartByte(), member.getEndByte(), tfProto.getTypeId());
         subMember.isInUnion = isUnion;
+        subMember.stampedGroupField = tfProto;
+        subMember.stampedFromNewtypeId = newtypeId;
+        subMember.stampedFromTemplateId = tmplStruct.getProto().getId();
         allMembers.add(&subMember);
         KJ_IF_SOME(sub, resolveStampSchema(tfProto.getGroup().getTypeId())) {
           if (isUnion) {
@@ -1469,37 +1492,19 @@ private:
     // `groupIsInUnion` is set when the stamped field is itself a union member (e.g.
     // `limit @[0-1] :Price` inside a union): the minted group becomes a discriminated member,
     // and `layout` should be its singleton group within the enclosing union.
-    uint64_t newtypeId = 0;
-    kj::Maybe<StructSchema> templateStruct;
-    auto brandOrphan = translator.orphanage.newOrphan<schema::Brand>();
+    kj::Maybe<InlineNewtypeRef> resolved;
     KJ_IF_SOME(decl, translator.compileDeclExpression(
         member.getField().getType(), ImplicitParams::none())) {
-      KJ_IF_SOME(kind, decl.getKind()) {
-        if (kind == Declaration::TYPE) {
-          newtypeId = decl.getIdAndFillBrand([&]() { return brandOrphan.get(); });
-          // The `type` node's Node.type points at its template struct; follow it to get the
-          // fields to stamp.
-          KJ_IF_SOME(schema, translator.resolver.resolveBootstrapSchema(
-              newtypeId, brandOrphan.getReader())) {
-            auto node = schema.getProto();
-            if (node.isType() && node.getType().isStruct()) {
-              // Follow Node.type to the template struct. It's an aux node, resolved via the
-              // bootstrap loader fallback in resolveBootstrapSchema().
-              uint64_t templateId = node.getType().getStruct().getTypeId();
-              auto emptyBrand = translator.orphanage.newOrphan<schema::Brand>();
-              KJ_IF_SOME(tmpl, translator.resolver.resolveBootstrapSchema(
-                  templateId, emptyBrand.getReader())) {
-                if (tmpl.getProto().isStruct()) {
-                  templateStruct = tmpl.asStruct();
-                }
-              }
-            }
-          }
-        }
-      }
+      resolved = translator.resolveInlineNewtype(decl);
     }
 
-    KJ_IF_SOME(tmpl, templateStruct) {
+    KJ_IF_SOME(ref, resolved) {
+      uint64_t newtypeId = ref.newtypeId;
+      StructSchema tmpl = ref.templateStruct;
+      // The inline newtype owning the template: the one to look the template up through once
+      // finished. Differs from `newtypeId` when the field names an alias (`type Bar = Foo`).
+      uint64_t templateOwnerId = tmpl.getProto().getScopeId();
+
       // Number of leaf slots across the whole template tree -- what `@[...]` must map.
       uint leafCount = countTemplateLeaves(tmpl);
 
@@ -1531,6 +1536,8 @@ private:
           newGroupNode(parent.node, member),
           member.getStartByte(), member.getEndByte(), newtypeId);
       groupMember.isInUnion = groupIsInUnion;
+      // Use-site annotations (e.g. `id @[0-2] :Uuid $foo`) apply to the stamped group field.
+      groupMember.declAnnotations = member.getAnnotations();
       allMembers.add(&groupMember);
 
       // Recursively copy the (already fully-resolved) template tree into the group, drawing each
@@ -1538,7 +1545,7 @@ private:
       // (which carry their own newtype identity via Field.typeId).
       uint ordinalIndex = 0;
       stampTemplateFields(tmpl, groupMember, layout, ordinals.asPtr(), ordinalIndex, member,
-                          newtypeId);
+                          templateOwnerId);
     } else {
       errorReporter.addErrorOn(member,
           "A '@[...]' ordinal mapping requires a field whose type is an inline "
@@ -1827,6 +1834,19 @@ private:
           member->getSchema().adoptAnnotations(
               translator.compileFieldAnnotations(member->declAnnotations, newtypeId));
         }
+      } else KJ_IF_SOME(stamped, member->stampedGroupField) {
+        // Nested group recreated from a newtype template: copy the template group field's
+        // annotations, as for stamped leaves.
+        member->getSchema().setAnnotations(stamped.getAnnotations());
+        translator.deferStampedFieldFixups(
+            member->stampedFromNewtypeId, member->stampedFromTemplateId, member->name,
+            member->getSchema());
+      } else if (member->stampedNewtypeId != 0) {
+        // The group field that stamps an inline group/union newtype inherits the newtype's
+        // annotations (declared on the `type` node, targeting group/union), merged with any
+        // specified at the use site.
+        member->getSchema().adoptAnnotations(translator.compileFieldAnnotations(
+            member->declAnnotations, member->stampedNewtypeId, targetsFlagName));
       } else {
         member->getSchema().adoptAnnotations(translator.compileAnnotationApplications(
             member->declAnnotations, targetsFlagName));
@@ -2114,6 +2134,39 @@ NodeTranslator::compileDeclExpression(
   } else {
     return kj::none;
   }
+}
+
+kj::Maybe<NodeTranslator::InlineNewtypeRef> NodeTranslator::resolveInlineNewtype(
+    BrandedDecl& decl) {
+  // Expression newtypes resolve through their alias to the underlying declaration, so a
+  // declaration that is still a `type` is an inline group/union newtype. If the name went
+  // through aliases (`type Bar = Foo`), `getNewtypeId()` is the alias actually named.
+  KJ_IF_SOME(kind, decl.getKind()) {
+    if (kind != Declaration::TYPE) return kj::none;
+  } else {
+    return kj::none;
+  }
+
+  auto brandOrphan = orphanage.newOrphan<schema::Brand>();
+  uint64_t inlineId = decl.getIdAndFillBrand([&]() { return brandOrphan.get(); });
+  uint64_t newtypeId = decl.getNewtypeId();
+  if (newtypeId == 0) newtypeId = inlineId;
+
+  // The inline newtype's Node.type points at its template struct, an aux node resolved via the
+  // bootstrap loader fallback in resolveBootstrapSchema().
+  KJ_IF_SOME(schema, resolver.resolveBootstrapSchema(inlineId, brandOrphan.getReader())) {
+    auto node = schema.getProto();
+    if (node.isType() && node.getType().isStruct()) {
+      uint64_t templateId = node.getType().getStruct().getTypeId();
+      auto emptyBrand = orphanage.newOrphan<schema::Brand>();
+      KJ_IF_SOME(tmpl, resolver.resolveBootstrapSchema(templateId, emptyBrand.getReader())) {
+        if (tmpl.getProto().isStruct()) {
+          return InlineNewtypeRef { newtypeId, tmpl.asStruct() };
+        }
+      }
+    }
+  }
+  return kj::none;
 }
 
 bool NodeTranslator::compileType(Expression::Reader source, schema::Type::Builder target,
@@ -2843,13 +2896,13 @@ static bool isDeferredValue(schema::Value::Reader value) {
 
 Orphan<List<schema::Annotation>> NodeTranslator::compileFieldAnnotations(
     List<Declaration::AnnotationApplication>::Reader fieldAnnotations,
-    uint64_t newtypeId) {
+    uint64_t newtypeId, kj::StringPtr targetsFlagName) {
   // Compile the field's own (use-site) annotations.  Track which of them have values that are
   // being interpreted lazily, in case we have to move the list below.
   kj::Vector<uint> deferredIndices;
   size_t unfinishedStart = unfinishedValues.size();
   Orphan<List<schema::Annotation>> own =
-      compileAnnotationApplications(fieldAnnotations, "targetsField", deferredIndices);
+      compileAnnotationApplications(fieldAnnotations, targetsFlagName, deferredIndices);
 
   if (newtypeId == 0 || !compileAnnotations) {
     return own;

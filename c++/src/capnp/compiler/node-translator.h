@@ -193,6 +193,18 @@ private:
       Expression::Reader source, ImplicitParams implicitMethodParams);
   // Compile an expression which is expected to resolve to a declaration or type expression.
 
+  struct InlineNewtypeRef {
+    uint64_t newtypeId;
+    // The newtype named (an inline group/union newtype, or a newtype aliasing one).
+    StructSchema templateStruct;
+    // The template struct whose fields are stamped. Its scopeId is the inline newtype that owns
+    // it, which differs from `newtypeId` when the name is an alias.
+  };
+
+  kj::Maybe<InlineNewtypeRef> resolveInlineNewtype(BrandedDecl& decl);
+  // If `decl` names an inline group/union newtype, directly or through `type` aliases, return
+  // the newtype named and the template to stamp.
+
   bool compileType(Expression::Reader source, schema::Type::Builder target,
                    ImplicitParams implicitMethodParams);
   // Returns false if there was a problem, in which case value expressions of this type should
@@ -233,11 +245,12 @@ private:
 
   Orphan<List<schema::Annotation>> compileFieldAnnotations(
       List<Declaration::AnnotationApplication>::Reader fieldAnnotations,
-      uint64_t newtypeId);
-  // Like compileAnnotationApplications() with "targetsField", but also merges in the
+      uint64_t newtypeId, kj::StringPtr targetsFlagName = "targetsField");
+  // Like compileAnnotationApplications() (with "targetsField" by default), but also merges in the
   // (field-scoped) annotations of the `type` newtype that the field was written as, following
   // the newtype chain.  Use-site annotations, then nearer newtypes, win over farther ones (by
-  // annotation ID).  `newtypeId` is the field's resolved slot-type `typeId` (0 if none).
+  // annotation ID).  `newtypeId` is the field's resolved slot-type `typeId` (0 if none), or the
+  // inline group/union newtype that a `@[...]` group field stamps.
 
   void deferStampedFieldFixups(uint64_t newtypeId, uint64_t templateId, kj::StringPtr fieldName,
                                schema::Field::Builder target);

@@ -493,16 +493,30 @@ private:
       }
       case schema::Field::GROUP: {
         auto group = field.getType().asStruct();
-        return kj::strTree(
-            indent, proto.getName(),
-            " :group", genAnnotations(proto.getAnnotations(), scope), " {",
+        // A named union is a group containing nothing but an unnamed union. Print it as
+        // `name :union {...}` rather than `name :group { union {...} }`, so that annotations
+        // targeting unions (which are stored on the field) remain valid where they're printed.
+        bool isNamedUnion = group.getProto().getStruct().getDiscriminantCount() > 0 &&
+                            group.getUnionFields().size() == group.getFields().size();
+        auto comments = kj::strTree(
+            isNamedUnion
+                ? kj::strTree("  # tag bits [",
+                      group.getProto().getStruct().getDiscriminantOffset() * 16, ", ",
+                      group.getProto().getStruct().getDiscriminantOffset() * 16 + 16, ")")
+                : kj::strTree(),
             proto.getTypeId() != 0 && !v1Compat
                 ? kj::strTree("  # type ", getUnqualifiedName(
                       schemaLoader.get(proto.getTypeId()))) : kj::strTree(),
             hasDiscriminantValue(proto)
-                ? kj::strTree("  # union tag = ", proto.getDiscriminantValue()) : kj::strTree(),
-            "\n",
-            genStructFields(group, indent.next()),
+                ? kj::strTree("  # union tag = ", proto.getDiscriminantValue()) : kj::strTree());
+        return kj::strTree(
+            indent, proto.getName(), isNamedUnion ? " :union" : " :group",
+            genAnnotations(proto.getAnnotations(), scope), " {", kj::mv(comments), "\n",
+            isNamedUnion
+                ? kj::strTree(KJ_MAP(uField, sortByCodeOrder(group.getUnionFields())) {
+                    return genStructField(uField, group, indent.next());
+                  })
+                : kj::strTree(genStructFields(group, indent.next())),
             indent, "}\n");
       }
     }
@@ -668,7 +682,7 @@ private:
               // A union newtype's template body is an unnamed union; emit its members directly.
               return kj::strTree(
                   indent, "type ", name, " @0x", kj::hex(proto.getId()),
-                  genAnnotations(schema), " = union {\n",
+                  " = union", genAnnotations(schema), " {\n",
                   KJ_MAP(uField, sortByCodeOrder(tmplStruct.getUnionFields())) {
                     return genStructField(uField, tmplStruct, indent.next());
                   },
@@ -676,7 +690,7 @@ private:
             } else {
               return kj::strTree(
                   indent, "type ", name, " @0x", kj::hex(proto.getId()),
-                  genAnnotations(schema), " = group {\n",
+                  " = group", genAnnotations(schema), " {\n",
                   genStructFields(tmplStruct, indent.next()),
                   indent, "}\n");
             }
