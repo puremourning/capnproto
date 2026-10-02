@@ -204,7 +204,11 @@ bool BrandedDecl::compileAsType(
         // Expression newtypes resolve transparently to their target before reaching here; only an
         // inline group/union newtype (or a newtype aliasing one) stays a `type` declaration, and
         // it can only be used via an `@[...]` field, not in type position.
-        KJ_FALLTHROUGH;
+        addError(errorReporter, kj::str(
+            "'", toString(), "' is an inline group/union newtype, which can only be used as the "
+            "type of a field with an '@[...]' ordinal mapping (e.g. 'foo @[0-1] :",
+            toString(), ";')."));
+        return false;
       case Declaration::FILE:
       case Declaration::USING:
       case Declaration::CONST:

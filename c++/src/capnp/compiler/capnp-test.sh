@@ -139,6 +139,11 @@ echo "$INCOMPLETE_WARN" | grep -q "warning: .*unmapped" || fail "incomplete mapp
 # Over-mapping (more ordinals than the inline newtype has fields) is a clean error.
 $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-over-mapping.capnp.nobuild 2>&1 | grep -q "maps 4 ordinals, but the type has only 3" || fail "over-mapping should error"
 
+# An inline group newtype used outside an `@[...]` field (directly, via an alias, or as a List
+# element) gets an error that points at `@[...]`, not a bare "is not a type".
+GROUP_AS_TYPE_ERR=$($CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-group-as-type.capnp.nobuild 2>&1 >/dev/null) && fail "inline group newtype in type position should error"
+test "`echo "$GROUP_AS_TYPE_ERR" | grep -c "is an inline group/union newtype, which can only be used as the type of a field with an '@\[...\]' ordinal mapping"`" = 3 || fail "inline group newtype in type position should explain '@[...]'"
+
 # Under-mapping a union below two members is a clean error, NOT an internal validation assert.
 $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-union-undermap.capnp.nobuild 2>&1 | grep -q "union needs at least two" || fail "union under-mapping should error cleanly"
 
