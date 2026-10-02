@@ -19,6 +19,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+#include "kj/common.h"
 #define CAPNP_TESTING_CAPNP 1
 
 #include "schema-parser.h"
@@ -150,6 +151,390 @@ TEST(SchemaParser, Basic) {
       ABS("opt/include/grault.capnp"), importPath);
   EXPECT_EQ(0x8000000000000001ull, wrongGraultSchema.getProto().getId());
   EXPECT_EQ("weird/display/name.capnp", wrongGraultSchema.getProto().getDisplayName());
+}
+
+TEST(SchemaParser, TypeDeclarationResolvesTransparently) {
+  // A `type X = <expr>` declaration behaves like a named `using`: every use of the newtype
+  // resolves to the underlying type in the schema (transparently, even when chained through
+  // another `type`).
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("newtype.capnp",
+      "@0x8123456789abce01;\n"
+      "type Uuid = Data;\n"
+      "type ProviderId = Uuid;\n"
+      "struct S {\n"
+      "  providerId @0 :ProviderId;\n"
+      "  raw @1 :Uuid;\n"
+      "  name @2 :Text;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile(
+      "newtype.capnp", "newtype.capnp", nullptr);
+
+  auto fields = fileSchema.getNested("S").asStruct().getFields();
+  auto providerIdType = fields[0].getProto().getSlot().getType();
+  auto rawType = fields[1].getProto().getSlot().getType();
+  auto nameType = fields[2].getProto().getSlot().getType();
+  EXPECT_EQ(schema::Type::DATA, providerIdType.which());  // ProviderId -> Uuid -> Data
+  EXPECT_EQ(schema::Type::DATA, rawType.which());          // Uuid -> Data
+  EXPECT_EQ(schema::Type::TEXT, nameType.which());         // plain Text
+
+  // The `type` declarations survive into the schema as TYPE nodes.
+  auto uuidNode = fileSchema.getNested("Uuid").getProto();
+  auto providerIdNode = fileSchema.getNested("ProviderId").getProto();
+  EXPECT_EQ(schema::Node::TYPE, uuidNode.which());
+  EXPECT_EQ(schema::Node::TYPE, providerIdNode.which());
+
+  // Each use records a `typeId` back-reference to the newtype it was written as (the outermost
+  // name at the use site), while the wire type stays the underlying type.
+  EXPECT_EQ(providerIdNode.getId(), providerIdType.getTypeId());
+  EXPECT_EQ(uuidNode.getId(), rawType.getTypeId());
+  EXPECT_EQ(0u, nameType.getTypeId());
+
+  // A TYPE node records its underlying type, chaining the back-reference through intermediate
+  // newtypes: ProviderId -> Uuid -> Data.
+  EXPECT_EQ(schema::Type::DATA, uuidNode.getType().which());
+  EXPECT_EQ(0u, uuidNode.getType().getTypeId());
+  EXPECT_EQ(schema::Type::DATA, providerIdNode.getType().which());
+  EXPECT_EQ(uuidNode.getId(), providerIdNode.getType().getTypeId());
+}
+
+TEST(SchemaParser, TypeNewtypeAnnotationMerge) {
+  // A field written as a `type` newtype inherits that newtype's (field-scoped) annotations,
+  // merged through the newtype chain, with use-site annotations overriding by annotation ID.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("ann.capnp",
+      "@0x8123456789abce02;\n"
+      "annotation hex(field) :Void;\n"
+      "annotation len(field) :UInt32;\n"
+      "annotation pii(field) :Void;\n"
+      "type Uuid = Data $hex $len(16);\n"
+      "type ProviderId = Uuid $pii;\n"
+      "struct S {\n"
+      "  id @0 :Uuid;                  # -> hex, len(16)\n"
+      "  owner @1 :ProviderId;         # -> pii, hex, len(16) (inherited through chain)\n"
+      "  override @2 :Uuid $len(32);   # -> len(32) [use-site wins], hex\n"
+      "  plain @3 :Data;               # -> (none)\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("ann.capnp", "ann.capnp", nullptr);
+
+  uint64_t hexId = fileSchema.getNested("hex").getProto().getId();
+  uint64_t lenId = fileSchema.getNested("len").getProto().getId();
+  uint64_t piiId = fileSchema.getNested("pii").getProto().getId();
+
+  auto fields = fileSchema.getNested("S").asStruct().getFields();
+
+  auto hasAnn = [](StructSchema::Field f, uint64_t id) {
+    for (auto a: f.getProto().getAnnotations()) {
+      if (a.getId() == id) return true;
+    }
+    return false;
+  };
+  auto lenValue = [lenId](StructSchema::Field f) -> kj::Maybe<uint32_t> {
+    for (auto a: f.getProto().getAnnotations()) {
+      if (a.getId() == lenId) return a.getValue().getUint32();
+    }
+    return kj::none;
+  };
+
+  // id :Uuid -> hex, len(16)
+  EXPECT_TRUE(hasAnn(fields[0], hexId));
+  EXPECT_EQ(16u, KJ_ASSERT_NONNULL(lenValue(fields[0])));
+  EXPECT_FALSE(hasAnn(fields[0], piiId));
+
+  // owner :ProviderId -> pii (from ProviderId) + hex, len(16) (inherited from Uuid).
+  EXPECT_TRUE(hasAnn(fields[1], piiId));
+  EXPECT_TRUE(hasAnn(fields[1], hexId));
+  EXPECT_EQ(16u, KJ_ASSERT_NONNULL(lenValue(fields[1])));
+
+  // override :Uuid $len(32) -> use-site len(32) overrides the newtype's len(16); hex inherited.
+  EXPECT_EQ(32u, KJ_ASSERT_NONNULL(lenValue(fields[2])));
+  EXPECT_TRUE(hasAnn(fields[2], hexId));
+
+  // plain :Data -> no annotations at all.
+  EXPECT_EQ(0u, fields[3].getProto().getAnnotations().size());
+}
+
+TEST(SchemaParser, TypeNewtypePointerValues) {
+  // Pointer-typed values (structs, lists) are interpreted lazily, after all nodes have bootstrap
+  // schemas.  Everything a `type` newtype hands to a use site -- inherited annotations, and the
+  // annotations and defaults of a stamped inline group -- must carry those values, not the empty
+  // placeholders that stand in for them until the newtype has been finished.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("ptrann.capnp",
+      "@0x8123456789abce05;\n"
+      "struct Sa { width @0 :UInt16; name @1 :Text; }\n"
+      "annotation sa(field) :Sa;\n"
+      "annotation la(field) :List(UInt16);\n"
+      "type Uuid = Data $sa(width = 10, name = \"Hi\") $la([1, 2]);\n"
+      "type Boxed = group {\n"
+      "  inner @0 :Uuid;                      # annotations reach the stamp through Boxed\n"
+      "  tags @1 :List(Int32) = [3, 4];       # a pointer-typed default reaches it too\n"
+      "}\n"
+      "type Choice = union {\n"
+      "  xs @0 :List(Int32) = [5, 6];         # same, through the synthesized unnamed union\n"
+      "  n @1 :Int32;\n"
+      "}\n"
+      "struct S {\n"
+      "  plain @0 :Uuid;                                     # inherits sa and la\n"
+      "  overridden @1 :Uuid $sa(width = 32, name = \"Bye\");   # use-site sa, inherited la\n"
+      "  boxed @[2, 3] :Boxed;\n"
+      "  choice @[4, 5] :Choice;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("ptrann.capnp", "ptrann.capnp", nullptr);
+
+  StructSchema saSchema = fileSchema.getNested("Sa").asStruct();
+  uint64_t saId = fileSchema.getNested("sa").getProto().getId();
+  uint64_t laId = fileSchema.getNested("la").getProto().getId();
+  auto s = fileSchema.getNested("S").asStruct();
+
+  auto annValue = [](StructSchema::Field f, uint64_t id) -> schema::Value::Reader {
+    for (auto a: f.getProto().getAnnotations()) {
+      if (a.getId() == id) return a.getValue();
+    }
+    KJ_FAIL_EXPECT("annotation not found on field", f.getProto().getName(), id);
+    return schema::Value::Reader();
+  };
+  auto expectSa = [&](StructSchema::Field f, uint16_t width, kj::StringPtr name) {
+    auto value = annValue(f, saId).getStruct().as<DynamicStruct>(saSchema);
+    EXPECT_EQ(width, value.get("width").as<uint16_t>());
+    EXPECT_EQ(name, value.get("name").as<Text>());
+  };
+  auto expectLa = [&](StructSchema::Field f) {
+    auto value = annValue(f, laId).getList().as<List<uint16_t>>();
+    ASSERT_EQ(2u, value.size());
+    EXPECT_EQ(1u, value[0]);
+    EXPECT_EQ(2u, value[1]);
+  };
+
+  // The struct- and list-valued annotations inherited from Uuid arrive with their contents.
+  expectSa(s.getFieldByName("plain"), 10, "Hi");
+  expectLa(s.getFieldByName("plain"));
+
+  // A use-site annotation survives being merged with the inherited ones.
+  expectSa(s.getFieldByName("overridden"), 32, "Bye");
+  expectLa(s.getFieldByName("overridden"));
+
+  // Stamped group: the inner field keeps Uuid's annotations, and the list default is preserved.
+  auto boxed = s.getFieldByName("boxed").getType().asStruct();
+  expectSa(boxed.getFieldByName("inner"), 10, "Hi");
+  expectLa(boxed.getFieldByName("inner"));
+  auto tags = boxed.getFieldByName("tags").getProto().getSlot()
+      .getDefaultValue().getList().as<List<int32_t>>();
+  ASSERT_EQ(2u, tags.size());
+  EXPECT_EQ(3, tags[0]);
+  EXPECT_EQ(4, tags[1]);
+
+  // Same for a union newtype, whose body is translated through a synthesized unnamed union.
+  auto choice = s.getFieldByName("choice").getType().asStruct();
+  auto xs = choice.getFieldByName("xs").getProto().getSlot()
+      .getDefaultValue().getList().as<List<int32_t>>();
+  ASSERT_EQ(2u, xs.size());
+  EXPECT_EQ(5, xs[0]);
+  EXPECT_EQ(6, xs[1]);
+}
+
+TEST(SchemaParser, InlineGroupNewtypeStamp) {
+  // A field written `@[...] :Vec3` where `type Vec3 = group {...}` stamps the newtype's fields
+  // inline into the parent struct's data space (no pointer), remapping ordinals, and records
+  // Field.typeId = the newtype on each stamped group field.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("stamp.capnp",
+      "@0x8123456789abce03;\n"
+      "type Vec3 = group { x @0 :Float32; y @1 :Float32; z @2 :Float32; }\n"
+      "struct Rectangle {\n"
+      "  topLeft @[0-2] :Vec3;\n"
+      "  bottomRight @[3-5] :Vec3;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("stamp.capnp", "stamp.capnp", nullptr);
+
+  uint64_t vec3Id = fileSchema.getNested("Vec3").getProto().getId();
+  auto rect = fileSchema.getNested("Rectangle").asStruct();
+
+  // Six floats packed inline: 3 data words, no pointers.
+  EXPECT_EQ(3u, rect.getProto().getStruct().getDataWordCount());
+  EXPECT_EQ(0u, rect.getProto().getStruct().getPointerCount());
+
+  auto fields = rect.getFields();
+  ASSERT_EQ(2u, fields.size());
+  auto tl = fields[0].getProto();
+  auto br = fields[1].getProto();
+
+  // Both are group fields whose Field.typeId back-references the Vec3 newtype.
+  EXPECT_TRUE(tl.isGroup());
+  EXPECT_TRUE(br.isGroup());
+  EXPECT_EQ(vec3Id, tl.getTypeId());
+  EXPECT_EQ(vec3Id, br.getTypeId());
+
+  // The per-instance group nodes stamp x/y/z at consecutive offsets in the parent.
+  auto tlFields = rect.getDependency(tl.getGroup().getTypeId()).asStruct().getFields();
+  auto brFields = rect.getDependency(br.getGroup().getTypeId()).asStruct().getFields();
+  ASSERT_EQ(3u, tlFields.size());
+  ASSERT_EQ(3u, brFields.size());
+  for (uint i = 0; i < 3; i++) {
+    EXPECT_EQ(i, tlFields[i].getProto().getSlot().getOffset());
+    EXPECT_EQ(3u + i, brFields[i].getProto().getSlot().getOffset());
+    EXPECT_EQ(schema::Type::FLOAT32, tlFields[i].getProto().getSlot().getType().which());
+  }
+}
+
+TEST(SchemaParser, InlineUnionNewtypeStamp) {
+  // A union newtype stamps inline like a group, but with a discriminant: the members overlap
+  // and get discriminant values; the discriminant consumes an offset but no ordinal.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("ustamp.capnp",
+      "@0x8123456789abce04;\n"
+      "type Instruction = union { market @0 :Void; limit @1 :Float32; stop @2 :Float32; }\n"
+      "struct Order {\n"
+      "  id @0 :Int32;\n"
+      "  instr @[1, 2, 3] :Instruction;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("ustamp.capnp", "ustamp.capnp", nullptr);
+  uint64_t instrId = fileSchema.getNested("Instruction").getProto().getId();
+  auto order = fileSchema.getNested("Order").asStruct();
+
+  auto instr = order.getFieldByName("instr").getProto();
+  EXPECT_TRUE(instr.isGroup());
+  EXPECT_EQ(instrId, instr.getTypeId());  // Field.typeId back-reference to the newtype
+
+  auto instrGroup = order.getDependency(instr.getGroup().getTypeId()).asStruct();
+  EXPECT_EQ(3u, instrGroup.getProto().getStruct().getDiscriminantCount());
+
+  auto gf = instrGroup.getFields();
+  ASSERT_EQ(3u, gf.size());
+  EXPECT_EQ(0u, gf[0].getProto().getDiscriminantValue());  // market
+  EXPECT_EQ(1u, gf[1].getProto().getDiscriminantValue());  // limit
+  EXPECT_EQ(2u, gf[2].getProto().getDiscriminantValue());  // stop
+  // limit and stop are mutually exclusive -> they overlap at the same offset.
+  EXPECT_EQ(gf[1].getProto().getSlot().getOffset(), gf[2].getProto().getSlot().getOffset());
+}
+
+TEST(SchemaParser, InlineNewtypePropagatesFieldProperties) {
+  // A stamped leaf must carry the template field's default value, hadExplicitDefault flag and
+  // annotations -- not only its type.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("prop.capnp",
+      "@0x8123456789abce05;\n"
+      "annotation label @0x9123456789abce06 (field) :Text;\n"
+      "type X = group { foo @0 :UInt32 = 100 $label(\"f\"); bar @1 :Int32; }\n"
+      "struct S { a @[0, 1] :X; }\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("prop.capnp", "prop.capnp", nullptr);
+  auto s = fileSchema.getNested("S").asStruct();
+  auto group = s.getFieldByName("a").getType().asStruct();  // this instance's group node
+  auto foo = group.getFieldByName("foo").getProto();
+
+  ASSERT_TRUE(foo.isSlot());
+  EXPECT_TRUE(foo.getSlot().getHadExplicitDefault());
+  EXPECT_EQ(100u, foo.getSlot().getDefaultValue().getUint32());
+  ASSERT_EQ(1u, foo.getAnnotations().size());
+  EXPECT_EQ("f", foo.getAnnotations()[0].getValue().getText());
+}
+
+TEST(SchemaParser, NestedNewtypeUnionMember) {
+  // A group newtype used as a union member (`limit @[0,1] :Price`) must stamp as a discriminated
+  // group member of the union newtype's template -- previously this crashed the compiler.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("nest.capnp",
+      "@0x8123456789abce07;\n"
+      "type Price = group { value @0 :Int64; scale @1 :UInt16; }\n"
+      "type OrderType = union {\n"
+      "  limit @[0, 1] :Price;\n"
+      "  market @2 :Void;\n"
+      "}\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("nest.capnp", "nest.capnp", nullptr);
+  uint64_t priceId = fileSchema.getNested("Price").getProto().getId();
+  auto orderType = fileSchema.getNested("OrderType");
+
+  // Follow the `type` node to its template struct: a union with `limit` (a Price group) + market.
+  // The template and group nodes are auxiliary (not top-level), so find them among all loaded.
+  auto byId = [&](uint64_t id) -> Schema {
+    for (auto s: parser.getAllLoaded()) {
+      if (s.getProto().getId() == id) return s;
+    }
+    KJ_FAIL_REQUIRE("schema not loaded", id);
+  };
+
+  uint64_t tmplId = orderType.getProto().getType().getStruct().getTypeId();
+  auto tmpl = byId(tmplId).asStruct();
+  EXPECT_EQ(2u, tmpl.getProto().getStruct().getDiscriminantCount());
+
+  auto limit = tmpl.getFieldByName("limit").getProto();
+  EXPECT_TRUE(limit.isGroup());
+  EXPECT_EQ(priceId, limit.getTypeId());          // limit is a Price newtype
+  EXPECT_EQ(0u, limit.getDiscriminantValue());    // ...and a union member (tag 0)
+
+  auto limitGroup = byId(limit.getGroup().getTypeId()).asStruct();
+  ASSERT_EQ(2u, limitGroup.getFields().size());   // value, scale stamped in
+  EXPECT_EQ("value", limitGroup.getFields()[0].getProto().getName());
+  EXPECT_EQ("scale", limitGroup.getFields()[1].getProto().getName());
+}
+
+TEST(SchemaParser, RecursiveNestedNewtypeStamp) {
+  // A group newtype built from other group newtypes stamps recursively, preserving each level's
+  // newtype identity (Field.typeId): `prices` is an OrderPrices whose `limit`/`stop` are each a
+  // Price of value/scale.
+  FakeFileReader reader;
+  SchemaParser parser;
+  parser.setDiskFilesystem(reader);
+
+  reader.add("rec.capnp",
+      "@0x8123456789abce08;\n"
+      "type Price = group { value @0 :Int64; scale @1 :UInt16; }\n"
+      "type OrderPrices = group { limit @[0, 1] :Price; stop @[2, 3] :Price; }\n"
+      "struct Order { prices @[0, 1, 2, 3] :OrderPrices; }\n");
+
+  ParsedSchema fileSchema = parser.parseDiskFile("rec.capnp", "rec.capnp", nullptr);
+  uint64_t priceId = fileSchema.getNested("Price").getProto().getId();
+  uint64_t orderPricesId = fileSchema.getNested("OrderPrices").getProto().getId();
+  auto order = fileSchema.getNested("Order").asStruct();
+
+  auto byId = [&](uint64_t id) -> Schema {
+    for (auto s: parser.getAllLoaded()) {
+      if (s.getProto().getId() == id) return s;
+    }
+    KJ_FAIL_REQUIRE("schema not loaded", id);
+  };
+
+  auto prices = order.getFieldByName("prices").getProto();
+  EXPECT_TRUE(prices.isGroup());
+  EXPECT_EQ(orderPricesId, prices.getTypeId());          // prices is an OrderPrices
+
+  auto pricesGroup = byId(prices.getGroup().getTypeId()).asStruct();
+  auto limit = pricesGroup.getFieldByName("limit").getProto();
+  EXPECT_TRUE(limit.isGroup());
+  EXPECT_EQ(priceId, limit.getTypeId());                 // ...whose limit is a Price
+
+  auto limitGroup = byId(limit.getGroup().getTypeId()).asStruct();
+  ASSERT_EQ(2u, limitGroup.getFields().size());          // ...of value + scale
+  EXPECT_EQ("value", limitGroup.getFields()[0].getProto().getName());
+  EXPECT_TRUE(limitGroup.getFields()[0].getProto().isSlot());
 }
 
 TEST(SchemaParser, Constants) {

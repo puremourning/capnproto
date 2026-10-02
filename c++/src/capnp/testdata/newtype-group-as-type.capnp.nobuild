@@ -1,0 +1,10 @@
+# An inline group newtype (or an alias of one) used with a plain `@N` ordinal, or anywhere else
+# in type position, is an error that points the user at `@[...]`.
+@0xe1000000000f0004;
+type Vec2 = group { x @0 :Float32; y @1 :Float32; }
+type Point = Vec2;
+struct S {
+  a @0 :Vec2;
+  b @1 :Point;
+  c @2 :List(Vec2);
+}

@@ -108,6 +108,11 @@ public:
   kj::Maybe<Declaration::Which> getKind();
   // Returns the kind of declaration, or null if this is an unbound generic variable.
 
+  uint64_t getNewtypeId();
+  // If the name resolved through a `type` newtype's alias, that newtype's node ID; else 0. (For
+  // a newtype aliasing an inline group/union newtype, `getIdAndFillBrand()` returns the inline
+  // newtype at the end of the chain, while this returns the alias actually named.)
+
   template <typename InitBrandFunc>
   uint64_t getIdAndFillBrand(InitBrandFunc&& initBrand);
   // Returns the type ID of this node. `initBrand` is a zero-arg functor which returns

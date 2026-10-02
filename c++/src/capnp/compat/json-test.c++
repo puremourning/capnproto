@@ -1047,6 +1047,45 @@ KJ_TEST("base64 union encoded correctly") {
   KJ_EXPECT(json.encode(root) == "{\"foo\": \"AAAAAAA=\"}", json.encode(root));
 }
 
+KJ_TEST("annotations on inline newtypes") {
+  // A field stamped from an inline union newtype (`id @[0-2] :Uuid`) must pick up the JSON
+  // annotations declared on the newtype, its nested groups, and its leaves, plus any at the use
+  // site -- encoding exactly like the same union written out inline.
+  kj::StringPtr expected =
+      "{\"id\":{\"kind\":\"parts\",\"val.lo\":\"1\",\"val.hi\":\"2\"},"
+      "\"other-id\":{\"kind\":\"raw\",\"raw\":\"0102\"},"
+      "\"f.kind\":\"parts\",\"f.val.lo\":\"3\",\"f.val.hi\":\"4\"}"_kj;
+
+  JsonCodec json;
+  json.handleByAnnotation<TestJsonNewtype>();
+  json.handleByAnnotation<TestJsonNewtypeInline>();
+
+  MallocMessageBuilder message;
+  auto inlineRoot = message.getRoot<TestJsonNewtypeInline>();
+  auto parts = inlineRoot.getId().initParts();
+  parts.setLo(1);
+  parts.setHi(2);
+  inlineRoot.getRenamed().setRaw(kj::heapArray<byte>({1, 2}));
+  auto flatParts = inlineRoot.getFlat().initParts();
+  flatParts.setLo(3);
+  flatParts.setHi(4);
+
+  // Both structs have the same layout, so the same message can be read as either.
+  auto newtypeRoot = message.getRoot<TestJsonNewtype>().asReader();
+
+  KJ_EXPECT(json.encode(inlineRoot.asReader()) == expected, json.encode(inlineRoot.asReader()));
+  KJ_EXPECT(json.encode(newtypeRoot) == expected, json.encode(newtypeRoot));
+
+  {
+    MallocMessageBuilder decoded;
+    auto root = decoded.getRoot<TestJsonNewtype>();
+    json.decode(expected, root);
+    KJ_EXPECT(json.encode(root.asReader()) == expected, json.encode(root.asReader()));
+    auto inlineView = decoded.getRoot<TestJsonNewtypeInline>().asReader();
+    KJ_EXPECT(kj::str(inlineView) == kj::str(inlineRoot.asReader()), inlineView);
+  }
+}
+
 KJ_TEST("JSON encode bench") {
   // Example test based on basic json encoding benchmark.
   capnp::JsonCodec json;

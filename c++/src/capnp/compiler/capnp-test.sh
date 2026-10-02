@@ -37,6 +37,9 @@ else
   CAPNP=${CAPNP:-capnp}
 fi
 
+# Don't let the caller's environment add import paths to the tests below.
+unset CAPNP_INCLUDE
+
 SCHEMA=`dirname "$0"`/../test.capnp
 JSON_SCHEMA=`dirname "$0"`/../compat/json-test.capnp
 TESTDATA=`dirname "$0"`/../testdata
@@ -127,3 +130,71 @@ $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -ofoo $TESTDATA/error
 
 $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -ofoo $TESTDATA/errors2.capnp.nobuild 2>&1 | sed -e "s,^.*errors2[.]capnp[.]nobuild:,file:,g" | tr -d '\r' |
     diff -u $TESTDATA/errors2.txt - || fail error2 output
+
+# An incomplete `@[...]` mapping (fewer ordinals than the inline newtype has fields) is allowed,
+# but must warn about the unmapped trailing field(s) and still compile successfully (exit 0).
+INCOMPLETE_WARN=$($CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/incomplete-mapping.capnp.nobuild 2>&1 >/dev/null) || fail "incomplete mapping should compile"
+echo "$INCOMPLETE_WARN" | grep -q "warning: .*unmapped" || fail "incomplete mapping should warn about unmapped fields"
+
+# Over-mapping (more ordinals than the inline newtype has fields) is a clean error.
+$CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-over-mapping.capnp.nobuild 2>&1 | grep -q "maps 4 ordinals, but the type has only 3" || fail "over-mapping should error"
+
+# An inline group newtype used outside an `@[...]` field (directly, via an alias, or as a List
+# element) gets an error that points at `@[...]`, not a bare "is not a type".
+GROUP_AS_TYPE_ERR=$($CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-group-as-type.capnp.nobuild 2>&1 >/dev/null) && fail "inline group newtype in type position should error"
+test "`echo "$GROUP_AS_TYPE_ERR" | grep -c "is an inline group/union newtype, which can only be used as the type of a field with an '@\[...\]' ordinal mapping"`" = 3 || fail "inline group newtype in type position should explain '@[...]'"
+
+# Under-mapping a union below two members is a clean error, NOT an internal validation assert.
+$CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-union-undermap.capnp.nobuild 2>&1 | grep -q "union needs at least two" || fail "union under-mapping should error cleanly"
+
+# Under-mapping a union so that a trailing arm is wholly unmapped drops that arm and still
+# compiles (with the usual warning), NOT an internal validation assert.
+DROP_ARM_WARN=$($CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-union-drop-arm.capnp.nobuild 2>&1 >/dev/null) || fail "union arm drop should compile"
+echo "$DROP_ARM_WARN" | grep -q "warning: .*unmapped" || fail "union arm drop should warn about unmapped fields"
+
+# CAPNP_INCLUDE directories are searched, in order, before -I directories, even with
+# --no-standard-import. Empty and nonexistent entries are ignored.
+INCLUDE_DIR=`mktemp -d`
+mkdir -p "$INCLUDE_DIR/a/lib" "$INCLUDE_DIR/b/lib"
+printf '@0xa1b2c3d4e5f60001;\nconst which :Text = "a";\n' > "$INCLUDE_DIR/a/lib/x.capnp"
+printf '@0xa1b2c3d4e5f60001;\nconst which :Text = "b";\n' > "$INCLUDE_DIR/b/lib/x.capnp"
+printf '@0xa1b2c3d4e5f60002;\nconst v :Text = import "/lib/x.capnp".which;\n' > "$INCLUDE_DIR/m.capnp"
+case "$CAPNP" in *.exe) SEP=";" ;; *) SEP=":" ;; esac
+test "x`CAPNP_INCLUDE="$INCLUDE_DIR/a" $CAPNP eval --no-standard-import -I"$INCLUDE_DIR/b" "$INCLUDE_DIR/m.capnp" v | tr -d '\r'`" = 'x"a"' ||
+    fail "CAPNP_INCLUDE should be searched before -I"
+test "x`CAPNP_INCLUDE="$SEP$INCLUDE_DIR/missing$SEP$INCLUDE_DIR/b$SEP$INCLUDE_DIR/a$SEP" $CAPNP eval --no-standard-import "$INCLUDE_DIR/m.capnp" v | tr -d '\r'`" = 'x"b"' ||
+    fail "CAPNP_INCLUDE should be searched in order, ignoring empty and missing entries"
+if test "$SEP" = ":"; then  # Windows prints native paths, which won't match the shell's
+  test "x`CAPNP_INCLUDE="$INCLUDE_DIR/missing$SEP$INCLUDE_DIR/b" $CAPNP config --import-paths | head -1`" = "x$INCLUDE_DIR/b" ||
+      fail "config --import-paths should list existing CAPNP_INCLUDE directories first"
+fi
+rm -rf "$INCLUDE_DIR"
+
+# capnpc-capnp output for schemas using newtypes must recompile, both natively and in v1
+# compatibility mode (which expands newtypes away, so a v1 compiler can read it). This covers
+# aliases of group/union newtypes (`type Bar = Foo`) and named unions carrying union-only
+# annotations (printed as `name :union $ann {...}`).
+if test -f ./capnpc-capnp; then
+  CAPNPC_CAPNP=${CAPNPC_CAPNP:-./capnpc-capnp}
+elif test -f ./capnpc-capnp.exe; then
+  CAPNPC_CAPNP=${CAPNPC_CAPNP:-./capnpc-capnp.exe}
+else
+  CAPNPC_CAPNP=${CAPNPC_CAPNP:-capnpc-capnp}
+fi
+REGEN_DIR=`mktemp -d`
+for compat in "" 1; do
+  for f in capnp/c++.capnp capnp/compat/json.capnp capnp/test-newtype-import.capnp \
+           capnp/test-newtype.capnp capnp/compat/json-test.capnp; do
+    mkdir -p "$REGEN_DIR/m$compat/`dirname $f`"
+    CAPNPC_CAPNP_COMPAT_VERSION=$compat $CAPNP compile --src-prefix="$SRCDIR" -I"$SRCDIR" \
+        -o"$CAPNPC_CAPNP" "$SRCDIR/$f" 2>/dev/null | sed 1d > "$REGEN_DIR/m$compat/$f" ||
+        fail "capnpc-capnp $f (compat='$compat')"
+  done
+  for f in capnp/test-newtype.capnp capnp/compat/json-test.capnp; do
+    $CAPNP compile --no-standard-import -I"$REGEN_DIR/m$compat" -o- "$REGEN_DIR/m$compat/$f" \
+        > /dev/null || fail "capnpc-capnp output for $f does not recompile (compat='$compat')"
+  done
+done
+! grep -q '^type \|@\[' "$REGEN_DIR/m1/capnp/test-newtype.capnp" ||
+    fail "capnpc-capnp v1 compat output still contains newtype syntax"
+rm -rf "$REGEN_DIR"
