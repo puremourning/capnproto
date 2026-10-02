@@ -36,6 +36,7 @@ set(INSTALL_TARGETS_DEFAULT_ARGS
 # Options ======================================================================
 
 option(EXTERNAL_CAPNP "Use the system capnp binary, or the one specified in $CAPNP, instead of using the compiled one." OFF)
+option(CAPNP_RELOCATABLE_PKGCONFIG "Write pkg-config files with paths relative to their own location (via \${pcfiledir}) so that the installation can be moved. Requires relative CMAKE_INSTALL_LIBDIR and CMAKE_INSTALL_INCLUDEDIR." ON)
 option(CAPNP_LITE "Compile Cap'n Proto in 'lite mode', in which all reflection APIs (schema.h, dynamic.h, etc.) are not included. Produces a smaller library at the cost of features. All programs built against the library must be compiled with -DCAPNP_LITE. Requires EXTERNAL_CAPNP." OFF)
 
 # Check for invalid combinations of build options
@@ -216,10 +217,24 @@ configure_file(cmake/CapnProtoMacros.cmake cmake/CapnProtoMacros.cmake COPYONLY)
 
 if(NOT MSVC)  # Don't install pkg-config files when building with MSVC
   # Variables for pkg-config files
-  set(prefix "${CMAKE_INSTALL_PREFIX}")
-  set(exec_prefix "") # not needed since we use absolute paths in libdir and includedir
-  set(libdir "${CMAKE_INSTALL_FULL_LIBDIR}")
-  set(includedir "${CMAKE_INSTALL_FULL_INCLUDEDIR}")
+  if(CAPNP_RELOCATABLE_PKGCONFIG AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}"
+     AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+    # Express all paths relative to the location of the .pc file itself, so that the installation
+    # tree can be moved. ${pcfiledir} is supported by both pkg-config and pkgconf.
+    file(RELATIVE_PATH pcfiledir_to_prefix
+      "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/pkgconfig" "${CMAKE_INSTALL_PREFIX}")
+    string(REGEX REPLACE "/$" "" pcfiledir_to_prefix "${pcfiledir_to_prefix}")
+    set(prefix "\${pcfiledir}/${pcfiledir_to_prefix}")
+    set(exec_prefix "\${prefix}")
+    set(libdir "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    set(includedir "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    unset(pcfiledir_to_prefix)
+  else()
+    set(prefix "${CMAKE_INSTALL_PREFIX}")
+    set(exec_prefix "") # not needed since we use absolute paths in libdir and includedir
+    set(libdir "${CMAKE_INSTALL_FULL_LIBDIR}")
+    set(includedir "${CMAKE_INSTALL_FULL_INCLUDEDIR}")
+  endif()
   set(PTHREAD_CFLAGS "-pthread")
   set(STDLIB_FLAG)  # TODO: Unsupported
   if(WIN32)
