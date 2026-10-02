@@ -139,6 +139,11 @@ $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype
 # Under-mapping a union below two members is a clean error, NOT an internal validation assert.
 $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-union-undermap.capnp.nobuild 2>&1 | grep -q "union needs at least two" || fail "union under-mapping should error cleanly"
 
+# Under-mapping a union so that a trailing arm is wholly unmapped drops that arm and still
+# compiles (with the usual warning), NOT an internal validation assert.
+DROP_ARM_WARN=$($CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-union-drop-arm.capnp.nobuild 2>&1 >/dev/null) || fail "union arm drop should compile"
+echo "$DROP_ARM_WARN" | grep -q "warning: .*unmapped" || fail "union arm drop should warn about unmapped fields"
+
 # capnpc-capnp output for schemas using newtypes must recompile, both natively and in v1
 # compatibility mode (which expands newtypes away, so a v1 compiler can read it). This covers
 # aliases of group/union newtypes (`type Bar = Foo`) and named unions carrying union-only

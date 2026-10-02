@@ -1457,6 +1457,10 @@ private:
         allMembers.add(&leaf);
         membersByOrdinal.insert(std::make_pair(ord, &leaf));
       } else {
+        // A nested group lying wholly in the unmapped suffix is dropped like an unmapped leaf:
+        // stamped empty, it would have no ordinal, and as a union member it would never be
+        // assigned a discriminant value.
+        if (ordinalIndex >= ordinals.size()) continue;
         // Nested group: recreate it (a discriminated member if we're in a union) and recurse.
         groupMember.childCount++;
         auto& subMember = arena.allocate<MemberInfo>(
