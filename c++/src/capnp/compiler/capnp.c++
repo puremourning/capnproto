@@ -82,6 +82,14 @@
 #define VERSION "(unknown)"
 #endif
 
+#if _WIN32
+#define IMPORT_PATH_SEP_STR ";"
+#else
+#define IMPORT_PATH_SEP_STR ":"
+#endif
+static constexpr char IMPORT_PATH_SEP = IMPORT_PATH_SEP_STR[0];
+// Separates directories in the CAPNP_INCLUDE environment variable, as in $PATH.
+
 namespace capnp {
 namespace compiler {
 
@@ -251,7 +259,8 @@ public:
                    "directory to pass as -I when compiling schemas with this capnp's standard "
                    "schemas (and typically also contains the C++ headers). Fails if none does.")
         .addOption({"import-paths"}, KJ_BIND_METHOD(*this, configImportPaths),
-                   "Print each existing standard import path, in search order.")
+                   "Print each existing import path that is searched without any -I option, in "
+                   "search order: the CAPNP_INCLUDE directories, then the standard import paths.")
         .callAfterParsing(KJ_BIND_METHOD(*this, printConfig))
         .build();
   }
@@ -431,11 +440,13 @@ public:
   void addGlobalOptions(kj::MainBuilder& builder) {
     builder.addOptionWithArg({'I', "import-path"}, KJ_BIND_METHOD(*this, addImportPath), "<dir>",
                              "Add <dir> to the list of directories searched for non-relative "
-                             "imports (ones that start with a '/').")
+                             "imports (ones that start with a '/').  Directories listed in the "
+                             "CAPNP_INCLUDE environment variable (separated by '" IMPORT_PATH_SEP_STR
+                             "') are searched first, before any -I directories.")
            .addOption({"no-standard-import"}, KJ_BIND_METHOD(*this, noStandardImport),
-                      "Do not add any default import paths; use only those specified by -I.  "
-                      "Otherwise, typically /usr/include and /usr/local/include are added by "
-                      "default.");
+                      "Do not add any default import paths; use only those specified by -I "
+                      "and CAPNP_INCLUDE.  Otherwise, typically /usr/include and "
+                      "/usr/local/include are added by default.");
   }
 
   void addCompileOptions(kj::MainBuilder& builder) {
@@ -461,11 +472,27 @@ public:
   // shared options
 
   kj::MainBuilder::Validity addImportPath(kj::StringPtr path) {
+    addEnvImportPaths();
     KJ_IF_SOME(dir, getSourceDirectory(path, false)) {
       loader.addImportPath(dir);
       return true;
     } else {
       return "no such directory";
+    }
+  }
+
+  void addEnvImportPaths() {
+    // Adds the CAPNP_INCLUDE directories to the search path, ahead of everything else. Called
+    // before the first -I directory or the standard import paths are added.
+    if (envImportPathsAdded) return;
+    envImportPathsAdded = true;
+
+    for (auto& path: getEnvImportPaths()) {
+      KJ_IF_SOME(dir, getSourceDirectory(path.toNativeString(true), false)) {
+        loader.addImportPath(dir);
+      } else {
+        // ignore CAPNP_INCLUDE entries that don't exist, like the standard paths
+      }
     }
   }
 
@@ -479,6 +506,8 @@ public:
       compiler = compilerSpace.construct(annotationFlag);
       compilerConstructed = true;
     }
+
+    addEnvImportPaths();
 
     if (addStandardImportPaths) {
       for (auto& path: getStandardImportPaths()) {
@@ -586,6 +615,30 @@ public:
   // =====================================================================================
   // "config" command
 
+  kj::Vector<kj::Path> getEnvImportPaths() {
+    // Returns the directories listed in the CAPNP_INCLUDE environment variable, in order, with
+    // empty entries skipped. Relative entries are interpreted relative to the current directory.
+    // The paths may not exist.
+
+    kj::Vector<kj::Path> result;
+    const char* env = getenv("CAPNP_INCLUDE");
+    if (env == nullptr) return result;
+
+    auto cwd = disk->getCurrentPath();
+    kj::StringPtr rest = env;
+    for (;;) {
+      KJ_IF_SOME(pos, rest.findFirst(IMPORT_PATH_SEP)) {
+        if (pos > 0) result.add(cwd.evalNative(kj::str(rest.first(pos))));
+        rest = rest.slice(pos + 1);
+      } else {
+        if (rest.size() > 0) result.add(cwd.evalNative(rest));
+        break;
+      }
+    }
+
+    return result;
+  }
+
   kj::Vector<kj::Path> getStandardImportPaths() {
     // Returns the standard import paths in search order, with duplicates removed. The paths may
     // not exist.
@@ -684,6 +737,14 @@ public:
         lines.add(kj::str("include dir:  (not found; no standard import path contains "
                           "capnp/c++.capnp)"));
       }
+      auto envPaths = getEnvImportPaths();
+      if (envPaths.size() > 0) {
+        lines.add(kj::str("CAPNP_INCLUDE import paths, searched first:"));
+        for (auto& path: envPaths) {
+          bool found = disk->getRoot().tryOpenSubdir(path) != kj::none;
+          lines.add(kj::str("  ", path.toNativeString(true), found ? "" : "  (does not exist)"));
+        }
+      }
       lines.add(kj::str("standard import paths, in search order:"));
       auto existing = getExistingStandardImportPaths();
       for (auto& path: getStandardImportPaths()) {
@@ -711,11 +772,23 @@ public:
             return "no standard import path contains capnp/c++.capnp";
           }
           break;
-        case ConfigItem::IMPORT_PATHS:
-          for (auto& path: getExistingStandardImportPaths()) {
+        case ConfigItem::IMPORT_PATHS: {
+          kj::Vector<kj::Path> printed;
+          auto print = [&](kj::Path path) {
+            for (auto& p: printed) {
+              if (p == path) return;
+            }
             lines.add(path.toNativeString(true));
+            printed.add(kj::mv(path));
+          };
+          for (auto& path: getEnvImportPaths()) {
+            if (disk->getRoot().tryOpenSubdir(path) != kj::none) print(kj::mv(path));
+          }
+          for (auto& path: getExistingStandardImportPaths()) {
+            print(kj::mv(path));
           }
           break;
+        }
       }
     }
 
@@ -2183,6 +2256,7 @@ private:
   // Use via getDisplayName().
 
   bool addStandardImportPaths = true;
+  bool envImportPathsAdded = false;
 
   kj::Maybe<kj::Path> exeDir;
   // Directory containing the running capnp executable (symlinks resolved), if known.

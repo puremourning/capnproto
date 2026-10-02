@@ -37,6 +37,9 @@ else
   CAPNP=${CAPNP:-capnp}
 fi
 
+# Don't let the caller's environment add import paths to the tests below.
+unset CAPNP_INCLUDE
+
 SCHEMA=`dirname "$0"`/../test.capnp
 JSON_SCHEMA=`dirname "$0"`/../compat/json-test.capnp
 TESTDATA=`dirname "$0"`/../testdata
@@ -143,6 +146,24 @@ $CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype
 # compiles (with the usual warning), NOT an internal validation assert.
 DROP_ARM_WARN=$($CAPNP compile --no-standard-import --src-prefix="$PREFIX" -o- $TESTDATA/newtype-union-drop-arm.capnp.nobuild 2>&1 >/dev/null) || fail "union arm drop should compile"
 echo "$DROP_ARM_WARN" | grep -q "warning: .*unmapped" || fail "union arm drop should warn about unmapped fields"
+
+# CAPNP_INCLUDE directories are searched, in order, before -I directories, even with
+# --no-standard-import. Empty and nonexistent entries are ignored.
+INCLUDE_DIR=`mktemp -d`
+mkdir -p "$INCLUDE_DIR/a/lib" "$INCLUDE_DIR/b/lib"
+printf '@0xa1b2c3d4e5f60001;\nconst which :Text = "a";\n' > "$INCLUDE_DIR/a/lib/x.capnp"
+printf '@0xa1b2c3d4e5f60001;\nconst which :Text = "b";\n' > "$INCLUDE_DIR/b/lib/x.capnp"
+printf '@0xa1b2c3d4e5f60002;\nconst v :Text = import "/lib/x.capnp".which;\n' > "$INCLUDE_DIR/m.capnp"
+case "$CAPNP" in *.exe) SEP=";" ;; *) SEP=":" ;; esac
+test "x`CAPNP_INCLUDE="$INCLUDE_DIR/a" $CAPNP eval --no-standard-import -I"$INCLUDE_DIR/b" "$INCLUDE_DIR/m.capnp" v | tr -d '\r'`" = 'x"a"' ||
+    fail "CAPNP_INCLUDE should be searched before -I"
+test "x`CAPNP_INCLUDE="$SEP$INCLUDE_DIR/missing$SEP$INCLUDE_DIR/b$SEP$INCLUDE_DIR/a$SEP" $CAPNP eval --no-standard-import "$INCLUDE_DIR/m.capnp" v | tr -d '\r'`" = 'x"b"' ||
+    fail "CAPNP_INCLUDE should be searched in order, ignoring empty and missing entries"
+if test "$SEP" = ":"; then  # Windows prints native paths, which won't match the shell's
+  test "x`CAPNP_INCLUDE="$INCLUDE_DIR/missing$SEP$INCLUDE_DIR/b" $CAPNP config --import-paths | head -1`" = "x$INCLUDE_DIR/b" ||
+      fail "config --import-paths should list existing CAPNP_INCLUDE directories first"
+fi
+rm -rf "$INCLUDE_DIR"
 
 # capnpc-capnp output for schemas using newtypes must recompile, both natively and in v1
 # compatibility mode (which expands newtypes away, so a v1 compiler can read it). This covers
