@@ -86,3 +86,6 @@
 # bazel output
 /c++/MODULE.bazel.lock
 bazel-*
+
+# Output of .github/newtype/build-tools.sh
+/build-newtype/
