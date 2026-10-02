@@ -59,6 +59,7 @@
 
 #if _WIN32
 #include <process.h>
+#include <wchar.h>
 #include <windows.h>
 #include <kj/encoding.h>
 #include <kj/windows-sanity.h>
@@ -106,16 +107,49 @@ static kj::Maybe<kj::String> getExecutablePath() {
 
 #if _WIN32
   auto buffer = kj::heapArray<wchar_t>(MAX_PATH);
+  DWORD n;
   for (;;) {
-    DWORD n = GetModuleFileNameW(nullptr, buffer.begin(), buffer.size());
+    n = GetModuleFileNameW(nullptr, buffer.begin(), buffer.size());
     if (n == 0) return kj::none;
-    if (n < buffer.size()) {
-      kj::String result = kj::decodeWideString(buffer.first(n));
-      return kj::mv(result);
-    }
+    if (n < buffer.size()) break;
     if (buffer.size() >= 32768) return kj::none;
     buffer = kj::heapArray<wchar_t>(buffer.size() * 2);
   }
+
+  // GetModuleFileNameW() returns the path as the process was started, which may use 8.3 short
+  // names or go through symlinks, so open the file and ask for its final path instead.
+  HANDLE handle = CreateFileW(buffer.begin(), 0,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (handle != INVALID_HANDLE_VALUE) {
+    KJ_DEFER(CloseHandle(handle));
+    const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    DWORD size = GetFinalPathNameByHandleW(handle, nullptr, 0, flags);
+    if (size > 0) {
+      auto finalPath = kj::heapArray<wchar_t>(size);
+      DWORD len = GetFinalPathNameByHandleW(handle, finalPath.begin(), size, flags);
+      if (len > 0 && len < size) {
+        auto path = finalPath.first(len);
+        auto startsWith = [&](const wchar_t* prefix) {
+          size_t prefixLen = wcslen(prefix);
+          return path.size() >= prefixLen && wmemcmp(path.begin(), prefix, prefixLen) == 0;
+        };
+        // The result has a "\\?\" prefix, or "\\?\UNC\" for a network share.
+        if (startsWith(L"\\\\?\\UNC\\")) {
+          return kj::str("\\\\", kj::decodeWideString(path.slice(8, path.size())));
+        } else if (startsWith(L"\\\\?\\")) {
+          kj::String result = kj::decodeWideString(path.slice(4, path.size()));
+          return kj::mv(result);
+        } else {
+          kj::String result = kj::decodeWideString(path);
+          return kj::mv(result);
+        }
+      }
+    }
+  }
+
+  kj::String result = kj::decodeWideString(buffer.first(n));
+  return kj::mv(result);
 #elif __APPLE__
   uint32_t size = 0;
   _NSGetExecutablePath(nullptr, &size);
