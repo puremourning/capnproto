@@ -468,6 +468,8 @@ test_capnpc_inputs =                                           \
   src/capnp/test-import2.capnp                                 \
   src/capnp/test-newtype.capnp                                 \
   src/capnp/test-newtype-import.capnp                          \
+  src/capnp/test-newtype-v1.capnp                              \
+  src/capnp/test-newtype-v2.capnp                              \
   src/capnp/compat/json-test.capnp
 
 test_capnpc_outputs =                                          \
@@ -481,6 +483,10 @@ test_capnpc_outputs =                                          \
   src/capnp/test-newtype.capnp.h                               \
   src/capnp/test-newtype-import.capnp.c++                      \
   src/capnp/test-newtype-import.capnp.h                        \
+  src/capnp/test-newtype-v1.capnp.c++                          \
+  src/capnp/test-newtype-v1.capnp.h                            \
+  src/capnp/test-newtype-v2.capnp.c++                          \
+  src/capnp/test-newtype-v2.capnp.h                            \
   src/capnp/compat/json-test.capnp.c++                         \
   src/capnp/compat/json-test.capnp.h
 

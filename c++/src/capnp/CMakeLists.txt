@@ -237,6 +237,8 @@ if(BUILD_TESTING)
     test-import2.capnp
     test-newtype.capnp
     test-newtype-import.capnp
+    test-newtype-v1.capnp
+    test-newtype-v2.capnp
     compat/json-test.capnp
   )
 
