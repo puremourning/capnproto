@@ -25,6 +25,8 @@
 #include "schema-parser.h"
 #include <kj/compat/gtest.h>
 #include "test-util.h"
+#include "message.h"
+#include "dynamic.h"
 #include <kj/debug.h>
 
 namespace capnp {
@@ -535,6 +537,326 @@ TEST(SchemaParser, RecursiveNestedNewtypeStamp) {
   ASSERT_EQ(2u, limitGroup.getFields().size());          // ...of value + scale
   EXPECT_EQ("value", limitGroup.getFields()[0].getProto().getName());
   EXPECT_TRUE(limitGroup.getFields()[0].getProto().isSlot());
+}
+
+// ---------------------------------------------------------------------------------------------
+// `@[...]` maps the template's fields by their template ordinal, not by their position in the
+// template tree, so nested newtypes can evolve (new fields take new ordinals at the end).
+
+struct StampedLeaf {
+  uint ordinal;
+  uint offset;
+};
+
+static StructSchema::Field fieldAtPath(StructSchema s, kj::StringPtr path) {
+  // Follow a dotted path of (group) field names, e.g. "r.tl.x".
+  for (;;) {
+    KJ_IF_SOME(dot, path.findFirst('.')) {
+      s = s.getFieldByName(kj::str(path.first(dot))).getType().asStruct();
+      path = path.slice(dot + 1);
+    } else {
+      return s.getFieldByName(path);
+    }
+  }
+}
+
+static StampedLeaf stampedLeaf(StructSchema s, kj::StringPtr path) {
+  auto proto = fieldAtPath(s, path).getProto();
+  KJ_ASSERT(proto.isSlot(), path);
+  return { proto.getOrdinal().getExplicit(), proto.getSlot().getOffset() };
+}
+
+static StructSchema parseStruct(SchemaParser& parser, FakeFileReader& reader,
+                                kj::StringPtr name, kj::StringPtr text, kj::StringPtr type) {
+  parser.setDiskFilesystem(reader);
+  reader.add(name, text);
+  return parser.parseDiskFile(name, name, nullptr).getNested(type).asStruct();
+}
+
+static DynamicStruct::Builder dynGroup(DynamicStruct::Builder s, kj::StringPtr path) {
+  for (;;) {
+    KJ_IF_SOME(dot, path.findFirst('.')) {
+      s = s.get(kj::str(path.first(dot))).as<DynamicStruct>();
+      path = path.slice(dot + 1);
+    } else {
+      return s.get(path).as<DynamicStruct>();
+    }
+  }
+}
+
+static DynamicStruct::Reader dynGroup(DynamicStruct::Reader s, kj::StringPtr path) {
+  for (;;) {
+    KJ_IF_SOME(dot, path.findFirst('.')) {
+      s = s.get(kj::str(path.first(dot))).as<DynamicStruct>();
+      path = path.slice(dot + 1);
+    } else {
+      return s.get(path).as<DynamicStruct>();
+    }
+  }
+}
+
+static const char NEST_V1[] =
+    "@0x8123456789abce10;\n"
+    "type Vec3 = group { x @0 :Float32; y @1 :Float32; z @2 :Float32; }\n"
+    "type Rect = group { tl @[0-2] :Vec3; br @[3-5] :Vec3; }\n"
+    "struct S { r @[0-5] :Rect; tag @6 :UInt32; }\n";
+static const char NEST_V2[] =
+    "@0x8123456789abce10;\n"
+    "type Vec3 = group { x @0 :Float32; y @1 :Float32; z @2 :Float32; w @3 :Float32; }\n"
+    "type Rect = group { tl @[0-2,6] :Vec3; br @[3-5,7] :Vec3; }\n"
+    "struct S { r @[0-5,7,8] :Rect; tag @6 :UInt32; }\n";
+
+TEST(SchemaParser, NestedNewtypeEvolutionMapsByOrdinal) {
+  FakeFileReader reader1, reader2;
+  SchemaParser parser1, parser2;
+  auto v1 = parseStruct(parser1, reader1, "v1.capnp", NEST_V1, "S");
+  auto v2 = parseStruct(parser2, reader2, "v2.capnp", NEST_V2, "S");
+
+  // v1: everything contiguous.
+  const char* names[] = { "r.tl.x", "r.tl.y", "r.tl.z", "r.br.x", "r.br.y", "r.br.z" };
+  for (uint i = 0; i < 6; i++) {
+    auto l1 = stampedLeaf(v1, names[i]);
+    KJ_EXPECT((i) == (l1.ordinal), names[i]);
+    KJ_EXPECT((i) == (l1.offset), names[i]);
+    // v2: the v1 fields keep their v1 ordinals and offsets.
+    auto l2 = stampedLeaf(v2, names[i]);
+    KJ_EXPECT((i) == (l2.ordinal), names[i]);
+    KJ_EXPECT((i) == (l2.offset), names[i]);
+  }
+  EXPECT_EQ(6u, stampedLeaf(v1, "tag").offset);
+  EXPECT_EQ(6u, stampedLeaf(v2, "tag").offset);
+  // The new fields: Rect's tl.w is Rect @6 -> S @7, br.w is Rect @7 -> S @8 (NOT tree order,
+  // which would have made tl.w S @3 and shifted br).
+  EXPECT_EQ(7u, stampedLeaf(v2, "r.tl.w").ordinal);
+  EXPECT_EQ(7u, stampedLeaf(v2, "r.tl.w").offset);
+  EXPECT_EQ(8u, stampedLeaf(v2, "r.br.w").ordinal);
+  EXPECT_EQ(8u, stampedLeaf(v2, "r.br.w").offset);
+
+  // v1 -> v2: written by v1, read by v2; the new fields default.
+  {
+    MallocMessageBuilder message;
+    auto root = message.initRoot<DynamicStruct>(v1);
+    float n = 1;
+    for (auto g: { "r.tl", "r.br" }) {
+      for (auto f: { "x", "y", "z" }) dynGroup(root, g).set(f, n++);
+    }
+    root.set("tag", 99);
+
+    auto read = message.getRoot<DynamicStruct>(v2).asReader();
+    n = 1;
+    for (auto g: { "r.tl", "r.br" }) {
+      for (auto f: { "x", "y", "z" }) EXPECT_EQ(n++, dynGroup(read, g).get(f).as<float>());
+      EXPECT_EQ(0, dynGroup(read, g).get("w").as<float>());
+    }
+    EXPECT_EQ(99u, read.get("tag").as<uint32_t>());
+  }
+
+  // v2 -> v1: written by v2, read by v1; the new fields are ignored.
+  {
+    MallocMessageBuilder message;
+    auto root = message.initRoot<DynamicStruct>(v2);
+    float n = 1;
+    for (auto g: { "r.tl", "r.br" }) {
+      for (auto f: { "x", "y", "z", "w" }) dynGroup(root, g).set(f, n++);
+    }
+    root.set("tag", 99);
+
+    auto read = message.getRoot<DynamicStruct>(v1).asReader();
+    EXPECT_EQ(1, dynGroup(read, "r.tl").get("x").as<float>());
+    EXPECT_EQ(3, dynGroup(read, "r.tl").get("z").as<float>());
+    EXPECT_EQ(5, dynGroup(read, "r.br").get("x").as<float>());
+    EXPECT_EQ(7, dynGroup(read, "r.br").get("z").as<float>());
+    EXPECT_EQ(99u, read.get("tag").as<uint32_t>());
+  }
+}
+
+TEST(SchemaParser, NestedNewtypeIncompleteMappingByOrdinal) {
+  // `r @[0-5]` against v2's Rect maps Rect @0-5, leaving only tl.w (Rect @6) and br.w (Rect @7)
+  // unmapped; all v1 fields keep their v1 positions.
+  FakeFileReader reader;
+  SchemaParser parser;
+  auto s = parseStruct(parser, reader, "partial.capnp",
+      "@0x8123456789abce11;\n"
+      "type Vec3 = group { x @0 :Float32; y @1 :Float32; z @2 :Float32; w @3 :Float32; }\n"
+      "type Rect = group { tl @[0-2,6] :Vec3; br @[3-5,7] :Vec3; }\n"
+      "struct S { r @[0-5] :Rect; tag @6 :UInt32; }\n", "S");
+
+  const char* names[] = { "r.tl.x", "r.tl.y", "r.tl.z", "r.br.x", "r.br.y", "r.br.z" };
+  for (uint i = 0; i < 6; i++) {
+    auto l = stampedLeaf(s, names[i]);
+    KJ_EXPECT((i) == (l.ordinal), names[i]);
+    KJ_EXPECT((i) == (l.offset), names[i]);
+  }
+  auto r = s.getFieldByName("r").getType().asStruct();
+  EXPECT_EQ(3u, r.getFieldByName("tl").getType().asStruct().getFields().size());
+  EXPECT_EQ(3u, r.getFieldByName("br").getType().asStruct().getFields().size());
+  EXPECT_TRUE(r.getFieldByName("tl").getType().asStruct().findFieldByName("w") == kj::none);
+  EXPECT_TRUE(r.getFieldByName("br").getType().asStruct().findFieldByName("w") == kj::none);
+  EXPECT_EQ(6u, stampedLeaf(s, "tag").ordinal);
+  EXPECT_EQ(6u, stampedLeaf(s, "tag").offset);
+}
+
+TEST(SchemaParser, UnionNewtypeWithNestedNewtypeEvolution) {
+  // A union newtype whose arms are nested newtypes; the nested newtype gains a field.
+  FakeFileReader reader1, reader2;
+  SchemaParser parser1, parser2;
+  auto v1 = parseStruct(parser1, reader1, "uv1.capnp",
+      "@0x8123456789abce12;\n"
+      "type Price = group { value @0 :Int64; scale @1 :UInt16; }\n"
+      "type Order = union { limit @[0-1] :Price; market @2 :Void; stop @[3-4] :Price; }\n"
+      "struct S { o @[0-4] :Order; tag @5 :UInt32; }\n", "S");
+  auto v2 = parseStruct(parser2, reader2, "uv2.capnp",
+      "@0x8123456789abce12;\n"
+      "type Price = group { value @0 :Int64; scale @1 :UInt16; currency @2 :UInt16; }\n"
+      "type Order = union { limit @[0-1,5] :Price; market @2 :Void; stop @[3-4,6] :Price; }\n"
+      "struct S { o @[0-4,6,7] :Order; tag @5 :UInt32; }\n", "S");
+
+  // Common fields: same ordinals and offsets in both versions.
+  for (auto name: { "o.limit.value", "o.limit.scale", "o.market", "o.stop.value",
+                    "o.stop.scale", "tag" }) {
+    auto l1 = stampedLeaf(v1, name);
+    auto l2 = stampedLeaf(v2, name);
+    KJ_EXPECT((l1.ordinal) == (l2.ordinal), name);
+    KJ_EXPECT((l1.offset) == (l2.offset), name);
+  }
+  EXPECT_EQ(3u, stampedLeaf(v2, "o.stop.value").ordinal);
+  EXPECT_EQ(5u, stampedLeaf(v2, "tag").ordinal);
+  EXPECT_EQ(6u, stampedLeaf(v2, "o.limit.currency").ordinal);
+  EXPECT_EQ(7u, stampedLeaf(v2, "o.stop.currency").ordinal);
+
+  // Same discriminant offset and values.
+  auto o1 = v1.getFieldByName("o").getType().asStruct();
+  auto o2 = v2.getFieldByName("o").getType().asStruct();
+  EXPECT_EQ(o1.getProto().getStruct().getDiscriminantOffset(),
+            o2.getProto().getStruct().getDiscriminantOffset());
+  for (auto arm: { "limit", "market", "stop" }) {
+    KJ_EXPECT((o1.getFieldByName(arm).getProto().getDiscriminantValue()) == (o2.getFieldByName(arm).getProto().getDiscriminantValue()), arm);
+  }
+
+  // v1 -> v2 round trip with the `stop` arm set.
+  {
+    MallocMessageBuilder message;
+    auto root = message.initRoot<DynamicStruct>(v1);
+    auto stop = dynGroup(root, "o").init("stop").as<DynamicStruct>();
+    stop.set("value", 1234);
+    stop.set("scale", 2);
+    root.set("tag", 7);
+
+    auto read = message.getRoot<DynamicStruct>(v2).asReader();
+    auto o = dynGroup(read, "o");
+    EXPECT_EQ("stop", KJ_ASSERT_NONNULL(o.which()).getProto().getName());
+    auto rs = o.get("stop").as<DynamicStruct>();
+    EXPECT_EQ(1234, rs.get("value").as<int64_t>());
+    EXPECT_EQ(2u, rs.get("scale").as<uint16_t>());
+    EXPECT_EQ(0u, rs.get("currency").as<uint16_t>());
+    EXPECT_EQ(7u, read.get("tag").as<uint32_t>());
+  }
+  // v2 -> v1.
+  {
+    MallocMessageBuilder message;
+    auto root = message.initRoot<DynamicStruct>(v2);
+    auto limit = dynGroup(root, "o").init("limit").as<DynamicStruct>();
+    limit.set("value", 55);
+    limit.set("scale", 3);
+    limit.set("currency", 840);
+    root.set("tag", 8);
+
+    auto read = message.getRoot<DynamicStruct>(v1).asReader();
+    auto o = dynGroup(read, "o");
+    EXPECT_EQ("limit", KJ_ASSERT_NONNULL(o.which()).getProto().getName());
+    auto rl = o.get("limit").as<DynamicStruct>();
+    EXPECT_EQ(55, rl.get("value").as<int64_t>());
+    EXPECT_EQ(3u, rl.get("scale").as<uint16_t>());
+    EXPECT_EQ(8u, read.get("tag").as<uint32_t>());
+  }
+}
+
+TEST(SchemaParser, ThreeLevelNewtypeEvolution) {
+  // Three nested newtype levels, evolving at the innermost one.
+  FakeFileReader reader1, reader2;
+  SchemaParser parser1, parser2;
+  auto v1 = parseStruct(parser1, reader1, "t1.capnp",
+      "@0x8123456789abce13;\n"
+      "type A = group { a0 @0 :UInt16; a1 @1 :UInt16; }\n"
+      "type B = group { p @[0-1] :A; q @[2-3] :A; }\n"
+      "type C = group { m @[0-3] :B; n @[4-7] :B; }\n"
+      "struct S { c @[0-7] :C; tag @8 :UInt32; }\n", "S");
+  auto v2 = parseStruct(parser2, reader2, "t2.capnp",
+      "@0x8123456789abce13;\n"
+      "type A = group { a0 @0 :UInt16; a1 @1 :UInt16; a2 @2 :UInt16; }\n"
+      "type B = group { p @[0-1,4] :A; q @[2-3,5] :A; }\n"
+      "type C = group { m @[0-3,8,9] :B; n @[4-7,10,11] :B; }\n"
+      "struct S { c @[0-7,9-12] :C; tag @8 :UInt32; }\n", "S");
+
+  const char* old[] = { "c.m.p.a0", "c.m.p.a1", "c.m.q.a0", "c.m.q.a1",
+                        "c.n.p.a0", "c.n.p.a1", "c.n.q.a0", "c.n.q.a1" };
+  for (uint i = 0; i < 8; i++) {
+    auto l1 = stampedLeaf(v1, old[i]);
+    auto l2 = stampedLeaf(v2, old[i]);
+    KJ_EXPECT((i) == (l1.ordinal), old[i]);
+    KJ_EXPECT((i) == (l2.ordinal), old[i]);
+    KJ_EXPECT((i) == (l1.offset), old[i]);
+    KJ_EXPECT((i) == (l2.offset), old[i]);
+  }
+  EXPECT_EQ(8u, stampedLeaf(v2, "tag").ordinal);
+  EXPECT_EQ(stampedLeaf(v1, "tag").offset, stampedLeaf(v2, "tag").offset);
+  EXPECT_EQ(9u, stampedLeaf(v2, "c.m.p.a2").ordinal);
+  EXPECT_EQ(10u, stampedLeaf(v2, "c.m.q.a2").ordinal);
+  EXPECT_EQ(11u, stampedLeaf(v2, "c.n.p.a2").ordinal);
+  EXPECT_EQ(12u, stampedLeaf(v2, "c.n.q.a2").ordinal);
+
+  {
+    MallocMessageBuilder message;
+    auto root = message.initRoot<DynamicStruct>(v1);
+    for (uint i = 0; i < 8; i++) {
+      kj::StringPtr path = old[i];
+      auto dot = KJ_ASSERT_NONNULL(path.findLast('.'));
+      dynGroup(root, kj::str(path.first(dot))).set(path.slice(dot + 1), 100 + i);
+    }
+    auto read = message.getRoot<DynamicStruct>(v2).asReader();
+    for (uint i = 0; i < 8; i++) {
+      kj::StringPtr path = old[i];
+      auto dot = KJ_ASSERT_NONNULL(path.findLast('.'));
+      auto g = dynGroup(read, kj::str(path.first(dot)));
+      KJ_EXPECT((100 + i) == (g.get(path.slice(dot + 1)).as<uint16_t>()), old[i]);
+      KJ_EXPECT((0u) == (g.get("a2").as<uint16_t>()), old[i]);
+    }
+  }
+  {
+    MallocMessageBuilder message;
+    auto root = message.initRoot<DynamicStruct>(v2);
+    for (uint i = 0; i < 8; i++) {
+      kj::StringPtr path = old[i];
+      auto dot = KJ_ASSERT_NONNULL(path.findLast('.'));
+      auto g = dynGroup(root, kj::str(path.first(dot)));
+      g.set(path.slice(dot + 1), 100 + i);
+      g.set("a2", 999);
+    }
+    root.set("tag", 5);
+    auto read = message.getRoot<DynamicStruct>(v1).asReader();
+    for (uint i = 0; i < 8; i++) {
+      kj::StringPtr path = old[i];
+      auto dot = KJ_ASSERT_NONNULL(path.findLast('.'));
+      KJ_EXPECT((100 + i) == (dynGroup(read, kj::str(path.first(dot)))
+          .get(path.slice(dot + 1)).as<uint16_t>()), old[i]);
+    }
+    EXPECT_EQ(5u, read.get("tag").as<uint32_t>());
+  }
+}
+
+TEST(SchemaParser, NestedStampedGroupDisplayNames) {
+  // Nested stamped group nodes are named after the template's group field, not the use site.
+  FakeFileReader reader;
+  SchemaParser parser;
+  auto s = parseStruct(parser, reader, "names.capnp", NEST_V1, "S");
+  auto r = s.getFieldByName("r").getType().asStruct();
+  EXPECT_EQ("names.capnp:S.r", r.getProto().getDisplayName());
+  auto tl = r.getFieldByName("tl").getType().asStruct();
+  auto br = r.getFieldByName("br").getType().asStruct();
+  EXPECT_EQ("names.capnp:S.r.tl", tl.getProto().getDisplayName());
+  EXPECT_EQ("names.capnp:S.r.br", br.getProto().getDisplayName());
+  EXPECT_EQ("tl", tl.getUnqualifiedName());
+  EXPECT_EQ("br", br.getUnqualifiedName());
 }
 
 TEST(SchemaParser, Constants) {

@@ -27,6 +27,7 @@
 #include <kj/debug.h>
 #include <kj/arena.h>
 #include <kj/encoding.h>
+#include <algorithm>
 #include <map>
 #include <stdlib.h>
 #include <capnp/stream.capnp.h>
@@ -1089,7 +1090,8 @@ private:
     // template field it was stamped from (its already-compiled type, default value, and
     // annotations are copied onto the leaf, rather than re-compiled from `fieldType`).
     uint stampedOrdinal = 0;
-    // The parent ordinal assigned to a stamped leaf field (its position in the `@[...]` mapping).
+    // The parent ordinal assigned to a stamped leaf field: the `@[...]` entry that its template
+    // ordinal maps to.
     uint64_t stampedFromNewtypeId = 0;
     uint64_t stampedFromTemplateId = 0;
     // For a stamped leaf: the `type` newtype the field came from, and the template (or nested
@@ -1388,43 +1390,74 @@ private:
     return kj::none;
   }
 
-  uint countTemplateLeaves(StructSchema tmplStruct) {
-    // Number of leaf (slot) fields in the template tree -- how many parent ordinals an `@[...]`
-    // must supply to fully map it.
-    uint n = 0;
+  void collectTemplateLeafOrdinals(StructSchema tmplStruct, kj::Vector<uint>& out) {
+    // Collect the template ordinals of every leaf (slot) field in the template tree. Leaves of
+    // nested groups (including nested newtypes, already stamped into the template when it was
+    // compiled) carry ordinals in the outermost template's ordinal space.
     for (auto f: tmplStruct.getFields()) {
-      if (f.getProto().isSlot()) {
-        n += 1;
-      } else KJ_IF_SOME(sub, resolveStampSchema(f.getProto().getGroup().getTypeId())) {
-        n += countTemplateLeaves(sub);
+      auto proto = f.getProto();
+      if (proto.isSlot()) {
+        out.add(templateOrdinalOf(proto));
+      } else KJ_IF_SOME(sub, resolveStampSchema(proto.getGroup().getTypeId())) {
+        collectTemplateLeafOrdinals(sub, out);
       }
     }
-    return n;
+  }
+
+  struct StampMapping {
+    // How a use site's `@[...]` maps the template's ordinals. Ordinals map one to one in
+    // template ordinal order: the template leaf with the k-th smallest ordinal (normally just
+    // `@k`) maps to `ordinals[k]`. This depends only on each leaf's own template ordinal, never on
+    // where the leaf sits in the template tree, so it is stable under schema evolution (new
+    // template fields take new, higher ordinals wherever they are declared).
+    kj::ArrayPtr<const uint> templateOrdinals;  // sorted leaf ordinals of the template
+    kj::ArrayPtr<const uint> ordinals;          // the use site's flattened `@[...]`
+
+    kj::Maybe<uint> map(uint templateOrdinal) const {
+      auto it = std::lower_bound(templateOrdinals.begin(), templateOrdinals.end(),
+                                 templateOrdinal);
+      KJ_ASSERT(it != templateOrdinals.end() && *it == templateOrdinal);
+      uint rank = it - templateOrdinals.begin();
+      if (rank < ordinals.size()) return ordinals[rank];
+      return kj::none;  // unmapped (incomplete mapping)
+    }
+  };
+
+  static uint templateOrdinalOf(schema::Field::Reader leaf) {
+    return leaf.getOrdinal().isExplicit() ? leaf.getOrdinal().getExplicit() : 0;
+  }
+
+  bool isTemplateFieldMapped(schema::Field::Reader tf, const StampMapping& mapping) {
+    // A leaf is mapped iff its template ordinal is covered by `@[...]`; a nested group is mapped
+    // iff ANY of its leaves is (it is dropped only when all of them are unmapped).
+    if (tf.isSlot()) {
+      return mapping.map(templateOrdinalOf(tf)) != kj::none;
+    }
+    KJ_IF_SOME(sub, resolveStampSchema(tf.getGroup().getTypeId())) {
+      for (auto f: sub.getFields()) {
+        if (isTemplateFieldMapped(f.getProto(), mapping)) return true;
+      }
+    }
+    return false;
   }
 
   void stampTemplateFields(StructSchema tmplStruct, MemberInfo& groupMember,
-                           StructLayout::StructOrGroup& layout,
-                           kj::ArrayPtr<const uint> ordinals, uint& ordinalIndex,
+                           StructLayout::StructOrGroup& layout, const StampMapping& mapping,
                            Declaration::Reader member, uint64_t newtypeId) {
-    // Structurally copy a (fully-resolved) template into `groupMember`: allocate each leaf's
-    // remapped ordinal from `ordinals` in tree order, and recreate nested groups/unions. Called
-    // recursively for nested groups, so an inline newtype built from other inline newtypes (which
-    // were already inlined into this template at definition time) stamps in one flat pass.
+    // Structurally copy a (fully-resolved) template into `groupMember`: give each leaf the use-site
+    // ordinal that `mapping` assigns to its template ordinal, and recreate nested groups/unions.
+    // Called recursively for nested groups, so an inline newtype built from other inline newtypes
+    // (which were already inlined into this template at definition time) stamps in one pass.
     bool isUnion = tmplStruct.getProto().getStruct().getDiscriminantCount() > 0;
     if (isUnion) {
-      // A union needs >= 2 members. An incomplete `@[...]` maps a prefix of the leaves, so it can
-      // drop trailing union members; if it reaches fewer than two, the result would be an invalid
-      // union. Report a clear error and fall back to a plain group (compilation fails anyway) so
-      // the bootstrap schema stays valid instead of tripping an internal validation assert.
+      // A union needs >= 2 members. An incomplete `@[...]` leaves the highest template ordinals
+      // unmapped, so it can drop union members; if it reaches fewer than two, the result would be
+      // an invalid union. Report a clear error and fall back to a plain group (compilation fails
+      // anyway) so the bootstrap schema stays valid instead of tripping an internal validation
+      // assert.
       uint reached = 0;
-      uint pos = ordinalIndex;
       for (auto tf: tmplStruct.getFields()) {
-        if (pos < ordinals.size()) reached += 1;
-        if (tf.getProto().isSlot()) {
-          pos += 1;
-        } else KJ_IF_SOME(sub, resolveStampSchema(tf.getProto().getGroup().getTypeId())) {
-          pos += countTemplateLeaves(sub);
-        }
+        if (isTemplateFieldMapped(tf.getProto(), mapping)) reached += 1;
       }
       if (reached < 2) {
         errorReporter.addErrorOn(member, kj::str(
@@ -1444,9 +1477,13 @@ private:
     for (auto tf: tmplStruct.getFields()) {
       auto tfProto = tf.getProto();
       if (tfProto.isSlot()) {
-        if (ordinalIndex >= ordinals.size()) continue;  // unmapped suffix (incomplete mapping)
+        uint ord;
+        KJ_IF_SOME(o, mapping.map(templateOrdinalOf(tfProto))) {
+          ord = o;
+        } else {
+          continue;  // unmapped (incomplete mapping)
+        }
         groupMember.childCount++;
-        uint ord = ordinals[ordinalIndex++];
         StructLayout::StructOrGroup* leafScope = &layout;
         if (isUnion) leafScope = &arena.allocate<StructLayout::Group>(*unionLayout);
         auto& leaf = arena.allocate<MemberInfo>(
@@ -1457,15 +1494,17 @@ private:
         allMembers.add(&leaf);
         membersByOrdinal.insert(std::make_pair(ord, &leaf));
       } else {
-        // A nested group lying wholly in the unmapped suffix is dropped like an unmapped leaf:
-        // stamped empty, it would have no ordinal, and as a union member it would never be
-        // assigned a discriminant value.
-        if (ordinalIndex >= ordinals.size()) continue;
+        // A nested group none of whose leaves is mapped is dropped like an unmapped leaf: stamped
+        // empty, it would have no ordinal, and as a union member it would never be assigned a
+        // discriminant value.
+        if (!isTemplateFieldMapped(tfProto, mapping)) continue;
         // Nested group: recreate it (a discriminated member if we're in a union) and recurse.
+        // Name the node after the template's group field (`S.r.tl`), not the use-site field.
         groupMember.childCount++;
         auto& subMember = arena.allocate<MemberInfo>(
             groupMember, codeOrder++, tfProto.getName(),
-            newGroupNode(groupMember.node, member),
+            newGroupNode(groupMember.node, tfProto.getName(),
+                         member.getStartByte(), member.getEndByte()),
             member.getStartByte(), member.getEndByte(), tfProto.getTypeId());
         subMember.isInUnion = isUnion;
         subMember.stampedGroupField = tfProto;
@@ -1476,12 +1515,10 @@ private:
           if (isUnion) {
             // A group that is itself a union member gets its own slot of the union's space.
             StructLayout::Group& subScope = arena.allocate<StructLayout::Group>(*unionLayout);
-            stampTemplateFields(sub, subMember, subScope, ordinals, ordinalIndex, member,
-                                newtypeId);
+            stampTemplateFields(sub, subMember, subScope, mapping, member, newtypeId);
           } else {
             // A group nested in a struct/group: its fields take fresh offsets in the same layout.
-            stampTemplateFields(sub, subMember, layout, ordinals, ordinalIndex, member,
-                                newtypeId);
+            stampTemplateFields(sub, subMember, layout, mapping, member, newtypeId);
           }
         }
       }
@@ -1509,8 +1546,12 @@ private:
       // finished. Differs from `newtypeId` when the field names an alias (`type Bar = Foo`).
       uint64_t templateOwnerId = tmpl.getProto().getScopeId();
 
-      // Number of leaf slots across the whole template tree -- what `@[...]` must map.
-      uint leafCount = countTemplateLeaves(tmpl);
+      // The template ordinals of every leaf across the whole template tree, sorted: `@[...]`
+      // maps them one to one, in ordinal order.
+      kj::Vector<uint> templateOrdinals;
+      collectTemplateLeafOrdinals(tmpl, templateOrdinals);
+      std::sort(templateOrdinals.begin(), templateOrdinals.end());
+      uint leafCount = templateOrdinals.size();
 
       // Flatten the `@[...]` mapping into a list of parent ordinals, in declaration order.
       kj::Vector<uint> ordinals;
@@ -1524,15 +1565,22 @@ private:
         errorReporter.addErrorOn(member, kj::str(
             "This '@[...]' maps ", ordinals.size(), " ordinals, but the type has only ",
             leafCount, " field(s)."));
+        ordinals.truncate(leafCount);
       } else if (ordinals.size() < leafCount) {
-        // An incomplete mapping leaves a suffix of the type's fields unmapped. This is allowed
-        // (it mirrors extending the inlined type later): the unmapped fields read as their
-        // default value and cannot be set here. Warn so the omission isn't silent.
+        // An incomplete mapping leaves the type's highest ordinals unmapped. This is allowed (it
+        // mirrors extending the inlined type later): the unmapped fields read as their default
+        // value and cannot be set here. Warn so the omission isn't silent.
+        uint unmapped = leafCount - ordinals.size();
+        auto which = unmapped == 1
+            ? kj::str("The field at the type's ordinal @", templateOrdinals.back(), " is")
+            : kj::str("The ", unmapped, " fields at the type's ordinals @",
+                      templateOrdinals[ordinals.size()], "-@", templateOrdinals.back(), " are");
         errorReporter.addWarningOn(member, kj::str(
             "This '@[...]' maps ", ordinals.size(), " ordinal(s), but the type has ",
-            leafCount, " field(s). The trailing ", leafCount - ordinals.size(),
-            " field(s) are unmapped here: they read as their default value and cannot be set."));
+            leafCount, " field(s). ", which, " unmapped here. Unmapped fields read as their default value "
+            "and cannot be set."));
       }
+      StampMapping mapping { templateOrdinals.asPtr(), ordinals.asPtr() };
 
       // Mint a group node + group MemberInfo for the field; the group field has no ordinal.
       auto& groupMember = arena.allocate<MemberInfo>(
@@ -1544,12 +1592,10 @@ private:
       groupMember.declAnnotations = member.getAnnotations();
       allMembers.add(&groupMember);
 
-      // Recursively copy the (already fully-resolved) template tree into the group, drawing each
-      // leaf's remapped ordinal from `@[...]` in tree order and recreating nested groups/unions
-      // (which carry their own newtype identity via Field.typeId).
-      uint ordinalIndex = 0;
-      stampTemplateFields(tmpl, groupMember, layout, ordinals.asPtr(), ordinalIndex, member,
-                          templateOwnerId);
+      // Recursively copy the (already fully-resolved) template tree into the group, mapping each
+      // leaf's template ordinal through `@[...]` and recreating nested groups/unions (which carry
+      // their own newtype identity via Field.typeId).
+      stampTemplateFields(tmpl, groupMember, layout, mapping, member, templateOwnerId);
     } else {
       errorReporter.addErrorOn(member,
           "A '@[...]' ordinal mapping requires a field whose type is an inline "
@@ -1645,24 +1691,28 @@ private:
   }
 
   NodeSourceInfoBuilderPair newGroupNode(schema::Node::Reader parent, Declaration::Reader decl) {
+    return newGroupNode(parent, decl.getName().getValue(), decl.getStartByte(), decl.getEndByte());
+  }
+
+  NodeSourceInfoBuilderPair newGroupNode(schema::Node::Reader parent, kj::StringPtr name,
+                                         uint startByte, uint endByte) {
     AuxNode aux {
       translator.orphanage.newOrphan<schema::Node>(),
       translator.orphanage.newOrphan<schema::Node::SourceInfo>()
     };
     auto node = aux.node.get();
     auto sourceInfo = aux.sourceInfo.get();
-    auto name = decl.getName().getValue();
 
     // We'll set the ID and scope ID later.
     node.setDisplayName(kj::str(parent.getDisplayName(), '.', name));
     node.setDisplayNamePrefixLength(node.getDisplayName().size() - name.size());
     node.setIsGeneric(parent.getIsGeneric());
     node.initStruct().setIsGroup(true);
-    node.setStartByte(decl.getStartByte());
-    node.setEndByte(decl.getEndByte());
+    node.setStartByte(startByte);
+    node.setEndByte(endByte);
 
-    sourceInfo.setStartByte(decl.getStartByte());
-    sourceInfo.setEndByte(decl.getEndByte());
+    sourceInfo.setStartByte(startByte);
+    sourceInfo.setEndByte(endByte);
 
     // The remaining contents of node.struct will be filled in later.
 
