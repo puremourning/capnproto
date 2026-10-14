@@ -21,6 +21,7 @@
 
 #include "error-reporter.h"
 #include <kj/debug.h>
+#include <kj/filesystem.h>
 
 namespace capnp {
 namespace compiler {
@@ -62,6 +63,11 @@ GlobalErrorReporter::SourcePos LineBreakTable::toSourcePos(uint32_t byteOffset) 
   uint line = findLargestElementBefore(lineBreaks, byteOffset);
   uint col = byteOffset - lineBreaks[line];
   return GlobalErrorReporter::SourcePos { byteOffset, line, col };
+}
+
+void GlobalErrorReporter::addWarning(const kj::ReadableDirectory& directory, kj::PathPtr path,
+                                      SourcePos start, SourcePos end, kj::StringPtr message) {
+  // Default implementation does nothing.
 }
 
 }  // namespace compiler

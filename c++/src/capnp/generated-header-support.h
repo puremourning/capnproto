@@ -47,6 +47,52 @@ struct Capability;  // To declare brandBindingFor<Capability>()
 
 namespace _ {  // private
 
+// =======================================================================================
+// Inline group/union newtype use-site tables
+
+static constexpr uint32_t NEWTYPE_UNMAPPED = 0xffffffffu;
+// Offset of a newtype member left unmapped at a use site by an incomplete `@[...]`.
+
+struct NewtypeTable {
+  // The layout of one inline group/union newtype at one use site, for ONE level of the newtype:
+  // `entries[i]` describes the member at position `i` of the newtype template's `fields` list.
+  // That position is stable under schema evolution (new fields are appended), so a carrier
+  // generated from one version of the newtype can read a table generated from another:
+  //  - an index past `size` (the table predates the field) reads as unmapped;
+  //  - entries past what the carrier knows (the table postdates it) are ignored.
+  //
+  // A slot member's entry holds its offset (in units of the slot's type, or pointers), or
+  // NEWTYPE_UNMAPPED. A nested-newtype member's entry instead points to that member's own table,
+  // built by the same rule for the nested template (null if the whole member is unmapped).
+  //
+  // Generated code emits one `constexpr` table per use site and level. The zero-cost wrapper
+  // `Foo::Reader<&table>` reads it at compile time; the erased `Foo::AnyReader` carries a pointer
+  // to it at runtime.
+
+  struct Entry {
+    uint32_t offset;
+    const NewtypeTable* nested;
+  };
+
+  const Entry* entries;
+  uint32_t size;
+  uint32_t discriminantOffset;  // union newtypes only; NEWTYPE_UNMAPPED otherwise
+
+  constexpr uint32_t offset(uint32_t i) const {
+    return i < size ? entries[i].offset : NEWTYPE_UNMAPPED;
+  }
+  constexpr const NewtypeTable* child(uint32_t i) const;
+  // Never null: an absent or unmapped nested member yields the empty table.
+};
+
+inline constexpr NewtypeTable EMPTY_NEWTYPE_TABLE = { nullptr, 0, NEWTYPE_UNMAPPED };
+// The table of a nested newtype member absent from (or wholly unmapped at) a use site: every
+// member reads as its default and every setter refuses.
+
+constexpr const NewtypeTable* NewtypeTable::child(uint32_t i) const {
+  return i < size && entries[i].nested != nullptr ? entries[i].nested : &EMPTY_NEWTYPE_TABLE;
+}
+
 #if !CAPNP_LITE
 
 template <typename T, typename CapnpPrivate = typename T::_capnpPrivate, bool = false>

@@ -1,0 +1,12 @@
+# Compiling this file should SUCCEED (exit 0) but emit a warning: `price @[0]` maps only the
+# first of Price's two fields, leaving `scale` unmapped at that use site.
+@0xd94dd6f3c8b5a201;
+
+type Price = group {
+  value @0 :Int64;
+  scale @1 :UInt16;
+}
+
+struct Order {
+  price @[0] :Price;
+}

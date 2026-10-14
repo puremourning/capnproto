@@ -66,6 +66,17 @@ public:
     addError(decl.getStartByte(), decl.getEndByte(), message);
   }
 
+  virtual void addWarning(uint32_t startByte, uint32_t endByte, kj::StringPtr message) {
+    // Report a warning at the given location. Unlike an error, a warning does not set
+    // hadErrors() and does not inhibit code generation. The default implementation ignores
+    // warnings; reporters that surface diagnostics to the user override this.
+  }
+
+  template <typename T>
+  inline void addWarningOn(T&& decl, kj::StringPtr message) {
+    addWarning(decl.getStartByte(), decl.getEndByte(), message);
+  }
+
   virtual bool hadErrors() = 0;
   // Return true if any errors have been reported, globally.  The main use case for this callback
   // is to inhibit the reporting of errors which may have been caused by previous errors, or to
@@ -94,6 +105,9 @@ public:
                         SourcePos start, SourcePos end,
                         kj::StringPtr message) = 0;
   // Report an error at the given location in the given file.
+
+  virtual void addWarning(const kj::ReadableDirectory& directory, kj::PathPtr path,
+                          SourcePos start, SourcePos end, kj::StringPtr message);
 
   virtual bool hadErrors() = 0;
   // Return true if any errors have been reported, globally.  The main use case for this callback

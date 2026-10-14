@@ -121,3 +121,45 @@ struct TestBase64Union {
     bar @1 :Text;
   }
 }
+
+# An inline union newtype whose JSON annotations (on the newtype itself, on a nested group, and on a
+# leaf) must reach the fields stamped from it. `TestJsonNewtypeInline` spells out the same layout
+# without the newtype, and must encode identically.
+type TestJsonNewtypeId = union $Json.discriminator(name = "kind") {
+  raw @0 :Data $Json.hex;
+  parts :group $Json.flatten(prefix = "val.") {
+    lo @1 :UInt64;
+    hi @2 :UInt64;
+  }
+}
+
+struct TestJsonNewtype {
+  id @[0-2] :TestJsonNewtypeId;
+  renamed @[3-5] :TestJsonNewtypeId $Json.name("other-id");
+  # Use-site annotations merge with the newtype's.
+  flat @[6-8] :TestJsonNewtypeId $Json.flatten(prefix = "f.");
+}
+
+struct TestJsonNewtypeInline {
+  id :union $Json.discriminator(name = "kind") {
+    raw @0 :Data $Json.hex;
+    parts :group $Json.flatten(prefix = "val.") {
+      lo @1 :UInt64;
+      hi @2 :UInt64;
+    }
+  }
+  renamed :union $Json.name("other-id") $Json.discriminator(name = "kind") {
+    raw @3 :Data $Json.hex;
+    parts :group $Json.flatten(prefix = "val.") {
+      lo @4 :UInt64;
+      hi @5 :UInt64;
+    }
+  }
+  flat :union $Json.flatten(prefix = "f.") $Json.discriminator(name = "kind") {
+    raw @6 :Data $Json.hex;
+    parts :group $Json.flatten(prefix = "val.") {
+      lo @7 :UInt64;
+      hi @8 :UInt64;
+    }
+  }
+}

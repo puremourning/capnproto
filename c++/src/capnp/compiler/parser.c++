@@ -656,6 +656,52 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
         return DeclParserResult(kj::mv(decl));
       }));
 
+  // `type X = group {...}` / `type X = union {...}` are block statements (like `struct`), so the
+  // `group`/`union` branches must be tried before the expression branch (which would otherwise
+  // parse the `group`/`union` keyword as a bare type name).
+  parsers.typeDecl = arena.copy(p::oneOf(
+      p::transform(
+          p::sequence(keyword("type"), identifier, p::optional(parsers.uid),
+                      p::optional(parenthesizedList(identifier, errorReporter)),
+                      op("="), keyword("group"), p::many(parsers.annotation)),
+          [this](Located<Text::Reader>&& name, kj::Maybe<Orphan<LocatedInteger>>&& id,
+                 kj::Maybe<Located<kj::Array<kj::Maybe<Located<Text::Reader>>>>>&& genericParameters,
+                 kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
+                     -> DeclParserResult {
+            auto decl = orphanage.newOrphan<Declaration>();
+            initDecl(decl.get(), kj::mv(name), kj::mv(id), kj::mv(genericParameters),
+                     kj::mv(annotations)).initType().getTarget().setGroup();
+            return DeclParserResult(kj::mv(decl), parsers.structLevelDecl);
+          }),
+      p::transform(
+          p::sequence(keyword("type"), identifier, p::optional(parsers.uid),
+                      p::optional(parenthesizedList(identifier, errorReporter)),
+                      op("="), keyword("union"), p::many(parsers.annotation)),
+          [this](Located<Text::Reader>&& name, kj::Maybe<Orphan<LocatedInteger>>&& id,
+                 kj::Maybe<Located<kj::Array<kj::Maybe<Located<Text::Reader>>>>>&& genericParameters,
+                 kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
+                     -> DeclParserResult {
+            auto decl = orphanage.newOrphan<Declaration>();
+            initDecl(decl.get(), kj::mv(name), kj::mv(id), kj::mv(genericParameters),
+                     kj::mv(annotations)).initType().getTarget().setUnion();
+            return DeclParserResult(kj::mv(decl), parsers.structLevelDecl);
+          }),
+      p::transform(
+          p::sequence(keyword("type"), identifier, p::optional(parsers.uid),
+                      p::optional(parenthesizedList(identifier, errorReporter)),
+                      op("="), parsers.expression, p::many(parsers.annotation)),
+          [this](Located<Text::Reader>&& name, kj::Maybe<Orphan<LocatedInteger>>&& id,
+                 kj::Maybe<Located<kj::Array<kj::Maybe<Located<Text::Reader>>>>>&& genericParameters,
+                 Orphan<Expression>&& target,
+                 kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
+                     -> DeclParserResult {
+            auto decl = orphanage.newOrphan<Declaration>();
+            auto builder = initDecl(decl.get(), kj::mv(name), kj::mv(id),
+                                    kj::mv(genericParameters), kj::mv(annotations)).initType();
+            builder.getTarget().adoptExpression(kj::mv(target));
+            return DeclParserResult(kj::mv(decl));
+          })));
+
   parsers.constDecl = arena.copy(p::transform(
       p::sequence(keyword("const"), identifier, p::optional(parsers.uid),
                   op(":"), parsers.expression,
@@ -710,18 +756,99 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
         return DeclParserResult(kj::mv(decl), parsers.structLevelDecl);
       }));
 
+  // A single item of an `@[...]` ordinal mapping: a single ordinal (start == end) or "a - b".
+  struct ParsedRange {
+    uint64_t start;
+    uint64_t end;
+    uint32_t startByte;
+    uint32_t endByte;
+  };
+  auto& rangeItem = arena.copy(p::oneOf(
+      p::transformWithLocation(
+          p::sequence(integerLiteral, op("-"), integerLiteral),
+          [](kj::parse::Span<List<Token>::Reader::Iterator> loc,
+             Located<uint64_t>&& start, Located<uint64_t>&& end) -> ParsedRange {
+            return ParsedRange { start.value, end.value,
+                (uint32_t)loc.begin()->getStartByte(), (uint32_t)(loc.end() - 1)->getEndByte() };
+          }),
+      p::transformWithLocation(
+          integerLiteral,
+          [](kj::parse::Span<List<Token>::Reader::Iterator> loc,
+             Located<uint64_t>&& value) -> ParsedRange {
+            return ParsedRange { value.value, value.value,
+                (uint32_t)loc.begin()->getStartByte(), (uint32_t)(loc.end() - 1)->getEndByte() };
+          })));
+
+  auto& ordinalRanges = arena.copy(p::transform(
+      p::sequence(op("@"), bracketedList(rangeItem, errorReporter)),
+      [this](Located<kj::Array<kj::Maybe<ParsedRange>>>&& items)
+          -> Orphan<List<Declaration::OrdinalRange>> {
+        uint count = 0;
+        for (auto& item: items.value) {
+          if (item != kj::none) count++;
+        }
+        auto result = orphanage.newOrphan<List<Declaration::OrdinalRange>>(count);
+        auto builder = result.get();
+        uint i = 0;
+        for (auto& item: items.value) {
+          KJ_IF_SOME(r, item) {
+            if (r.start >= 65536 || r.end >= 65536) {
+              errorReporter.addError(r.startByte, r.endByte,
+                  "Ordinals cannot be greater than 65535.");
+            }
+            if (r.end < r.start) {
+              errorReporter.addError(r.startByte, r.endByte,
+                  "Ordinal range end must not be less than start.");
+            }
+            auto rb = builder[i++];
+            rb.setStart(r.start & 0xffff);
+            rb.setEnd(r.end & 0xffff);
+            rb.setStartByte(r.startByte);
+            rb.setEndByte(r.endByte);
+          }
+        }
+        return result;
+      }));
+
+  // A field's ordinal is either a single `@n` or an `@[...]` mapping (for inline group/union
+  // newtype fields).
+  typedef kj::OneOf<Orphan<LocatedInteger>, Orphan<List<Declaration::OrdinalRange>>> FieldOrdinal;
+  auto& fieldOrdinal = arena.copy(p::oneOf(
+      p::transform(parsers.ordinal,
+          [](Orphan<LocatedInteger>&& o) -> FieldOrdinal {
+            FieldOrdinal result;
+            result.init<Orphan<LocatedInteger>>(kj::mv(o));
+            return result;
+          }),
+      p::transform(ordinalRanges,
+          [](Orphan<List<Declaration::OrdinalRange>>&& r) -> FieldOrdinal {
+            FieldOrdinal result;
+            result.init<Orphan<List<Declaration::OrdinalRange>>>(kj::mv(r));
+            return result;
+          })));
+
   parsers.fieldDecl = arena.copy(p::transform(
-      p::sequence(identifier, parsers.ordinal, op(":"), parsers.expression,
+      p::sequence(identifier, fieldOrdinal, op(":"), parsers.expression,
                   p::optional(p::sequence(op("="), parsers.expression)),
                   p::many(parsers.annotation)),
-      [this](Located<Text::Reader>&& name, Orphan<LocatedInteger>&& ordinal,
+      [this](Located<Text::Reader>&& name, FieldOrdinal&& ordinal,
              Orphan<Expression>&& type, kj::Maybe<Orphan<Expression>>&& defaultValue,
              kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
                  -> DeclParserResult {
         auto decl = orphanage.newOrphan<Declaration>();
-        auto builder =
-            initMemberDecl(decl.get(), kj::mv(name), kj::mv(ordinal), kj::mv(annotations))
-                .initField();
+        auto declBuilder = decl.get();
+        name.copyTo(declBuilder.initName());
+        if (ordinal.is<Orphan<LocatedInteger>>()) {
+          declBuilder.getId().adoptOrdinal(kj::mv(ordinal.get<Orphan<LocatedInteger>>()));
+        } else {
+          declBuilder.getId().adoptOrdinalRanges(
+              kj::mv(ordinal.get<Orphan<List<Declaration::OrdinalRange>>>()));
+        }
+        auto annotationsBuilder = declBuilder.initAnnotations(annotations.size());
+        for (uint i = 0; i < annotations.size(); i++) {
+          annotationsBuilder.adoptWithCaveats(i, kj::mv(annotations[i]));
+        }
+        auto builder = declBuilder.initField();
         builder.adoptType(kj::mv(type));
         KJ_IF_SOME(val, defaultValue) {
           builder.getDefaultValue().adoptValue(kj::mv(val));
@@ -1018,7 +1145,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
   // -----------------------------------------------------------------
 
   parsers.genericDecl = arena.copy(p::oneOf(
-      parsers.usingDecl, parsers.constDecl, parsers.annotationDecl,
+      parsers.usingDecl, parsers.typeDecl, parsers.constDecl, parsers.annotationDecl,
       parsers.enumDecl, parsers.structDecl, parsers.interfaceDecl));
   parsers.fileLevelDecl = arena.copy(p::oneOf(
       parsers.genericDecl, nakedId, nakedAnnotation));

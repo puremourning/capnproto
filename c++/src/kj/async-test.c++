@@ -1580,6 +1580,18 @@ KJ_TEST("exclusiveJoin both events complete simultaneously") {
   KJ_EXPECT(!joined.poll(waitScope));
 }
 
+struct DebugObserver: public kj::EventLoopObserver {
+  void onWaitStart() override {
+    events.add(kj::str("waitStart"));
+  }
+
+  void onWaitEnd() override {
+    events.add(kj::str("waitEnd"));
+  }
+
+  Vector<String> events;
+};
+
 #if KJ_USE_FIBERS
 KJ_TEST("start a fiber") {
   if (isLibcContextHandlingKnownBroken()) return;
@@ -1936,18 +1948,6 @@ KJ_TEST("fiber pool limit") {
   // that the second stack doesn't match the previously-deleted stack, because there's a high
   // likelihood that the new stack would be allocated in the same location.
 }
-
-struct DebugObserver: public kj::EventLoopObserver {
-  void onWaitStart() override {
-    events.add(kj::str("waitStart"));
-  }
-
-  void onWaitEnd() override {
-    events.add(kj::str("waitEnd"));
-  }
-
-  Vector<String> events;
-};
 
 #if __GNUC__ >= 12 && !__clang__
 // The test below intentionally takes a pointer to a stack variable and stores it past the end

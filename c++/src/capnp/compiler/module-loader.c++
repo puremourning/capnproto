@@ -205,6 +205,14 @@ public:
         lines.toSourcePos(startByte), lines.toSourcePos(endByte), message);
   }
 
+  void addWarning(uint32_t startByte, uint32_t endByte, kj::StringPtr message) override {
+    auto& lines = *KJ_REQUIRE_NONNULL(lineBreaks,
+        "Can't report warnings until loadContent() is called.");
+
+    loader.getErrorReporter().addWarning(sourceDir, path,
+        lines.toSourcePos(startByte), lines.toSourcePos(endByte), message);
+  }
+
   bool hadErrors() override {
     return loader.getErrorReporter().hadErrors();
   }
