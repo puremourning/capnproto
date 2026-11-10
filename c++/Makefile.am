@@ -562,7 +562,8 @@ heavy_tests =                                                  \
   src/capnp/compat/json-test.c++                               \
   src/capnp/compat/websocket-rpc-test.c++                      \
   src/capnp/compiler/lexer-test.c++                            \
-  src/capnp/compiler/type-id-test.c++
+  src/capnp/compiler/type-id-test.c++                          \
+  src/capnp/compiler/resolution-test.c++
 capnp_test_LDADD =                                             \
   libcapnp-test.a                                              \
   libcapnpc.la                                                 \

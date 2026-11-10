@@ -305,6 +305,7 @@ if(BUILD_TESTING)
       rpc-twoparty-test.c++
       compiler/lexer-test.c++
       compiler/type-id-test.c++
+      compiler/resolution-test.c++
       test-util.c++
       compat/json-test.c++
       compat/websocket-rpc-test.c++

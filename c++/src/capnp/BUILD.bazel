@@ -264,6 +264,7 @@ cc_test(
     "common-test.c++",
     "capability-test.c++",
     "compiler/lexer-test.c++",
+    "compiler/resolution-test.c++",
     "compiler/type-id-test.c++",
     "dynamic-test.c++",
     "encoding-test.c++",

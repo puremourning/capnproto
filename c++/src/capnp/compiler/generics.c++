@@ -554,6 +554,17 @@ BrandedDecl BrandScope::decompileType(
   KJ_UNREACHABLE;
 }
 
+namespace {
+
+uint64_t resolutionTypeId(const Resolver::ResolvedDecl& decl) {
+  // The type ID to report for an identifier in `FileSourceInfo`. A name that resolves through
+  // a `type` newtype carries the newtype's node in `newtypeId` (the decl itself describes the
+  // underlying type); navigation wants the newtype, as in `Compiler::Impl::lookup`.
+  return decl.newtypeId != 0 ? decl.newtypeId : decl.id;
+}
+
+}  // namespace
+
 kj::Maybe<BrandedDecl> BrandScope::compileDeclExpression(
     Expression::Reader source, Resolver& resolver,
     ImplicitParams implicitMethodParams) {
@@ -596,7 +607,7 @@ kj::Maybe<BrandedDecl> BrandScope::compileDeclExpression(
           errorReporter.reportResolution(Resolution {
             /* .startByte = */ source.getStartByte(),
             /* .endByte = */ source.getEndByte(),
-            /* .target = */ Resolution::Type { r.get<Resolver::ResolvedDecl>().id },
+            /* .target = */ Resolution::Type { resolutionTypeId(r.get<Resolver::ResolvedDecl>()) },
           });
         }
         return kj::mv(result);
@@ -614,7 +625,7 @@ kj::Maybe<BrandedDecl> BrandScope::compileDeclExpression(
           errorReporter.reportResolution(Resolution {
             /* .startByte = */ source.getStartByte(),
             /* .endByte = */ source.getEndByte(),
-            /* .target = */ Resolution::Type { r.get<Resolver::ResolvedDecl>().id },
+            /* .target = */ Resolution::Type { resolutionTypeId(r.get<Resolver::ResolvedDecl>()) },
           });
         }
         return kj::mv(result);
@@ -684,10 +695,11 @@ kj::Maybe<BrandedDecl> BrandScope::compileDeclExpression(
         auto name = member.getName();
         KJ_IF_SOME(memberDecl, decl.getMember(name.getValue(), source)) {
           KJ_IF_SOME(id, memberDecl.getGenericTypeId()) {
+            uint64_t newtypeId = memberDecl.getNewtypeId();
             errorReporter.reportResolution(Resolution {
               /* .startByte = */ source.getStartByte(),
               /* .endByte = */ source.getEndByte(),
-              /* .target = */ Resolution::Type { id },
+              /* .target = */ Resolution::Type { newtypeId != 0 ? newtypeId : id },
             });
           }
           return kj::mv(memberDecl);
