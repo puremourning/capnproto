@@ -111,6 +111,7 @@ const void* castToConstVoid(T* ptr) {
 }
 
 KJ_NORETURN(void throwWrongDisposerError());
+KJ_NORETURN(void throwNullPtrError());
 
 template <typename From, typename To>
 using EnableIfCanConvertPtr = EnableIf<canConvert<From*, To*>() && isConst<From>() == isConst<To>()>;
@@ -193,6 +194,9 @@ class PtrTarget;
 
 namespace _ {
 
+template <typename T, bool isPtrTarget>
+struct PinControl;
+
 class WeakCell {
   // Shared validity cell for kj::Weak<T>. The referent (a Pin or PtrTarget) owns one reference
   // while it is alive; Weak owns one reference per weak pointer. When the referent is destroyed or
@@ -256,8 +260,7 @@ protected:
     if (weakCell == nullptr) {
       weakCell = new _::WeakCell(nullptr, nullptr);
     } else {
-      weakCell->ptr = nullptr;
-      weakCell->target = nullptr;
+      expireWeak();
     }
   }
 
@@ -276,14 +279,35 @@ private:
     return weakCell;
   }
 
-  inline void dispose() {
+  inline void expireWeak() {
+    // Expire outstanding weak pointers but keep the cell, so that weak pointers created later are
+    // expired too. Unlike invalidateWeak(), doesn't allocate a cell if none exists.
+    if (weakCell != nullptr) {
+      weakCell->ptr = nullptr;
+      weakCell->target = nullptr;
+    }
+  }
+
+  inline void expireWeakForMove() {
+    // Release a live cell so the moved-from object can create fresh weak pointers, while existing
+    // weak pointers stay expired. Keep an already-expired cell: it records permanent invalidation
+    // by invalidateWeak(), which moving must not undo.
+    if (weakCell != nullptr && weakCell->ptr != nullptr) {
+      disposeWeakCell();
+    }
+  }
+
+  inline void disposeWeakCell() {
     if (weakCell != nullptr) {
       weakCell->ptr = nullptr;
       weakCell->target = nullptr;
       weakCell->decRef();
       weakCell = nullptr;
     }
+  }
 
+  inline void dispose() {
+    disposeWeakCell();
     assertEmpty();
   }
 
@@ -305,10 +329,13 @@ private:
   inline void assertEmpty() {}
 #endif // KJ_ASSERT_PTR_COUNTERS
 
-  _::WeakCell* weakCell = nullptr;
+  mutable _::WeakCell* weakCell = nullptr;
 #if KJ_ASSERT_PTR_COUNTERS
-  _::AtomicPtrCounter ptrCounter;
+  mutable _::AtomicPtrCounter ptrCounter;
 #endif // KJ_ASSERT_PTR_COUNTERS
+  // Reference bookkeeping is logically mutable, including when embedded in Pin<const T>.
+  // That Pin contains an actually const T: casting away const to access its PtrTarget does not
+  // itself permit modifying these fields. They must be mutable to make those updates legal.
 
   template <typename>
   friend class Ptr;
@@ -316,7 +343,40 @@ private:
   friend class Weak;
   template <typename>
   friend class Pin;
+  template <typename, bool>
+  friend struct _::PinControl;
 };
+
+namespace _ {  // private
+
+template <typename T, bool isPtrTarget = DerivedFrom<RemoveConst<T>, PtrTarget>>
+struct PinControl {
+  // T does not extend PtrTarget, have our own.
+  PtrTarget target;
+  inline PtrTarget* get(T&) { return &target; }
+
+  inline void expireWeak(T&) {
+    // The target is private to the Pin, so no subclass needs to retain its expired cell.
+    target.disposeWeakCell();
+  }
+};
+
+template <typename T>
+struct PinControl<T, true> {
+  // T already extends PtrTarget, no new target is necessary.
+  inline PtrTarget* get(T& t) {
+    // Like PtrTarget::asPtrTarget(), bookkeeping is logically mutable even for const T.
+    return const_cast<PtrTarget*>(static_cast<const PtrTarget*>(&t));
+  }
+
+  inline void expireWeak(T& t) {
+    // The target is shared with T: keep the cell (expired), so that invalidation done by T via
+    // invalidateWeak() remains permanent.
+    get(t)->expireWeak();
+  }
+};
+
+}  // namespace _ (private)
 
 // =======================================================================================
 // Own<T> -- An owned pointer.
@@ -764,6 +824,11 @@ class Pin {
   // operations are asserted.
   // Weak<T> support adds one pointer of overhead to Pin<T>, and allocates a shared cell lazily when
   // the first weak reference is created.
+  //
+  // If T extends PtrTarget, Pin<T> reuses T's PtrTarget instead of adding its own, so it has no
+  // overhead over T. Pointers obtained via Pin<T> and via T's addPtrToThis()/addWeakToThis() then
+  // share the same bookkeeping. Moving allows fresh weak pointers to the moved-from object unless
+  // T has permanently invalidated them with invalidateWeak().
 
 public:
   template <typename... Params>
@@ -773,13 +838,14 @@ public:
   inline Pin(Pin<T>&& other): t(kj::mv(other.t)) {
     // Move T's ownership.
     // Undefined behavior when live pointers exist, asserted when KJ_ASSERT_PTR_COUNTERS is defined.
-    other.target.dispose();
+    other.target()->expireWeakForMove();
+    other.target()->assertEmpty();
   }
 
   inline ~Pin() {
-    // Destroy a Pin with underlying object.
-    // Undefined behavior when live pointers exist, asserted when KJ_ASSERT_PTR_COUNTERS is defined.
-    target.dispose();
+    // Expire weak pointers before destroying T. The PtrTarget destructor checks for active strong
+    // pointers: for an embedded PtrTarget this happens after T's members release any self pointers.
+    control.expireWeak(t);
   }
 
   inline T* operator->() const { return get(); }
@@ -814,11 +880,16 @@ private:
   inline Pin(T&& t): t(kj::mv(t)) {}
 
   inline _::WeakCell* getWeakCell() {
-    return target.getWeakCell(&t);
+    return target()->getWeakCell(&t);
   }
 
+  inline PtrTarget* target() { return control.get(t); }
+
   T t;
-  PtrTarget target;
+  KJ_NO_UNIQUE_ADDRESS _::PinControl<T> control;
+  // `control` must be declared after `t`: members are destroyed in reverse order, so when T doesn't
+  // extend PtrTarget, the PtrTarget destructor asserts that no strong pointers exist before T is
+  // destroyed.
 
   template <typename>
   friend class Ptr;
@@ -880,17 +951,24 @@ public:
   }
 
   inline T* operator->() const { return get(); }
-  inline T* get() const { return ptr; }
+  inline T* get() const {
+    // A Ptr is null after being moved from or assigned nullptr. Throw rather than hand out a null
+    // pointer that the caller will dereference. Compare against nullptr to test for null.
+    if (KJ_UNLIKELY(ptr == nullptr)) _::throwNullPtrError();
+    return ptr;
+  }
 
-  inline bool operator==(const Pin<T>& other) const { return get() == other.get(); }
-  inline bool operator==(const Ptr<T>& other) const { return get() == other.get(); }
-  inline bool operator==(const T* const other) const { return get() == other; }
+  inline bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
+  inline bool operator==(const Ptr<T>& other) const { return ptr == other.ptr; }
+  inline bool operator==(const T* const other) const { return ptr == other; }
 
   template <typename U>
-  inline bool operator==(const Pin<U>& other) const { return get() == other.get(); }
+  inline bool operator==(const Pin<U>& other) const { return ptr == other.get(); }
+  // Templated so that comparing with nullptr doesn't instantiate Pin<T>, which fails for an
+  // abstract T.
 
   template <typename U>
-  inline bool operator==(const Ptr<U>& other) const { return get() == other.get(); }
+  inline bool operator==(const Ptr<U>& other) const { return ptr == other.ptr; }
 
   inline T& asRef() const { return *get(); }
   // Obtain a `T&` reference.
@@ -901,12 +979,12 @@ public:
 private:
   inline explicit Ptr(decltype(nullptr)) noexcept: ptr(nullptr), target(nullptr) {}
 
-  inline Ptr(Pin<T>* pin) : ptr(pin->get()), target(&pin->target) {
+  inline Ptr(Pin<T>* pin) : ptr(pin->get()), target(pin->target()) {
     target->inc();
   }
 
   template <typename U, typename = _::EnableIfCanConvertPtr<U, T>>
-  inline Ptr(Pin<U>* pin) : ptr(pin->get()), target(&pin->target) {
+  inline Ptr(Pin<U>* pin) : ptr(pin->get()), target(pin->target()) {
     target->inc();
   }
 

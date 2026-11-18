@@ -214,6 +214,10 @@ cc_capnp_library(
         "test.capnp",
         "test-import.capnp",
         "test-import2.capnp",
+        "test-newtype.capnp",
+        "test-newtype-import.capnp",
+        "test-newtype-v1.capnp",
+        "test-newtype-v2.capnp",
     ],
     data = [
         "c++.capnp",
@@ -260,6 +264,7 @@ cc_test(
     "common-test.c++",
     "capability-test.c++",
     "compiler/lexer-test.c++",
+    "compiler/resolution-test.c++",
     "compiler/type-id-test.c++",
     "dynamic-test.c++",
     "encoding-test.c++",
@@ -267,6 +272,7 @@ cc_test(
     "layout-test.c++",
     "membrane-test.c++",
     "message-test.c++",
+    "newtype-test.c++",
     "orphan-test.c++",
     "reconnect-test.c++",
     "rpc-test.c++",
@@ -313,7 +319,7 @@ cc_test(
 
 cc_test(
     name = "compiler/evolution-test",
+    size = "large",
     srcs = ["compiler/evolution-test.c++"],
     deps = [":capnp-test"],
-    size = "large",
 )

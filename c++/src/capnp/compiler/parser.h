@@ -119,6 +119,7 @@ public:
     Parser<Orphan<Declaration::Param>> param;
 
     DeclParser usingDecl;
+    DeclParser typeDecl;
     DeclParser constDecl;
     DeclParser enumDecl;
     DeclParser enumerantDecl;

@@ -62,6 +62,38 @@
 #include <execinfo.h>
 #endif
 
+#if __linux__ && KJ_HAS_BACKTRACE && \
+    (KJ_HAS_COMPILER_FEATURE(address_sanitizer) || defined(__SANITIZE_ADDRESS__) || \
+     KJ_HAS_COMPILER_FEATURE(thread_sanitizer) || defined(__SANITIZE_THREAD__))
+// ASan and TSan intercept backtrace().
+#define KJ_BACKTRACE_INTERCEPTED 1
+#else
+#define KJ_BACKTRACE_INTERCEPTED 0
+#endif
+
+#ifndef KJ_BACKTRACE_WITH_UNWINDER
+// The sanitizers' backtrace() interceptor takes a scratch buffer from the sanitizer's internal
+// allocator, under a spin lock that a thread cannot take twice. A signal handler that traces a
+// thread interrupted while it held that lock, as it briefly does in every backtrace() call, would
+// spin forever. So under ASan we call the unwinder directly, as glibc's backtrace() does,
+// bypassing the interceptor.
+//
+// TSan delivers crash signals such as SIGSEGV at once too, but doing so under TSan isn't safe in
+// the first place: the handler's instrumented code takes a TSan lock that the interrupted thread
+// may hold, so it can deadlock before it gets here. Define this to 1 to bypass the interceptor
+// anyway, or to 0 to keep it under ASan.
+#if __linux__ && KJ_HAS_BACKTRACE && \
+    (KJ_HAS_COMPILER_FEATURE(address_sanitizer) || defined(__SANITIZE_ADDRESS__))
+#define KJ_BACKTRACE_WITH_UNWINDER 1
+#else
+#define KJ_BACKTRACE_WITH_UNWINDER 0
+#endif
+#endif
+
+#if KJ_BACKTRACE_WITH_UNWINDER
+#include <unwind.h>
+#endif
+
 #if _WIN32 || __CYGWIN__
 #include <windows.h>
 #include "windows-sanity.h"
@@ -235,7 +267,7 @@ struct PipePair {
 };
 
 PipePair raiiPipe() {
-  int fds[2];
+  int fds[2]{};
   KJ_SYSCALL(pipe(fds));
   return PipePair { OwnFd(fds[0]), OwnFd(fds[1]) };
 }
@@ -383,6 +415,49 @@ String stringifyStackTraceWithLlvm(ArrayPtr<void* const> trace) {
 
 #endif
 
+#if KJ_BACKTRACE_WITH_UNWINDER
+namespace {
+
+struct UnwinderTrace {
+  ArrayPtr<void*> space;
+  size_t size = 0;
+  bool skippedOwnFrame = false;
+  _Unwind_Word lastCfa = 0;
+};
+
+_Unwind_Reason_Code addUnwinderFrame(_Unwind_Context* context, void* arg) {
+  auto& trace = *static_cast<UnwinderTrace*>(arg);
+  if (!trace.skippedOwnFrame) {
+    // The first frame is unwinderBacktrace() itself, which backtrace() wouldn't report either.
+    trace.skippedOwnFrame = true;
+    return _URC_NO_REASON;
+  }
+
+  auto ip = reinterpret_cast<void*>(_Unwind_GetIP(context));
+  auto cfa = _Unwind_GetCFA(context);
+  if (trace.size > 0 && trace.space[trace.size - 1] == ip && trace.lastCfa == cfa) {
+    // Like backtrace(), stop if the unwinder isn't making progress.
+    return _URC_END_OF_STACK;
+  }
+  trace.space[trace.size++] = ip;
+  trace.lastCfa = cfa;
+  return trace.size == trace.space.size() ? _URC_END_OF_STACK : _URC_NO_REASON;
+}
+
+KJ_NOINLINE size_t unwinderBacktrace(ArrayPtr<void*> space) {
+  // Equivalent to backtrace(space.begin(), space.size()), without the ASan interceptor.
+  UnwinderTrace trace{.space = space};
+  _Unwind_Backtrace(&addUnwinderFrame, &trace);
+  if (trace.size > 1 && trace.space[trace.size - 1] == nullptr) {
+    // Like backtrace(), drop the null address the unwinder reports above _start.
+    --trace.size;
+  }
+  return trace.size;
+}
+
+}  // namespace
+#endif
+
 bool isStackTraceSupported() {
 #if KJ_USE_WIN32_DBGHELP || KJ_HAS_BACKTRACE
   return true;
@@ -407,7 +482,11 @@ KJ_NOINLINE ArrayPtr<void* const> getStackTrace(ArrayPtr<void*> space) {
   RtlCaptureContext(&context);
   return getStackTrace(space, GetCurrentThread(), context);
 #elif KJ_HAS_BACKTRACE
+#if KJ_BACKTRACE_WITH_UNWINDER
+  size_t size = unwinderBacktrace(space);
+#else
   size_t size = backtrace(space.begin(), space.size());
+#endif
   for (auto& addr: space.first(size)) {
     // The addresses produced by backtrace() are return addresses, which means they point to the
     // instruction immediately after the call. Invoking addr2line on these can be confusing because
@@ -432,10 +511,8 @@ size_t saturatingAdd(size_t a, size_t b) {
 }
 
 ArrayPtr<void* const> trimStackTrace(ArrayPtr<void* const> trace, size_t ignoreCount) {
-#if __linux__ && KJ_HAS_BACKTRACE && \
-    (KJ_HAS_COMPILER_FEATURE(address_sanitizer) || defined(__SANITIZE_ADDRESS__) || \
-     KJ_HAS_COMPILER_FEATURE(thread_sanitizer) || defined(__SANITIZE_THREAD__))
-  // ASan and TSan add a backtrace() interceptor frame.
+#if KJ_BACKTRACE_INTERCEPTED && !KJ_BACKTRACE_WITH_UNWINDER
+  // The sanitizer's backtrace() interceptor adds a frame.
   constexpr size_t interceptorFrames = 1;
 #else
   constexpr size_t interceptorFrames = 0;
@@ -457,7 +534,7 @@ Vector<void*> getStackTrace(size_t ignoreCount) {
   ignoreCount = saturatingAdd(ignoreCount, 2 /* this frame + getStackTrace(space) frame */);
 
   // Try a buffer on the stack first.
-  void* space[32];
+  void* space[32]{};
   auto stackSpace = arrayPtr(space).first(kj::min(kj::size(space), maxSize));
   auto trace = getStackTrace(stackSpace);
   if (trace.size() < stackSpace.size() || stackSpace.size() == maxSize) {
@@ -1420,12 +1497,8 @@ ExceptionCallback::~ExceptionCallback() noexcept(false) {
   }
 }
 
-void ExceptionCallback::onRecoverableException(Exception&& exception) {
-  next.onRecoverableException(mv(exception));
-}
-
-void ExceptionCallback::onFatalException(Exception&& exception) {
-  next.onFatalException(mv(exception));
+void ExceptionCallback::onException(Exception&& exception) {
+  next.onException(mv(exception));
 }
 
 void ExceptionCallback::logMessage(
@@ -1441,24 +1514,26 @@ Function<void(Function<void()>)> ExceptionCallback::getThreadInitializer() {
   return next.getThreadInitializer();
 }
 
+static void logException(LogSeverity severity, Exception&& e) {
+  // We intentionally go back to the top exception callback on the stack because we don't want to
+  // bypass whatever log processing is in effect.
+  //
+  // We intentionally don't log the context since it should get re-added by the exception callback
+  // anyway.
+  getExceptionCallback().logMessage(severity, e.getFile(), e.getLine(), 0, str(
+      e.getType(), e.getDescription() == nullptr ? "" : ": ", e.getDescription(),
+      e.getRemoteTrace().size() > 0 ? "\nremote: " : "",
+      e.getRemoteTrace(),
+      e.getStackTrace().size() > 0 ? "\nstack: " : "",
+      stringifyStackTraceAddresses(e.getStackTrace()),
+      stringifyStackTrace(e.getStackTrace()), "\n"));
+}
+
 class ExceptionCallback::RootExceptionCallback: public ExceptionCallback {
 public:
   RootExceptionCallback(): ExceptionCallback(*this) {}
 
-  void onRecoverableException(Exception&& exception) override {
-    if (UnwindDetector::uncaughtExceptionCount() > 0) {
-      // Bad time to throw an exception.  Just log instead.
-      //
-      // TODO(someday): We should really compare uncaughtExceptionCount() against the count at
-      //   the innermost runCatchingExceptions() frame in this thread to tell if exceptions are
-      //   being caught correctly.
-      logException(LogSeverity::ERROR, mv(exception));
-    } else {
-      throw ExceptionImpl(mv(exception));
-    }
-  }
-
-  void onFatalException(Exception&& exception) override {
+  void onException(Exception&& exception) override {
     throw ExceptionImpl(mv(exception));
   }
 
@@ -1494,22 +1569,6 @@ public:
       func();
     };
   }
-
-private:
-  void logException(LogSeverity severity, Exception&& e) {
-    // We intentionally go back to the top exception callback on the stack because we don't want to
-    // bypass whatever log processing is in effect.
-    //
-    // We intentionally don't log the context since it should get re-added by the exception callback
-    // anyway.
-    getExceptionCallback().logMessage(severity, e.getFile(), e.getLine(), 0, str(
-        e.getType(), e.getDescription() == nullptr ? "" : ": ", e.getDescription(),
-        e.getRemoteTrace().size() > 0 ? "\nremote: " : "",
-        e.getRemoteTrace(),
-        e.getStackTrace().size() > 0 ? "\nstack: " : "",
-        stringifyStackTraceAddresses(e.getStackTrace()),
-        stringifyStackTrace(e.getStackTrace()), "\n"));
-  }
 };
 
 ExceptionCallback& getExceptionCallback() {
@@ -1543,15 +1602,67 @@ ExceptionCallback& getExceptionCallback() {
   return scoped != nullptr ? *scoped : *defaultCallback;
 }
 
-void throwFatalException(kj::Exception&& exception, uint ignoreCount) {
+void throwException(kj::Exception&& exception, uint ignoreCount) {
   if (ignoreCount != (uint)kj::maxValue) exception.extendTrace(ignoreCount + 1);
-  getExceptionCallback().onFatalException(kj::mv(exception));
+  getExceptionCallback().onException(kj::mv(exception));
   abort();
 }
 
-void throwRecoverableException(kj::Exception&& exception, uint ignoreCount) {
+void throwFatalException(kj::Exception&& exception, uint ignoreCount) {
+  // Same as throwException(), not a call to it, so that `ignoreCount` skips the same frames.
   if (ignoreCount != (uint)kj::maxValue) exception.extendTrace(ignoreCount + 1);
-  getExceptionCallback().onRecoverableException(kj::mv(exception));
+  getExceptionCallback().onException(kj::mv(exception));
+  abort();
+}
+
+namespace _ {  // private
+
+void rethrowUnlessUnwinding() {
+  // We're in a `catch` block, where the exception being handled no longer counts as uncaught, so
+  // this only counts other exceptions in flight.
+  if (std::uncaught_exceptions() == 0) {
+    // Not unwinding: let the exception continue as if it had not been caught. `throw;` rethrows
+    // the same exception object, so the exception callbacks don't run again.
+    throw;
+  }
+  logException(LogSeverity::ERROR, getCaughtExceptionAsKj());
+}
+
+}  // namespace _ (private)
+
+void throwExceptionUnlessUnwinding(kj::Exception&& exception, uint ignoreCount) {
+  if (ignoreCount != (uint)kj::maxValue) exception.extendTrace(ignoreCount + 1);
+  if (std::uncaught_exceptions() == 0) {
+    getExceptionCallback().onException(kj::mv(exception));
+    abort();
+  }
+
+  // Another exception is unwinding the stack. Still pass the exception through the callback
+  // chain exactly as if it had been thrown, so callbacks see it like any other exception, but log
+  // what the chain throws instead of letting it escape. (`KJ_CONTEXT` is re-added when logging.)
+  KJ_TRY {
+    getExceptionCallback().onException(kj::mv(exception));
+    abort();
+  } KJ_CATCH(e) {
+    logException(LogSeverity::ERROR, kj::mv(e));
+  }
+}
+
+void throwRecoverableException(kj::Exception&& exception, uint ignoreCount) {
+  // Same as throwExceptionUnlessUnwinding(), not a call to it, so that `ignoreCount` skips the same
+  // frames.
+  if (ignoreCount != (uint)kj::maxValue) exception.extendTrace(ignoreCount + 1);
+  if (std::uncaught_exceptions() == 0) {
+    getExceptionCallback().onException(kj::mv(exception));
+    abort();
+  }
+
+  KJ_TRY {
+    getExceptionCallback().onException(kj::mv(exception));
+    abort();
+  } KJ_CATCH(e) {
+    logException(LogSeverity::ERROR, kj::mv(e));
+  }
 }
 
 // =======================================================================================

@@ -466,6 +466,10 @@ test_capnpc_inputs =                                           \
   src/capnp/test.capnp                                         \
   src/capnp/test-import.capnp                                  \
   src/capnp/test-import2.capnp                                 \
+  src/capnp/test-newtype.capnp                                 \
+  src/capnp/test-newtype-import.capnp                          \
+  src/capnp/test-newtype-v1.capnp                              \
+  src/capnp/test-newtype-v2.capnp                              \
   src/capnp/compat/json-test.capnp
 
 test_capnpc_outputs =                                          \
@@ -475,6 +479,14 @@ test_capnpc_outputs =                                          \
   src/capnp/test-import.capnp.h                                \
   src/capnp/test-import2.capnp.c++                             \
   src/capnp/test-import2.capnp.h                               \
+  src/capnp/test-newtype.capnp.c++                             \
+  src/capnp/test-newtype.capnp.h                               \
+  src/capnp/test-newtype-import.capnp.c++                      \
+  src/capnp/test-newtype-import.capnp.h                        \
+  src/capnp/test-newtype-v1.capnp.c++                          \
+  src/capnp/test-newtype-v1.capnp.h                            \
+  src/capnp/test-newtype-v2.capnp.c++                          \
+  src/capnp/test-newtype-v2.capnp.h                            \
   src/capnp/compat/json-test.capnp.c++                         \
   src/capnp/compat/json-test.capnp.h
 
@@ -550,7 +562,8 @@ heavy_tests =                                                  \
   src/capnp/compat/json-test.c++                               \
   src/capnp/compat/websocket-rpc-test.c++                      \
   src/capnp/compiler/lexer-test.c++                            \
-  src/capnp/compiler/type-id-test.c++
+  src/capnp/compiler/type-id-test.c++                          \
+  src/capnp/compiler/resolution-test.c++
 capnp_test_LDADD =                                             \
   libcapnp-test.a                                              \
   libcapnpc.la                                                 \
@@ -605,6 +618,7 @@ capnp_test_SOURCES =                                           \
   src/capnp/any-test.c++                                       \
   src/capnp/message-test.c++                                   \
   src/capnp/encoding-test.c++                                  \
+  src/capnp/newtype-test.c++                                   \
   src/capnp/orphan-test.c++                                    \
   src/capnp/serialize-test.c++                                 \
   src/capnp/serialize-packed-test.c++                          \

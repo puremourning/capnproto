@@ -76,6 +76,14 @@ kj::Maybe<Declaration::Which> BrandedDecl::getKind() {
   }
 }
 
+uint64_t BrandedDecl::getNewtypeId() {
+  if (body.is<Resolver::ResolvedParameter>()) {
+    return 0;
+  } else {
+    return body.get<Resolver::ResolvedDecl>().newtypeId;
+  }
+}
+
 kj::Maybe<BrandedDecl&> BrandedDecl::getListParam() {
   KJ_REQUIRE(body.is<Resolver::ResolvedDecl>());
 
@@ -98,6 +106,16 @@ Resolver::ResolvedParameter BrandedDecl::asVariable() {
 
 bool BrandedDecl::compileAsType(
     ErrorReporter& errorReporter, schema::Type::Builder target) {
+  if (body.is<Resolver::ResolvedDecl>()) {
+    // If the name resolved through a `type` newtype, record a back-reference to that node.
+    // The union filled below still describes the underlying type (for layout and wire format);
+    // `typeId` is a separate, non-union field, so setting it here is order-independent.
+    uint64_t newtypeId = body.get<Resolver::ResolvedDecl>().newtypeId;
+    if (newtypeId != 0) {
+      target.setTypeId(newtypeId);
+    }
+  }
+
   KJ_IF_SOME(kind, getKind()) {
     switch (kind) {
       case Declaration::ENUM: {
@@ -182,6 +200,15 @@ bool BrandedDecl::compileAsType(
         target.initAnyPointer().initUnconstrained().setCapability();
         return true;
 
+      case Declaration::TYPE:
+        // Expression newtypes resolve transparently to their target before reaching here; only an
+        // inline group/union newtype (or a newtype aliasing one) stays a `type` declaration, and
+        // it can only be used via an `@[...]` field, not in type position.
+        addError(errorReporter, kj::str(
+            "'", toString(), "' is an inline group/union newtype, which can only be used as the "
+            "type of a field with an '@[...]' ordinal mapping (e.g. 'foo @[0-1] :",
+            toString(), ";')."));
+        return false;
       case Declaration::FILE:
       case Declaration::USING:
       case Declaration::CONST:
@@ -527,6 +554,17 @@ BrandedDecl BrandScope::decompileType(
   KJ_UNREACHABLE;
 }
 
+namespace {
+
+uint64_t resolutionTypeId(const Resolver::ResolvedDecl& decl) {
+  // The type ID to report for an identifier in `FileSourceInfo`. A name that resolves through
+  // a `type` newtype carries the newtype's node in `newtypeId` (the decl itself describes the
+  // underlying type); navigation wants the newtype, as in `Compiler::Impl::lookup`.
+  return decl.newtypeId != 0 ? decl.newtypeId : decl.id;
+}
+
+}  // namespace
+
 kj::Maybe<BrandedDecl> BrandScope::compileDeclExpression(
     Expression::Reader source, Resolver& resolver,
     ImplicitParams implicitMethodParams) {
@@ -569,7 +607,7 @@ kj::Maybe<BrandedDecl> BrandScope::compileDeclExpression(
           errorReporter.reportResolution(Resolution {
             /* .startByte = */ source.getStartByte(),
             /* .endByte = */ source.getEndByte(),
-            /* .target = */ Resolution::Type { r.get<Resolver::ResolvedDecl>().id },
+            /* .target = */ Resolution::Type { resolutionTypeId(r.get<Resolver::ResolvedDecl>()) },
           });
         }
         return kj::mv(result);
@@ -587,7 +625,7 @@ kj::Maybe<BrandedDecl> BrandScope::compileDeclExpression(
           errorReporter.reportResolution(Resolution {
             /* .startByte = */ source.getStartByte(),
             /* .endByte = */ source.getEndByte(),
-            /* .target = */ Resolution::Type { r.get<Resolver::ResolvedDecl>().id },
+            /* .target = */ Resolution::Type { resolutionTypeId(r.get<Resolver::ResolvedDecl>()) },
           });
         }
         return kj::mv(result);
@@ -657,10 +695,11 @@ kj::Maybe<BrandedDecl> BrandScope::compileDeclExpression(
         auto name = member.getName();
         KJ_IF_SOME(memberDecl, decl.getMember(name.getValue(), source)) {
           KJ_IF_SOME(id, memberDecl.getGenericTypeId()) {
+            uint64_t newtypeId = memberDecl.getNewtypeId();
             errorReporter.reportResolution(Resolution {
               /* .startByte = */ source.getStartByte(),
               /* .endByte = */ source.getEndByte(),
-              /* .target = */ Resolution::Type { id },
+              /* .target = */ Resolution::Type { newtypeId != 0 ? newtypeId : id },
             });
           }
           return kj::mv(memberDecl);

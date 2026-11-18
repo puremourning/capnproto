@@ -1,0 +1,6 @@
+# Under-mapping a union so a trailing arm gets no ordinals at all drops that arm (with a warning),
+# rather than stamping it empty with no discriminant value (an internal validation assert).
+@0xe1000000000f0003;
+type Price = group { value @0 :Int64; scale @1 :UInt16; }
+type OrderPrices = union { limit @[0-1] :Price; stop @[2-3] :Price; other @[4-5] :Price; }
+struct S { p @[0, 1, 2] :OrderPrices; }

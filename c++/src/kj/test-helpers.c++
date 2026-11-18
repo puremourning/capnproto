@@ -31,6 +31,10 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#if __linux__
+#include <sys/prctl.h>
+#endif
 #else
 #include <process.h>
 #endif
@@ -62,72 +66,6 @@ void LogExpectation::logMessage(
 }
 
 // =======================================================================================
-
-namespace {
-
-class FatalThrowExpectation: public ExceptionCallback {
-public:
-  FatalThrowExpectation(Maybe<Exception::Type> type,
-                        Maybe<StringPtr> message)
-      : type(type), message(message) {}
-
-  void onFatalException(Exception&& exception) override {
-    KJ_IF_SOME(expectedType, type) {
-      if (exception.getType() != expectedType) {
-        KJ_LOG(ERROR, "threw exception of wrong type", exception, expectedType);
-        _exit(1);
-      }
-    }
-    KJ_IF_SOME(expectedSubstring, message) {
-      if (!exception.getDescription().contains(expectedSubstring)) {
-        KJ_LOG(ERROR, "threw exception with wrong message", exception, expectedSubstring);
-        _exit(1);
-      }
-    }
-    _exit(0);
-  }
-
-private:
-  Maybe<Exception::Type> type;
-  Maybe<StringPtr> message;
-};
-
-}  // namespace
-
-bool expectFatalThrow(kj::Maybe<Exception::Type> type, kj::Maybe<StringPtr> message,
-                      Function<void()> code) {
-#if _WIN32
-  // We don't support death tests on Windows due to lack of efficient fork.
-  return true;
-#else
-  pid_t child;
-  KJ_SYSCALL(child = fork());
-  if (child == 0) {
-    KJ_DEFER(_exit(1));
-    FatalThrowExpectation expectation(type, message);
-    KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
-      code();
-    })) {
-      KJ_LOG(ERROR, "a non-fatal exception was thrown, but we expected fatal", e);
-    } else {
-      KJ_LOG(ERROR, "no fatal exception was thrown");
-    }
-  }
-
-  int status;
-  KJ_SYSCALL(waitpid(child, &status, 0));
-
-  if (WIFEXITED(status)) {
-    return WEXITSTATUS(status) == 0;
-  } else if (WIFSIGNALED(status)) {
-    KJ_FAIL_EXPECT("subprocess crashed without throwing exception", WTERMSIG(status));
-    return false;
-  } else {
-    KJ_FAIL_EXPECT("subprocess neither exited nor crashed?", status);
-    return false;
-  }
-#endif
-}
 
 bool expectExit(Maybe<int> statusCode, FunctionParam<void()> code)  noexcept {
 #if _WIN32
@@ -173,6 +111,16 @@ bool expectSignal(Maybe<int> signal, FunctionParam<void()> code) noexcept {
   KJ_SYSCALL(child = fork());
   if (child == 0) {
     resetCrashHandlers();
+
+    // The child is expected to die of the signal, so its core dump would only be noise, and the
+    // system's core handler can take seconds to produce one.
+    struct rlimit noCore = {0, 0};
+    setrlimit(RLIMIT_CORE, &noCore);
+#if __linux__
+    // Linux still runs a core_pattern pipe handler at a zero limit; this stops the dump itself.
+    prctl(PR_SET_DUMPABLE, 0);
+#endif
+
     code();
     _exit(0);
   }

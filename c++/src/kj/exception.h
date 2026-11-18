@@ -280,11 +280,9 @@ enum class LogSeverity {
 StringPtr KJ_STRINGIFY(LogSeverity severity);
 
 class ExceptionCallback {
-  // If you don't like C++ exceptions, you may implement and register an ExceptionCallback in order
-  // to perform your own exception handling.  For example, a reasonable thing to do is to have
-  // onRecoverableException() set a flag indicating that an error occurred, and then check for that
-  // flag just before writing to storage and/or returning results to the user.  If the flag is set,
-  // discard whatever you have and return an error instead.
+  // An ExceptionCallback may be implemented and registered in order to customize how exceptions
+  // are thrown and how log messages are written.  For example, a callback might annotate
+  // exceptions with additional context before they are thrown, or redirect log output.
   //
   // ExceptionCallbacks must always be allocated on the stack.  When an exception is thrown, the
   // newest ExceptionCallback on the calling thread's stack is called.  The default implementation
@@ -297,18 +295,11 @@ public:
   KJ_DISALLOW_COPY_AND_MOVE(ExceptionCallback);
   virtual ~ExceptionCallback() noexcept(false);
 
-  virtual void onRecoverableException(Exception&& exception);
-  // Called when an exception has been raised, but the calling code has the ability to continue by
-  // producing garbage output.  This method _should_ throw the exception, but is allowed to simply
-  // return if garbage output is acceptable.
-  //
-  // The global default implementation throws an exception, unless we're currently in a destructor
-  // unwinding due to another exception being thrown, in which case it logs an error and returns.
-
-  virtual void onFatalException(Exception&& exception);
-  // Called when an exception has been raised and the calling code cannot continue.  If this method
-  // returns normally, abort() will be called.  The method must throw the exception to avoid
-  // aborting.
+  virtual void onException(Exception&& exception);
+  // Called when an exception has been raised by `kj::throwException()` or
+  // `kj::throwRecoverableException()`.  The method must throw the exception: if it returns
+  // normally, abort() will be called.  (`throwRecoverableException()` logs what this method throws
+  // instead of letting it escape if the stack is already unwinding.)
   //
   // The global default implementation throws an exception.
 
@@ -362,18 +353,32 @@ private:
 ExceptionCallback& getExceptionCallback();
 // Returns the current exception callback.
 
-KJ_NOINLINE KJ_NORETURN(void throwFatalException(kj::Exception&& exception, uint ignoreCount = 0));
-// Invoke the exception callback to throw the given fatal exception.  If the exception callback
+KJ_NOINLINE KJ_NORETURN(void throwException(kj::Exception&& exception, uint ignoreCount = 0));
+// Invoke the exception callback to throw the given exception.  If the exception callback
 // returns, abort.
 //
-// TODO(2.0): Rename this to `throwException()`.
+// To avoid throwing from a destructor while the stack is already unwinding, see
+// `kj::throwExceptionUnlessUnwinding()` and `kj::logExceptionsIfUnwinding()`.
+
+KJ_NOINLINE KJ_NOT_TAIL_CALLED void throwExceptionUnlessUnwinding(
+    kj::Exception&& exception, uint ignoreCount = 0);
+// Like `throwException()`, but if the stack is currently unwinding due to another exception, the
+// exception is logged at ERROR severity and the function returns instead, since throwing during
+// unwind would terminate the process. Either way, the exception goes through the exception
+// callback chain first, exactly as with `throwException()`.
+//
+// For use in destructors (and code called from destructors). Code after the call must cope with
+// it returning. The `KJ_DTOR_*` macros in debug.h (`KJ_DTOR_ASSERT`, `KJ_DTOR_SYSCALL`, ...) use
+// this to report failed checks.
+//
+// "Unwinding" means that any exception is in flight in this thread; see
+// `kj::logExceptionsIfUnwinding()`.
+
+KJ_NOINLINE KJ_NORETURN(void throwFatalException(kj::Exception&& exception, uint ignoreCount = 0));
+// Deprecated: old name of `throwException()`, which should be used instead.
 
 KJ_NOINLINE void throwRecoverableException(kj::Exception&& exception, uint ignoreCount = 0);
-// Invoke the exception callback to throw the given recoverable exception.  If the exception
-// callback returns, return normally.
-//
-// TODO(2.0): Rename this to `throwExceptionUnlessUnwinding()`. (Or, can we fix the unwind problem
-//   and be able to remove this entirely?)
+// Deprecated: old name of `throwExceptionUnlessUnwinding()`, which should be used instead.
 
 // =======================================================================================
 
@@ -387,7 +392,7 @@ KJ_NOINLINE void throwRecoverableException(kj::Exception&& exception, uint ignor
 //     // code that may throw
 //   } KJ_CATCH(e) {
 //     // code that handles the exception `e`
-//     kj::throwFatalException(kj::mv(e));  // Optional: rethrow like so
+//     kj::throwException(kj::mv(e));  // Optional: rethrow like so
 //   }
 //
 // KJ_TRY: Semantically equivalent to `try`. The user-provided code block following this macro
@@ -398,7 +403,7 @@ KJ_NOINLINE void throwRecoverableException(kj::Exception&& exception, uint ignor
 // details, you can name the exception `_` to suppress the unused variable warning, or suffix it
 // with `[[maybe_unused]]`. You are free to move the exception away, if you want, e.g. to rethrow
 // it. As a reminder, if you want to rethrow the exception, you must use
-// `kj::throwFatalException()`, and not a naked `throw`, to ensure the exception's attached stack
+// `kj::throwException()`, and not a naked `throw`, to ensure the exception's attached stack
 // trace is accurate.
 //
 // The user-provided code block following `KJ_CATCH(e)` IS NOT A TRUE CATCH HANDLER! In particular,
@@ -575,6 +580,10 @@ KJ_NOINLINE void throwRecoverableException(kj::Exception&& exception, uint ignor
 // storage variable, we must choose a hard-coded name for it. This will cause variable shadowing in
 // nested KJ_TRY/KJ_CATCHes, but that is benign, so we disable shadowing warnings. The `_kj` prefix
 // on the variable name should make name collision with user code extremely unlikely.
+//
+// The `if` / `else` statements below intentionally have unbraced bodies so that the caller can
+// supply the `try` block and the `KJ_CATCH` handler block.
+// NOLINTBEGIN(readability-inconsistent-ifelse-braces)
 #define KJ_TRY \
     KJ_SILENCE_SHADOWING_BEGIN \
     if (::kj::Maybe<::kj::Exception> _kjTryCatchException; true) \
@@ -592,6 +601,7 @@ KJ_NOINLINE void throwRecoverableException(kj::Exception&& exception, uint ignor
       KJ_UNIQUE_NAME(_kjTryCatchHandler): \
       if (auto& exception = *::kj::_::readMaybe(_kjTryCatchException); false) {} \
       else
+// NOLINTEND(readability-inconsistent-ifelse-braces)
 
 namespace _ { class Runnable; }
 
@@ -636,6 +646,11 @@ public:
   // Runs the given function (e.g., a lambda).  If isUnwinding() is true, any exceptions are
   // caught and treated as secondary faults, meaning they are considered to be side-effects of the
   // exception that is unwinding the stack.  Otherwise, exceptions are passed through normally.
+  //
+  // TODO(cleanup): Unify with `kj::logExceptionsIfUnwinding()` so there is only one "don't throw
+  //   during unwind" tool. This method uses the per-object unwinding rule and silently discards
+  //   the secondary exception; move its users to `logExceptionsIfUnwinding()` /
+  //   `KJ_DTOR_CALL()` and remove it along with `catchThrownExceptionAsSecondaryFault()`.
 
   static uint uncaughtExceptionCount();
   // exposes `std::uncaught_exceptions`
@@ -645,6 +660,54 @@ private:
 
   void catchThrownExceptionAsSecondaryFault() const;
 };
+
+template <typename Func>
+void logExceptionsIfUnwinding(Func&& func);
+// Runs the given function (e.g., a lambda). If the stack is currently unwinding due to another
+// exception, any exception thrown by the function is caught and logged at ERROR severity rather
+// than propagated, since throwing during unwind would terminate the process. Otherwise, exceptions
+// propagate normally.
+//
+// This is intended for use in destructors (and code called from destructors), which in KJ are
+// allowed to throw (they are declared `noexcept(false)`), but must not throw during unwind:
+//
+//     Foo::~Foo() noexcept(false) {
+//       kj::logExceptionsIfUnwinding([&]() {
+//         flushBuffer();
+//         closeConnection();
+//       });
+//       // ... more cleanup, which runs if we're unwinding even if the above threw ...
+//     }
+//
+// For a single statement, use the `KJ_DTOR_CALL()` shorthand instead. For a single
+// assertion or system call, use the `KJ_DTOR_*` macros from debug.h (`KJ_DTOR_ASSERT`,
+// `KJ_DTOR_SYSCALL`, ...) instead: they only check for unwinding once the check has failed, and
+// need no try/catch at the call site.
+//
+// Unlike `UnwindDetector::catchExceptionsIfUnwinding()`, this does not require an `UnwindDetector`
+// constructed ahead of time, and logs the secondary exception instead of discarding it. The
+// trade-off is that it considers the stack to be unwinding if any exception is in flight in this
+// thread, even one that will be caught before reaching the destructor's caller.
+//
+// TODO(someday): Compare the uncaught exception count against the count at the innermost
+//   catch frame in this thread, to tell whether we're really unwinding through our caller.
+
+#define KJ_DTOR_CALL(...) ::kj::logExceptionsIfUnwinding([&]() { __VA_ARGS__; })
+// Shorthand for `kj::logExceptionsIfUnwinding()` wrapping a single statement. Typically used
+// to wrap a call to a function that may throw in a destructor:
+//
+//     Foo::~Foo() noexcept(false) {
+//       KJ_DTOR_CALL(flushBuffer());
+//     }
+//
+// Don't use this for assertions and system calls; use `KJ_DTOR_ASSERT()`, `KJ_DTOR_SYSCALL()`,
+// etc. from debug.h instead.
+
+namespace _ {  // private
+KJ_NOINLINE void rethrowUnlessUnwinding();
+// Called from a `catch` block by `logExceptionsIfUnwinding()`: rethrows the caught exception (with
+// `throw;`) if no other exception is unwinding the stack, otherwise logs it at ERROR severity.
+}  // namespace _ (private)
 
 template <typename Func>
 Maybe<Exception> runCatchingExceptions(Func&& func) {
@@ -666,6 +729,17 @@ void UnwindDetector::catchExceptionsIfUnwinding(Func&& func) const {
     }
   } else {
     func();
+  }
+}
+
+template <typename Func>
+void logExceptionsIfUnwinding(Func&& func) {
+  // Whether the stack is unwinding is only checked once `func` has thrown, so the normal path is
+  // just a call to `func`, and all the handling is in an out-of-line function.
+  try {
+    func();
+  } catch (...) {
+    _::rethrowUnlessUnwinding();
   }
 }
 
@@ -737,7 +811,7 @@ class InFlightExceptionIterator {
   //
   // This is meant for debugging purposes, and the results are best-effort. The C++ standard
   // library does not provide any way to inspect uncaught exceptions, so this class can only
-  // discover KJ exceptions thrown using throwFatalException() or throwRecoverableException().
+  // discover KJ exceptions thrown using throwException() or throwRecoverableException().
   // All KJ code uses those two functions to throw exceptions, but if your own code uses a bare
   // `throw`, or if the standard library throws an exception, these cannot be inspected.
   //

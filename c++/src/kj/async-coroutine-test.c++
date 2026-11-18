@@ -227,7 +227,7 @@ KJ_TEST("Exceptions propagate through layered coroutines") {
 
   auto throwy = simpleCoroutine(kj::Promise<int>(kj::NEVER_DONE), false);
 
-  KJ_EXPECT_THROW_RECOVERABLE(FAILED, simpleCoroutine(kj::mv(throwy)).wait(waitScope));
+  KJ_EXPECT_THROW(FAILED, simpleCoroutine(kj::mv(throwy)).wait(waitScope));
 }
 
 // GCC gets compilation errors with promise continuations in lambdas
@@ -251,7 +251,7 @@ KJ_TEST("Exceptions before the first co_await don't escape, but reject the promi
 
   auto throwy = throwEarly();
 
-  KJ_EXPECT_THROW_RECOVERABLE(FAILED, throwy.wait(waitScope));
+  KJ_EXPECT_THROW(FAILED, throwy.wait(waitScope));
 }
 
 KJ_TEST("Coroutines can catch exceptions from co_await") {
@@ -311,7 +311,7 @@ KJ_TEST("Coroutines can be canceled while suspended") {
 }
 
 Promise<void> deferredThrowCoroutine(Promise<void> awaitMe, StringPtr message) {
-  KJ_DEFER(throwFatalException(
+  KJ_DEFER(throwException(
       Exception(Exception::Type::FAILED, __FILE__, __LINE__, str(message))));
   co_await awaitMe;
   co_return;
@@ -342,7 +342,7 @@ struct DeferredThrowPromiseNode: public _::PromiseNode {
 
   virtual ~DeferredThrowPromiseNode() noexcept(false) {
     unwindDetector.catchExceptionsIfUnwinding([]() {
-      kj::throwFatalException(KJ_EXCEPTION(FAILED, "~DeferredThrowPromiseNode()"));
+      kj::throwException(KJ_EXCEPTION(FAILED, "~DeferredThrowPromiseNode()"));
     });
   }
 
@@ -449,7 +449,7 @@ KJ_TEST("Exceptions during completed coroutine frame-unwind propagate via return
   {
     // Next, prove that they show up via the returned Promise.
     auto promise = deferredThrowCoroutine(kj::READY_NOW, "thrown during unwind");
-    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("thrown during unwind", promise.wait(waitScope));
+    KJ_EXPECT_THROW_MESSAGE("thrown during unwind", promise.wait(waitScope));
   }
 }
 
@@ -459,7 +459,7 @@ KJ_TEST("Coroutine destruction exceptions are ignored if there is another except
 
   auto exception = KJ_ASSERT_NONNULL(kj::runCatchingExceptions([&]() {
     auto promise = deferredThrowCoroutine(kj::NEVER_DONE, "thrown during unwind");
-    kj::throwFatalException(KJ_EXCEPTION(FAILED, "thrown before destroying throwy promise"));
+    kj::throwException(KJ_EXCEPTION(FAILED, "thrown before destroying throwy promise"));
   }));
 
   KJ_EXPECT(exception.getDescription() == "thrown before destroying throwy promise");
@@ -473,7 +473,7 @@ KJ_TEST("co_await only sees coroutine destruction exceptions if promise was not 
   // we expect to be able to catch from a coroutine which co_awaits it.
   auto throwyDtorPromise = kj::Promise<void>(kj::READY_NOW)
       .attach(kj::defer([]() {
-    kj::throwFatalException(KJ_EXCEPTION(FAILED, "thrown during unwind"));
+    kj::throwException(KJ_EXCEPTION(FAILED, "thrown during unwind"));
   }));
 
   // rejectedThrowyDtorPromise is a rejected promise. When co_awaited in a coroutine,
@@ -481,9 +481,9 @@ KJ_TEST("co_await only sees coroutine destruction exceptions if promise was not 
   // the temporary promise will be destroyed. The exception it throws during unwind will be ignored,
   // and the caller of the coroutine will see only the "thrown during execution" exception.
   auto rejectedThrowyDtorPromise = kj::evalNow([&]() -> kj::Promise<void> {
-    kj::throwFatalException(KJ_EXCEPTION(FAILED, "thrown during execution"));
+    kj::throwException(KJ_EXCEPTION(FAILED, "thrown during execution"));
   }).attach(kj::defer([]() {
-    kj::throwFatalException(KJ_EXCEPTION(FAILED, "thrown during unwind"));
+    kj::throwException(KJ_EXCEPTION(FAILED, "thrown during unwind"));
   }));
 
   auto awaitPromise = [](kj::Promise<void> promise) -> kj::Promise<void> {
@@ -523,7 +523,7 @@ KJ_TEST("Can trace through coroutines") {
   // Get an async trace when the promise is fulfilled. We eagerlyEvaluate() to make sure the
   // continuation executes while the event loop is running.
   paf.promise = paf.promise.then([]() {
-    void* scratch[16];
+    void* scratch[16]{};
     auto trace = getAsyncTrace(scratch);
     // We expect one entry for waitImpl(), one for the coroutine, and one for this continuation.
     // When building in debug mode with CMake, I observed this count can be 2. The missing frame is
@@ -550,6 +550,30 @@ KJ_TEST("Can trace through coroutines") {
   coroPromise.wait(waitScope);
 }
 #endif  // !_MSC_VER || defined(__clang__)
+
+KJ_TEST("Can trace a coroutine while it destroys its locals after co_return") {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  auto paf = newPromiseAndFulfiller<void>();
+  bool traced = false;
+
+  auto coroPromise = [&]() -> kj::Promise<void> {
+    // Runs after co_return has armed the coroutine's OnReadyEvent, while the coroutine is still
+    // the currently firing event. Flowing off the end destroys locals before arming, so the
+    // explicit co_return is needed.
+    KJ_DEFER({
+      getAsyncTrace();
+      traced = true;
+    });
+    co_await paf.promise;
+    co_return;
+  }();
+
+  paf.fulfiller->fulfill();
+  coroPromise.wait(waitScope);
+  KJ_EXPECT(traced);
+}
 
 Promise<void> sendData(Promise<Own<NetworkAddress>> addressPromise) {
   auto address = co_await addressPromise;

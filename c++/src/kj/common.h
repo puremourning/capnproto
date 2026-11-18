@@ -233,6 +233,15 @@ typedef unsigned char byte;
 #define KJ_NOINLINE __attribute__((noinline))
 #endif
 
+#if __clang__
+#define KJ_NOT_TAIL_CALLED __attribute__((not_tail_called))
+#else
+#define KJ_NOT_TAIL_CALLED
+#endif
+// Prevents calls to the function from being compiled as tail calls, so the caller's frame stays on
+// the stack. Used by functions that capture a stack trace skipping a fixed number of frames.
+// Supported by Clang only.
+
 #ifndef KJ_DISPOSE_ATTR
 #define KJ_DISPOSE_ATTR
 // Attribute applied to KJ's type-erased object-teardown dispatch helpers: Disposer::dispose(),
@@ -299,7 +308,7 @@ typedef unsigned char byte;
 #define KJ_UNUSED_MEMBER
 #endif
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && KJ_HAS_CPP_ATTRIBUTE(msvc::no_unique_address)
 // MSVC intentionally ignores the standard spelling to preserve ABI compatibility with older
 // toolsets. The vendor spelling opts in to empty-member optimization; clang-cl supports it too.
 #define KJ_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
@@ -363,31 +372,30 @@ KJ_NORETURN(void unreachable());
 #define KJ_MSVC_TRADITIONAL_CPP 1
 #endif
 
-#if defined(KJ_DEBUG) && !defined(KJ_ENABLE_IREQUIRE)
+#if !defined(KJ_ENABLE_IREQUIRE)
 #define KJ_ENABLE_IREQUIRE 1
 #endif
 
-#if defined(KJ_ENABLE_IREQUIRE) && KJ_ENABLE_IREQUIRE
+#if !KJ_ENABLE_IREQUIRE
+#error "KJ_ENABLE_IREQUIRE=0 is no longer supported: KJ_IREQUIRE checks are always enabled."
+#endif
+// KJ_IREQUIRE checks used to be enabled only in debug builds or when KJ_ENABLE_IREQUIRE was set.
+// They are now always enabled. The KJ_ENABLE_IREQUIRE macro (and the corresponding build flags)
+// are kept only for compatibility with existing build configurations; disabling it is an error.
+
 #if KJ_MSVC_TRADITIONAL_CPP
 #define KJ_IREQUIRE(condition, ...) \
     if (KJ_LIKELY(condition)); else ::kj::_::inlineRequireFailure( \
         __FILE__, __LINE__, #condition, "" #__VA_ARGS__, __VA_ARGS__)
-// Version of KJ_DREQUIRE() which is safe to use in headers that are #included by users.  Used to
-// check preconditions inside inline methods.  KJ_IREQUIRE is particularly useful in that
-// it will be enabled depending on whether the application is compiled in debug mode rather than
-// whether libkj is.
 #else
 #define KJ_IREQUIRE(condition, ...) \
     if (KJ_LIKELY(condition)); else ::kj::_::inlineRequireFailure( \
         __FILE__, __LINE__, #condition, #__VA_ARGS__, ##__VA_ARGS__)
-// Version of KJ_DREQUIRE() which is safe to use in headers that are #included by users.  Used to
-// check preconditions inside inline methods.  KJ_IREQUIRE is particularly useful in that
-// it will be enabled depending on whether the application is compiled in debug mode rather than
-// whether libkj is.
 #endif
-#else
-#define KJ_IREQUIRE(condition, ...)
-#endif
+// Version of KJ_REQUIRE() which is safe to use in headers that are #included by users.  Used to
+// check preconditions inside inline methods.  Unlike KJ_REQUIRE(), it does not require including
+// debug.h and failures are reported through an out-of-line function to minimize code size.
+// Always enabled, regardless of whether the application or libkj is compiled in debug mode.
 
 #define KJ_IASSERT KJ_IREQUIRE
 
@@ -428,23 +436,42 @@ KJ_NORETURN(void unreachable());
 // is the stack array size to use if variable-width arrays are not supported.  `maxStack` is the
 // maximum stack array size if variable-width arrays *are* supported.
 //
+// Elements are value-initialized, just like `type array[n]{}`, whether the array ends up on the
+// stack or on the heap: trivially-constructible types are zeroed and other types are initialized
+// by their default constructors. This makes sure stale memory contents can't leak.
+//
 // TODO(cleanup): Deprecate this in favor of kj::SmallArray, over in array.h
-#if __GNUC__ && !__clang__
 #define KJ_STACK_ARRAY(type, name, size, minStack, maxStack) \
+  KJ_STACK_ARRAY_({}, ::kj::_::valueInitializedHeapArray, type, name, size, minStack, maxStack)
+
+// #define KJ_STACK_ARRAY_UNINITIALIZED(type, name, size, minStack, maxStack)
+//
+// Like KJ_STACK_ARRAY, but elements are default-initialized, just like `type array[n]`:
+// trivially-constructible types are left uninitialized. Only use this in performance-critical code
+// where every element is provably written before it is read. The custom-uninitialized-array
+// clang-tidy check reports every use, so justify each one with a NOLINT comment:
+//
+//     // NOLINTNEXTLINE(custom-uninitialized-array): <why this is necessary and safe>
+//     KJ_STACK_ARRAY_UNINITIALIZED(byte, buffer, size, 256, 4096);
+#define KJ_STACK_ARRAY_UNINITIALIZED(type, name, size, minStack, maxStack) \
+  KJ_STACK_ARRAY_(, ::kj::heapArray, type, name, size, minStack, maxStack)
+
+#if __GNUC__ && !__clang__
+#define KJ_STACK_ARRAY_(init, heapArrayFunc, type, name, size, minStack, maxStack) \
   size_t name##_size = (size); \
   bool name##_isOnStack = name##_size <= (maxStack); \
-  type name##_stack[kj::max(1, name##_isOnStack ? name##_size : 0)]; \
+  type name##_stack[kj::max(1, name##_isOnStack ? name##_size : 0)] init; \
   ::kj::Array<type> name##_heap = name##_isOnStack ? \
-      nullptr : kj::heapArray<type>(name##_size); \
+      nullptr : heapArrayFunc<type>(name##_size); \
   ::kj::ArrayPtr<type> name = name##_isOnStack ? \
       kj::arrayPtr(name##_stack, name##_size) : name##_heap
 #else
-#define KJ_STACK_ARRAY(type, name, size, minStack, maxStack) \
+#define KJ_STACK_ARRAY_(init, heapArrayFunc, type, name, size, minStack, maxStack) \
   size_t name##_size = (size); \
   bool name##_isOnStack = name##_size <= (minStack); \
-  type name##_stack[minStack]; \
+  type name##_stack[minStack] init; \
   ::kj::Array<type> name##_heap = name##_isOnStack ? \
-      nullptr : kj::heapArray<type>(name##_size); \
+      nullptr : heapArrayFunc<type>(name##_size); \
   ::kj::ArrayPtr<type> name = name##_isOnStack ? \
       kj::arrayPtr(name##_stack, name##_size) : name##_heap
 #endif
@@ -1303,12 +1330,11 @@ concept AssignableFrom = requires(T& a, U&& b) { a = kj::fwd<U>(b); };
 // Concept: T has an assignment operator that accepts U&&.
 
 template <typename T, typename U>
-concept ConstructibleFrom = requires(U&& u) { T(kj::fwd<U>(u)); };
-// Concept: T has a constructor that accepts U&&.
+concept ConstructibleFrom = __is_constructible(T, U);
+// Concept: T can be direct-initialized from U&&, i.e. `T t(kj::fwd<U>(u));` is well-formed.
 
 template <typename T, typename U>
-concept NoThrowConstructibleFrom = requires(U&& u) {
-  T(kj::fwd<U>(u));
+concept NoThrowConstructibleFrom = ConstructibleFrom<T, U> && requires(U&& u) {
   requires noexcept(new ((void*)nullptr, _::PlacementNew()) T(kj::fwd<U>(u)));
 };
 // Concept: T has a noexcept constructor that accepts U&&.
@@ -1827,11 +1853,15 @@ constexpr int KJ_IF_MAYBE_IS_DEPRECATED = 0;
 #define KJ_IF_MAYBE(name, exp) \
     if (KJ_DEPRECATE_KJ_IF_MAYBE_STMT; auto name = ::kj::_::readMaybe(exp))
 
+// The outer `if` intentionally has an unbraced body (the inner `if`) so that the caller can
+// supply the braced block and an optional `else`.
+// NOLINTBEGIN(readability-inconsistent-ifelse-braces)
 #define KJ_IF_SOME(name, exp) \
     KJ_SILENCE_DANGLING_ELSE_BEGIN \
     if (auto KJ_UNIQUE_NAME(_##name) = ::kj::_::readMaybe(exp)) \
       if (auto& name = *KJ_UNIQUE_NAME(_##name); false) {} else \
     KJ_SILENCE_DANGLING_ELSE_END
+// NOLINTEND(readability-inconsistent-ifelse-braces)
 
 struct None {};
 static constexpr None none;
@@ -2394,6 +2424,11 @@ public:
   }
   template <typename U>
   inline Maybe& operator=(const Maybe<U&>&& other) = delete;
+  Maybe& operator=(RemoveConst<T>&& other) = delete;
+  template <typename U>
+    requires (!isReference<U>())
+  Maybe& operator=(Maybe<U>&& other) = delete;
+  // Assigning from a temporary would leave this Maybe<T&> dangling.
 
   KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
   inline constexpr bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
@@ -3394,7 +3429,7 @@ constexpr bool isDisallowedInCoroutine() {
 template<typename T, typename = EnableIf<KJ_HAS_TRIVIAL_CONSTRUCTOR(T)>>
 inline void memzero(T& t) {
   // Zero-initialize memory region belonging to t. Type-safe wrapper around `memset`.
-  memset(&t, 0, sizeof(T));
+  memset(&t, 0, sizeof(T));  // NOLINT(*-ban-memset)
 }
 
 namespace _ {

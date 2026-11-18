@@ -181,13 +181,7 @@ If exceptions are merely a means to fault tolerance, then it is perfectly clear 
 Alas, C++ is what it is. So, in KJ, we work around the problem in a couple ways:
 
 * `kj::UnwindDetector` may be used to detect when a destructor is called during unwind and squelch secondary exceptions.
-* The `KJ_ASSERT` family of macros -- from which most exceptions are thrown in the first place -- implement a concept of "recoverable" exceptions, where it is safe to continue execution without throwing in cases where throwing would be bad. Assert macros in destructors must always be recoverable.
-
-#### Allowing `-fno-exceptions`
-
-KJ and Cap'n Proto are designed to function even when compiled with `-fno-exceptions`. In this case, throwing an exception behaves differently depending on whether the exception is "fatal" or "recoverable". Fatal exceptions abort the process. On a recoverable exception, on the other hand, execution continues normally, perhaps after replacing invalid data with some safe default. The exception itself is stored in a thread-local variable where code up the stack can check for it later on.
-
-This compromise is made only so that C++ applications which eschew exceptions are still able to use Cap'n Proto. We do NOT recommend disabling exceptions if you have a choice. Moreover, code following this style guide (other than KJ and Cap'n Proto) is not required to be `-fno-exceptions`-safe, and in fact we recommend against it.
+* `KJ_DTOR_ASSERT()`, `KJ_DTOR_REQUIRE()`, `KJ_DTOR_SYSCALL()`, etc. are variants of the assertion macros which log the failure rather than throw if the stack is already unwinding due to another exception. Assertions and system calls in destructors must always use them. `KJ_DTOR_CALL()` (and `kj::logExceptionsIfUnwinding()`) do the same for any code, such as calls to functions that may throw. The `custom-dtor-throw-during-unwind` clang-tidy check (see `c++/.clang-tidy`) reports assertions and throws written in a destructor that don't use them. Debug-only checks (`KJ_DASSERT()`, `KJ_DREQUIRE()`) are exempt: like in `noexcept` functions, terminating on a failed debug check is acceptable.
 
 ### Threads vs. Event Loops
 
@@ -304,7 +298,7 @@ Never use `throw` explicitly. Almost all exceptions should originate from the `K
 
 Never declare anything `noexcept`. As explained in the philosophy section, whether you like it or not, bugs can happen anywhere and therefore exceptions can happen anywhere. `noexcept` causes the process to abort on exceptions. Aborting is _never_ the right answer.
 
-Explicit destructors must always be declared `noexcept(false)`, to work around C++11's regrettable decision that destructors should be `noexcept` by default. In destructors, always use `kj::UnwindDetector` or make all your asserts recoverable in order to ensure that an exception is not thrown during unwind.
+Explicit destructors must always be declared `noexcept(false)`, to work around C++11's regrettable decision that destructors should be `noexcept` by default. In destructors, always use the `KJ_DTOR_*` assertion macros, `KJ_DTOR_CALL()`, `kj::logExceptionsIfUnwinding()`, or `kj::UnwindDetector` in order to ensure that an exception is not thrown during unwind.
 
 Do not fret too much about recovering into a perfectly consistent state after every exception. That's not the point. The point is to be able to recover at all -- to _improve_ reliability, but not to make it perfect. So, write your code to do a reasonable thing in most cases.
 

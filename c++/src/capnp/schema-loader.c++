@@ -213,18 +213,14 @@ class SchemaLoader::Validator {
 public:
   Validator(SchemaLoader::Impl& loader): loader(loader) {}
 
-  bool validate(const schema::Node::Reader& node) {
-    isValid = true;
+  void validate(const schema::Node::Reader& node) {
     nodeName = node.getDisplayName();
     dependencies.clear();
 
     KJ_CONTEXT("validating schema node", nodeName, (uint)node.which());
 
     if (node.getParameters().size() > 0) {
-      KJ_REQUIRE(node.getIsGeneric(), "if parameter list is non-empty, isGeneric must be true") {
-        isValid = false;
-        return false;
-      }
+      KJ_REQUIRE(node.getIsGeneric(), "if parameter list is non-empty, isGeneric must be true");
     }
 
     switch (node.which()) {
@@ -246,10 +242,13 @@ public:
       case schema::Node::ANNOTATION:
         validate(node.getAnnotation());
         break;
+      case schema::Node::TYPE:
+        // A `type` newtype is an alias for its underlying type; it carries no layout of its
+        // own to validate.
+        break;
     }
 
     // We accept and pass through node types we don't recognize.
-    return isValid;
   }
 
   const _::RawSchema** makeDependencyArray(uint32_t* count) {
@@ -282,7 +281,6 @@ public:
 private:
   SchemaLoader::Impl& loader;
   Text::Reader nodeName;
-  bool isValid;
 
   // Maps type IDs -> compiled schemas for each dependency.
   // Order is important because makeDependencyArray() compiles a sorted array.
@@ -295,9 +293,9 @@ private:
   kj::ArrayPtr<uint16_t> membersByDiscriminant;
 
 #define VALIDATE_SCHEMA(condition, ...) \
-  KJ_REQUIRE(condition, ##__VA_ARGS__) { isValid = false; return; }
+  KJ_REQUIRE(condition, ##__VA_ARGS__)
 #define FAIL_VALIDATE_SCHEMA(...) \
-  KJ_FAIL_REQUIRE(__VA_ARGS__) { isValid = false; return; }
+  KJ_FAIL_REQUIRE(__VA_ARGS__)
 
   void validateMemberName(kj::StringPtr name, uint index) {
     members.upsert(name, index, [&](auto&, auto&&) {
@@ -312,10 +310,8 @@ private:
     auto fields = structNode.getFields();
 
     KJ_STACK_ARRAY(bool, sawCodeOrder, fields.size(), 32, 256);
-    sawCodeOrder.fill(false);
 
     KJ_STACK_ARRAY(bool, sawDiscriminantValue, structNode.getDiscriminantCount(), 32, 256);
-    sawDiscriminantValue.fill(false);
 
     if (structNode.getDiscriminantCount() > 0) {
       VALIDATE_SCHEMA(structNode.getDiscriminantCount() != 1,
@@ -408,7 +404,6 @@ private:
   void validate(const schema::Node::Enum::Reader& enumNode) {
     auto enumerants = enumNode.getEnumerants();
     KJ_STACK_ARRAY(bool, sawCodeOrder, enumerants.size(), 32, 256);
-    sawCodeOrder.fill(false);
 
     uint index = 0;
     for (auto enumerant: enumerants) {
@@ -429,7 +424,6 @@ private:
 
     auto methods = interfaceNode.getMethods();
     KJ_STACK_ARRAY(bool, sawCodeOrder, methods.size(), 32, 256);
-    sawCodeOrder.fill(false);
 
     uint index = 0;
     for (auto method: methods) {
@@ -652,15 +646,14 @@ private:
   enum Compatibility {
     EQUIVALENT,
     OLDER,
-    NEWER,
-    INCOMPATIBLE
+    NEWER
   };
   Compatibility compatibility;
 
 #define VALIDATE_SCHEMA(condition, ...) \
-  KJ_REQUIRE(condition, ##__VA_ARGS__) { compatibility = INCOMPATIBLE; return; }
+  KJ_REQUIRE(condition, ##__VA_ARGS__)
 #define FAIL_VALIDATE_SCHEMA(...) \
-  KJ_FAIL_REQUIRE(__VA_ARGS__) { compatibility = INCOMPATIBLE; return; }
+  KJ_FAIL_REQUIRE(__VA_ARGS__)
 
   void replacementIsNewer() {
     switch (compatibility) {
@@ -672,8 +665,6 @@ private:
             "that are downgrades.  All changes must be in the same direction for compatibility.");
         break;
       case NEWER:
-        break;
-      case INCOMPATIBLE:
         break;
     }
   }
@@ -689,15 +680,13 @@ private:
         FAIL_VALIDATE_SCHEMA("Schema node contains some changes that are upgrades and some "
             "that are downgrades.  All changes must be in the same direction for compatibility.");
         break;
-      case INCOMPATIBLE:
-        break;
     }
   }
 
   void checkCompatibility(const schema::Node::Reader& node,
                           const schema::Node::Reader& replacement) {
-    // Returns whether `replacement` is equivalent, older than, newer than, or incompatible with
-    // `node`.  If exceptions are enabled, this will throw an exception on INCOMPATIBLE.
+    // Determines whether `replacement` is equivalent, older than, newer than, or incompatible with
+    // `node`.  Throws an exception if they are incompatible.
 
     VALIDATE_SCHEMA(node.which() == replacement.which(),
                     "kind of declaration changed");
@@ -731,6 +720,10 @@ private:
         break;
       case schema::Node::ANNOTATION:
         checkCompatibility(node.getAnnotation(), replacement.getAnnotation());
+        break;
+      case schema::Node::TYPE:
+        // A `type` newtype is an alias; compatibility of the underlying type is checked
+        // through the fields that reference it.
         break;
     }
   }
@@ -1185,10 +1178,7 @@ private:
                                  const schema::Value::Reader& replacement) {
     // Note that we test default compatibility only after testing type compatibility, and default
     // values have already been validated as matching their types, so this should pass.
-    KJ_ASSERT(value.which() == replacement.which()) {
-      compatibility = INCOMPATIBLE;
-      return;
-    }
+    KJ_ASSERT(value.which() == replacement.which());
 
     switch (value.which()) {
 #define HANDLE_TYPE(discrim, name) \
@@ -1233,13 +1223,7 @@ _::RawSchema* SchemaLoader::Impl::load(const schema::Node::Reader& reader, bool 
   Validator validator(*this);
   auto validatedReader = readMessageUnchecked<schema::Node>(validated.begin());
 
-  if (!validator.validate(validatedReader)) {
-    // Not valid.  Construct an empty schema of the same type and return that.
-    return loadEmpty(validatedReader.getId(),
-                     validatedReader.getDisplayName(),
-                     validatedReader.which(),
-                     false);
-  }
+  validator.validate(validatedReader);
 
   // Check if we already have a schema for this ID.
   _::RawSchema* schema;
@@ -1406,6 +1390,10 @@ _::RawSchema* SchemaLoader::Impl::loadEmpty(
     case schema::Node::ANNOTATION:
       KJ_FAIL_REQUIRE("Not a type.");
       break;
+
+    case schema::Node::TYPE:
+      KJ_FAIL_REQUIRE("Cannot synthesize a placeholder for a `type` newtype.");
+      break;
   }
 
   return load(node, isPlaceholder);
@@ -1420,7 +1408,6 @@ const _::RawBrandedSchema* SchemaLoader::Impl::makeBranded(
   auto srcScopes = proto.getScopes();
 
   KJ_STACK_ARRAY(_::RawBrandedSchema::Scope, dstScopes, srcScopes.size(), 16, 32);
-  dstScopes.asBytes().fill(0);
 
   uint dstScopeCount = 0;
   for (auto srcScope: srcScopes) {
@@ -1428,7 +1415,6 @@ const _::RawBrandedSchema* SchemaLoader::Impl::makeBranded(
       case schema::Brand::Scope::BIND: {
         auto srcBindings = srcScope.getBind();
         KJ_STACK_ARRAY(_::RawBrandedSchema::Binding, dstBindings, srcBindings.size(), 16, 32);
-        dstBindings.asBytes().fill(0);
 
         for (auto j: kj::indices(srcBindings)) {
           auto srcBinding = srcBindings[j];
@@ -1538,6 +1524,13 @@ SchemaLoader::Impl::makeBrandedDependencies(
     case schema::Node::CONST:
       ADD_ENTRY(CONST_TYPE, 0, makeDepSchema(
           node.getConst().getType(), scopeName, bindings));
+      break;
+
+    case schema::Node::TYPE:
+      // A `type` newtype's underlying type is a dependency (e.g. a group newtype's template
+      // struct), reachable via Schema::getDependency().
+      ADD_ENTRY(CONST_TYPE, 0, makeDepSchema(
+          node.getType(), scopeName, bindings));
       break;
 
     case schema::Node::STRUCT: {

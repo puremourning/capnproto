@@ -70,8 +70,8 @@ extern const RawSchema NULL_STRUCT_SCHEMA;
 extern const RawSchema NULL_ENUM_SCHEMA;
 extern const RawSchema NULL_INTERFACE_SCHEMA;
 extern const RawSchema NULL_CONST_SCHEMA;
-// The schema types default to these null (empty) schemas in case of error, especially when
-// exceptions are disabled.
+// The schema types default to these null (empty) schemas when default-constructed or in case of
+// error.
 }  // namespace _ (private)
 
 class Schema {
@@ -698,7 +698,7 @@ private:
   schema::Type::Which baseType;  // type not including applications of List()
   uint8_t listDepth;             // 0 for T, 1 for List(T), 2 for List(List(T)), ...
 
-  bool isImplicitParam;
+  bool isImplicitParam = false;
   // If true, this refers to an implicit method parameter. baseType must be ANY_POINTER, scopeId
   // must be zero, and paramIndex indicates the parameter index.
 

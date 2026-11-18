@@ -98,9 +98,7 @@ AnyPointer::Reader MessageReader::getRootInternal() {
   _::SegmentReader* segment = arena()->tryGetSegment(_::SegmentId(0));
   KJ_REQUIRE(segment != nullptr &&
              segment->checkObject(segment->getStartPtr(), ONE * WORDS),
-             "Message did not contain a root pointer.") {
-    return AnyPointer::Reader();
-  }
+             "Message did not contain a root pointer.");
 
   // const_cast here is safe because dummyCapTableReader has no state.
   return AnyPointer::Reader(_::PointerReader::getRoot(
@@ -231,12 +229,15 @@ MallocMessageBuilder::~MallocMessageBuilder() noexcept(false) {
       free(firstSegment);
     } else {
       // Must zero first segment.
-      kj::ArrayPtr<const kj::ArrayPtr<const word>> segments = getSegmentsForOutput();
-      if (segments.size() > 0) {
-        KJ_ASSERT(segments[0].begin() == firstSegment,
-            "First segment in getSegmentsForOutput() is not the first segment allocated?");
-        kj::asBytes(static_cast<word*>(firstSegment), segments[0].size()).fill(0);
-      }
+      // Both getSegmentsForOutput() and the assertion may throw; if so, skip zeroing.
+      kj::logExceptionsIfUnwinding([&]() {
+        kj::ArrayPtr<const kj::ArrayPtr<const word>> segments = getSegmentsForOutput();
+        if (segments.size() > 0) {
+          KJ_ASSERT(segments[0].begin() == firstSegment,
+              "First segment in getSegmentsForOutput() is not the first segment allocated?");
+          kj::asBytes(static_cast<word*>(firstSegment), segments[0].size()).fill(0);
+        }
+      });
     }
 
     for (word* ptr: moreSegments) {

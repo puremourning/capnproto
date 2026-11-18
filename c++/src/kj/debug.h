@@ -43,26 +43,10 @@
 //   debugging a particular problem.  Calls to `KJ_DBG` should always be deleted before committing
 //   code.  It is suggested that you set up a pre-commit hook that checks for this.
 //
-// * `KJ_ASSERT(condition, ...)`:  Throws an exception if `condition` is false, or aborts if
-//   exceptions are disabled.  This macro should be used to check for bugs in the surrounding code
-//   and its dependencies, but NOT to check for invalid input.  The macro may be followed by a
-//   brace-delimited code block; if so, the block will be executed in the case where the assertion
-//   fails, before throwing the exception.  If control jumps out of the block (e.g. with "break",
-//   "return", or "goto"), then the error is considered "recoverable" -- in this case, if
-//   exceptions are disabled, execution will continue normally rather than aborting (but if
-//   exceptions are enabled, an exception will still be thrown on exiting the block). A "break"
-//   statement in particular will jump to the code immediately after the block (it does not break
-//   any surrounding loop or switch).  Example:
-//
-//       KJ_ASSERT(value >= 0, "Value cannot be negative.", value) {
-//         // Assertion failed.  Set value to zero to "recover".
-//         value = 0;
-//         // Don't abort if exceptions are disabled.  Continue normally.
-//         // (Still throw an exception if they are enabled, though.)
-//         break;
-//       }
-//       // When exceptions are disabled, we'll get here even if the assertion fails.
-//       // Otherwise, we get here only if the assertion passes.
+// * `KJ_ASSERT(condition, ...)`:  Throws an exception if `condition` is false.  This macro should
+//   be used to check for bugs in the surrounding code and its dependencies, but NOT to check for
+//   invalid input.  In destructors (and code called from destructors), use the `KJ_DTOR_*` macros
+//   described below instead.
 //
 // * `KJ_REQUIRE(condition, ...)`:  Like `KJ_ASSERT` but used to check preconditions -- e.g. to
 //   validate parameters passed from a caller.  A failure indicates that the caller is buggy.
@@ -82,8 +66,6 @@
 //       int fd;
 //       KJ_SYSCALL(fd = open(filename, O_RDONLY), filename);
 //
-//   `KJ_SYSCALL` can be followed by a recovery block, just like `KJ_ASSERT`.
-//
 // * `KJ_NONBLOCKING_SYSCALL(code, ...)`:  Like KJ_SYSCALL, but will not throw an exception on
 //   EAGAIN/EWOULDBLOCK.  The calling code should check the syscall's return value to see if it
 //   indicates an error; in this case, it can assume the error was EAGAIN because any other error
@@ -94,7 +76,6 @@
 //   `KJ_SYSCALL_FD` is like `KJ_SYSCALL`, but:
 //     * The syscall must return a file descriptor.
 //     * The whole macro evaluates to a `kj::OwnFd`.
-//     * It cannot have a recovery block.
 //
 //   Example:
 //
@@ -108,16 +89,31 @@
 //   KJ_CONTEXT() are only evaluated if an exception is thrown.  This implies that any variables
 //   used must remain valid until the end of the scope.
 //
+// * `KJ_DTOR_ASSERT(condition, ...)`, `KJ_DTOR_REQUIRE`, `KJ_DTOR_SYSCALL`, `KJ_DTOR_WIN32`,
+//   `KJ_DTOR_WINSOCK` and their `KJ_DTOR_FAIL_*` forms:  Variants for destructors (and code called
+//   from destructors).  Throwing from a destructor while another exception is unwinding would
+//   terminate the program, so if the check fails in that case, these log the failure and continue
+//   with the next statement instead.  Otherwise they throw like the plain macros.  The unwinding
+//   check only happens once the check has failed, so they cost the same as the plain macros.
+//   Code after them must cope with the check having failed.
+//
+//       Foo::~Foo() noexcept(false) {
+//         KJ_DTOR_ASSERT(buffer.size() == 0, "Buffer was not flushed.");
+//         KJ_DTOR_SYSCALL(close(fd));
+//       }
+//
+//   To protect calls to functions that may throw, use `KJ_DTOR_CALL()` (see exception.h).
+//
 // Notes:
 // * Do not write expressions with side-effects in the message content part of the macro, as the
 //   message will not necessarily be evaluated.
 // * For every macro `FOO` above except `LOG`, there is also a `FAIL_FOO` macro used to report
 //   failures that already happened.  For the macros that check a boolean condition, `FAIL_FOO`
-//   omits the first parameter and behaves like it was `false`.  `FAIL_SYSCALL` and
-//   `FAIL_RECOVERABLE_SYSCALL` take a string and an OS error number as the first two parameters.
-//   The string should be the name of the failed system call.
-// * For every macro `FOO` above except `ASSUME`, there is a `DFOO` version (or
-//   `RECOVERABLE_DFOO`) which is only executed in debug mode, i.e. when KJ_DEBUG is defined.
+//   omits the first parameter and behaves like it was `false`.  `FAIL_SYSCALL` takes a string and
+//   an OS error number as the first two parameters.  The string should be the name of the failed
+//   system call.
+// * For every macro `FOO` above except `ASSUME`, there is a `DFOO` version which is only executed
+//   in debug mode, i.e. when KJ_DEBUG is defined.
 //   KJ_DEBUG is defined automatically by common.h when compiling without optimization (unless
 //   NDEBUG is defined), but you can also define it explicitly (e.g. -DKJ_DEBUG).  Generally,
 //   production builds should NOT use KJ_DEBUG as it may enable expensive checks that are unlikely
@@ -138,6 +134,19 @@ KJ_BEGIN_HEADER
 
 namespace kj {
 
+// The macros below intentionally expand to `if (cond) {} else <statement>` so that they are safe
+// to use in unbraced if/else statements. This can't be expressed with consistent braces.
+// NOLINTBEGIN(readability-inconsistent-ifelse-braces)
+
+#if _MSC_VER && !defined(__clang__)
+// MSVC ignores `__declspec(noreturn)` on the `Debug::fail()` template when checking whether a
+// function returns a value (C4715 / C4716), so the unconditional failure macros wrap the call in
+// an infinite loop to show that control does not continue past it.
+#define KJ_FAIL_NORETURN_ for (;;)
+#else
+#define KJ_FAIL_NORETURN_
+#endif
+
 #if KJ_MSVC_TRADITIONAL_CPP
 // MSVC does __VA_ARGS__ differently from GCC:
 // - A trailing comma before an empty __VA_ARGS__ is removed automatically, whereas GCC wants
@@ -153,77 +162,111 @@ namespace kj {
 #define KJ_EXPAND(X) X
 
 #define KJ_LOG(severity, ...) \
-  for (bool _kj_shouldLog = ::kj::_::Debug::shouldLog(::kj::LogSeverity::severity); \
-       _kj_shouldLog; _kj_shouldLog = false) \
+  if (!::kj::_::Debug::shouldLog(::kj::LogSeverity::severity)) {} else \
     ::kj::_::Debug::log(__FILE__, __LINE__, ::kj::LogSeverity::severity, \
                         "" #__VA_ARGS__, __VA_ARGS__)
 
 #define KJ_LOG_AT(severity, location, ...) \
-  for (bool _kj_shouldLog = ::kj::_::Debug::shouldLog(::kj::LogSeverity::severity); \
-       _kj_shouldLog; _kj_shouldLog = false) \
+  if (!::kj::_::Debug::shouldLog(::kj::LogSeverity::severity)) {} else \
     ::kj::_::Debug::log(location.fileName, location.lineNumber, ::kj::LogSeverity::severity, \
                         "" #__VA_ARGS__, __VA_ARGS__)
 
 #define KJ_DBG(...) KJ_EXPAND(KJ_LOG(DBG, __VA_ARGS__))
 
 // TODO(cleanup): It may be possible to reduce code duplication between the macros and their _AT
-// variants by making Debug::Fault take a SourceLocation instead of __FILE__/__LINE__.
+// variants by making Debug::fail() take a SourceLocation instead of __FILE__/__LINE__.
 
 #define KJ_REQUIRE(cond, ...) \
   if (auto _kjCondition = ::kj::_::MAGIC_ASSERT << cond) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
-        #cond, "_kjCondition," #__VA_ARGS__, _kjCondition, __VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+        #cond, "_kjCondition," #__VA_ARGS__, _kjCondition, __VA_ARGS__)
 
 #define KJ_REQUIRE_AT(cond, location, ...) \
   if (auto _kjCondition = ::kj::_::MAGIC_ASSERT << cond) {} else \
-    for (::kj::_::Debug::Fault f(location.fileName, location.lineNumber, \
+    ::kj::_::Debug::fail(location.fileName, location.lineNumber, \
         ::kj::Exception::Type::FAILED, #cond, "_kjCondition," #__VA_ARGS__, _kjCondition, \
-        __VA_ARGS__);; f.fatal())
+        __VA_ARGS__)
 
 #define KJ_FAIL_REQUIRE(...) \
-  for (::kj::_::Debug::Fault f(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
-                               nullptr, "" #__VA_ARGS__, __VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+      nullptr, "" #__VA_ARGS__, __VA_ARGS__)
 
 #define KJ_FAIL_REQUIRE_AT(location, ...) \
-  for (::kj::_::Debug::Fault f(location.fileName, location.lineNumber, \
-                               ::kj::Exception::Type::FAILED, nullptr, "" #__VA_ARGS__, \
-                               __VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(location.fileName, location.lineNumber, \
+      ::kj::Exception::Type::FAILED, nullptr, "" #__VA_ARGS__, \
+      __VA_ARGS__)
 
 #define KJ_SYSCALL(call, ...) \
   if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);}, false)) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-             _kjSyscallResult.getErrorNumber(), #call, "" #__VA_ARGS__, __VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, \
+        _kjSyscallResult.getErrorNumber(), #call, "" #__VA_ARGS__, __VA_ARGS__)
 
 #define KJ_NONBLOCKING_SYSCALL(call, ...) \
   if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);}, true)) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-             _kjSyscallResult.getErrorNumber(), #call, "" #__VA_ARGS__, __VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, \
+        _kjSyscallResult.getErrorNumber(), #call, "" #__VA_ARGS__, __VA_ARGS__)
 
 #define KJ_FAIL_SYSCALL(code, errorNumber, ...) \
-  for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-           errorNumber, code, "" #__VA_ARGS__, __VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(__FILE__, __LINE__, \
+      errorNumber, code, "" #__VA_ARGS__, __VA_ARGS__)
 
 #if _WIN32 || __CYGWIN__
 
 #define KJ_WIN32(call, ...) \
   if (auto _kjWin32Result = ::kj::_::Debug::win32Call(call)) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-             _kjWin32Result, #call, "" #__VA_ARGS__, __VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, \
+        _kjWin32Result, #call, "" #__VA_ARGS__, __VA_ARGS__)
 
 #define KJ_WINSOCK(call, ...) \
   if (auto _kjWin32Result = ::kj::_::Debug::winsockCall(call)) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-             _kjWin32Result, #call, "" #__VA_ARGS__, __VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, \
+        _kjWin32Result, #call, "" #__VA_ARGS__, __VA_ARGS__)
 
 #define KJ_FAIL_WIN32(code, errorNumber, ...) \
-  for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-           ::kj::_::Debug::Win32Result(errorNumber), code, "" #__VA_ARGS__, __VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(__FILE__, __LINE__, \
+      ::kj::_::Debug::Win32Result(errorNumber), code, "" #__VA_ARGS__, __VA_ARGS__)
 
 #endif  // _WIN32 || __CYGWIN__
 
 #define KJ_UNIMPLEMENTED(...) \
-  for (::kj::_::Debug::Fault f(__FILE__, __LINE__, ::kj::Exception::Type::UNIMPLEMENTED, \
-                               nullptr, "" #__VA_ARGS__, __VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::UNIMPLEMENTED, \
+      nullptr, "" #__VA_ARGS__, __VA_ARGS__)
+
+#define KJ_DTOR_REQUIRE(cond, ...) \
+  if (auto _kjCondition = ::kj::_::MAGIC_ASSERT << cond) {} else \
+    ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+        #cond, "_kjCondition," #__VA_ARGS__, _kjCondition, __VA_ARGS__)
+
+#define KJ_DTOR_FAIL_REQUIRE(...) \
+  ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+      nullptr, "" #__VA_ARGS__, __VA_ARGS__)
+
+#define KJ_DTOR_SYSCALL(call, ...) \
+  if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);}, false)) {} else \
+    ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, \
+        _kjSyscallResult.getErrorNumber(), #call, "" #__VA_ARGS__, __VA_ARGS__)
+
+#define KJ_DTOR_FAIL_SYSCALL(code, errorNumber, ...) \
+  ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, errorNumber, code, \
+      "" #__VA_ARGS__, __VA_ARGS__)
+
+#if _WIN32 || __CYGWIN__
+
+#define KJ_DTOR_WIN32(call, ...) \
+  if (auto _kjWin32Result = ::kj::_::Debug::win32Call(call)) {} else \
+    ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, \
+        _kjWin32Result, #call, "" #__VA_ARGS__, __VA_ARGS__)
+
+#define KJ_DTOR_WINSOCK(call, ...) \
+  if (auto _kjWin32Result = ::kj::_::Debug::winsockCall(call)) {} else \
+    ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, \
+        _kjWin32Result, #call, "" #__VA_ARGS__, __VA_ARGS__)
+
+#define KJ_DTOR_FAIL_WIN32(code, errorNumber, ...) \
+  ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, \
+      ::kj::_::Debug::Win32Result(errorNumber), code, "" #__VA_ARGS__, __VA_ARGS__)
+
+#endif  // _WIN32 || __CYGWIN__
 
 // TODO(msvc):  MSVC mis-deduces `ContextImpl<decltype(func)>` as `ContextImpl<int>` in some edge
 // cases, such as inside nested lambdas inside member functions. Wrapping the type in
@@ -240,8 +283,8 @@ namespace kj {
   (*[&] { \
     auto _kj_result = ::kj::_::readMaybe(value); \
     if (KJ_UNLIKELY(!_kj_result)) { \
-      ::kj::_::Debug::Fault(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
-                            #value " != nullptr", "" #__VA_ARGS__, __VA_ARGS__).fatal(); \
+      ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+          #value " != nullptr", "" #__VA_ARGS__, __VA_ARGS__); \
     } \
     return _kj_result; \
   }())
@@ -250,8 +293,8 @@ namespace kj {
   (*[&] { \
     auto _kj_result = ::kj::_::readMaybe(value); \
     if (KJ_UNLIKELY(!_kj_result)) { \
-      ::kj::_::Debug::Fault(location.fileName, location.lineNumber, ::kj::Exception::Type::FAILED, \
-                            #value " != nullptr", "" #__VA_ARGS__, __VA_ARGS__).fatal(); \
+      ::kj::_::Debug::fail(location.fileName, location.lineNumber, ::kj::Exception::Type::FAILED, \
+          #value " != nullptr", "" #__VA_ARGS__, __VA_ARGS__); \
     } \
     return _kj_result; \
   }())
@@ -263,84 +306,121 @@ namespace kj {
 #else  // KJ_MSVC_TRADITIONAL_CPP
 
 #define KJ_LOG(severity, ...) \
-  for (bool _kj_shouldLog = ::kj::_::Debug::shouldLog(::kj::LogSeverity::severity); \
-       _kj_shouldLog; _kj_shouldLog = false) \
+  if (!::kj::_::Debug::shouldLog(::kj::LogSeverity::severity)) {} else \
     ::kj::_::Debug::log(__FILE__, __LINE__, ::kj::LogSeverity::severity, \
                         #__VA_ARGS__, ##__VA_ARGS__)
 
 #define KJ_LOG_AT(severity, location, ...) \
-  for (bool _kj_shouldLog = ::kj::_::Debug::shouldLog(::kj::LogSeverity::severity); \
-       _kj_shouldLog; _kj_shouldLog = false) \
+  if (!::kj::_::Debug::shouldLog(::kj::LogSeverity::severity)) {} else \
     ::kj::_::Debug::log(location.fileName, location.lineNumber, ::kj::LogSeverity::severity, \
                         #__VA_ARGS__, ##__VA_ARGS__)
 
-#define KJ_DBG(...) KJ_LOG(DBG, ##__VA_ARGS__)
+#define KJ_DBG(...) KJ_LOG(DBG __VA_OPT__(,) __VA_ARGS__)
 
 #define KJ_REQUIRE(cond, ...) \
   if (auto _kjCondition = ::kj::_::MAGIC_ASSERT << cond) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
-        #cond, "_kjCondition," #__VA_ARGS__, _kjCondition, ##__VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+        #cond, "_kjCondition," #__VA_ARGS__, _kjCondition, ##__VA_ARGS__)
 
 #define KJ_REQUIRE_AT(cond, location, ...) \
   if (auto _kjCondition = ::kj::_::MAGIC_ASSERT << cond) {} else \
-    for (::kj::_::Debug::Fault f(location.fileName, location.lineNumber, \
+    ::kj::_::Debug::fail(location.fileName, location.lineNumber, \
         ::kj::Exception::Type::FAILED, #cond, "_kjCondition," #__VA_ARGS__, _kjCondition, \
-        ##__VA_ARGS__);; f.fatal())
+        ##__VA_ARGS__)
 
 #define KJ_FAIL_REQUIRE(...) \
-  for (::kj::_::Debug::Fault f(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
-                               nullptr, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+      nullptr, #__VA_ARGS__ __VA_OPT__(,) __VA_ARGS__)
 
 #define KJ_FAIL_REQUIRE_AT(location, ...) \
-  for (::kj::_::Debug::Fault f(location.fileName, location.lineNumber, \
-                               ::kj::Exception::Type::FAILED, nullptr, #__VA_ARGS__, \
-                               ##__VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(location.fileName, location.lineNumber, \
+      ::kj::Exception::Type::FAILED, nullptr, #__VA_ARGS__, \
+      ##__VA_ARGS__)
 
 #define KJ_SYSCALL(call, ...) \
   if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);}, false)) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-             _kjSyscallResult.getErrorNumber(), #call, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, \
+        _kjSyscallResult.getErrorNumber(), #call, #__VA_ARGS__, ##__VA_ARGS__)
 
 #define KJ_NONBLOCKING_SYSCALL(call, ...) \
   if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);}, true)) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-             _kjSyscallResult.getErrorNumber(), #call, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, \
+        _kjSyscallResult.getErrorNumber(), #call, #__VA_ARGS__, ##__VA_ARGS__)
 
 #define KJ_FAIL_SYSCALL(code, errorNumber, ...) \
-  for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-           errorNumber, code, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(__FILE__, __LINE__, \
+      errorNumber, code, #__VA_ARGS__, ##__VA_ARGS__)
 
 #if _WIN32 || __CYGWIN__
 
 #define KJ_WIN32(call, ...) \
   if (auto _kjWin32Result = ::kj::_::Debug::win32Call(call)) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-             _kjWin32Result, #call, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, \
+        _kjWin32Result, #call, #__VA_ARGS__, ##__VA_ARGS__)
 // Invoke a Win32 syscall that returns either BOOL or HANDLE, and throw an exception if it fails.
 
 #define KJ_WINSOCK(call, ...) \
   if (auto _kjWin32Result = ::kj::_::Debug::winsockCall(call)) {} else \
-    for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-             _kjWin32Result, #call, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+    ::kj::_::Debug::fail(__FILE__, __LINE__, \
+        _kjWin32Result, #call, #__VA_ARGS__, ##__VA_ARGS__)
 // Like KJ_WIN32 but for winsock calls which return `int` with SOCKET_ERROR indicating failure.
 //
 // Unfortunately, it's impossible to distinguish these from BOOL-returning Win32 calls by type,
 // since BOOL is in fact an alias for `int`. :(
 
 #define KJ_FAIL_WIN32(code, errorNumber, ...) \
-  for (::kj::_::Debug::Fault f(__FILE__, __LINE__, \
-           ::kj::_::Debug::Win32Result(errorNumber), code, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(__FILE__, __LINE__, \
+      ::kj::_::Debug::Win32Result(errorNumber), code, #__VA_ARGS__, ##__VA_ARGS__)
 
 #endif
 
 #define KJ_UNIMPLEMENTED(...) \
-  for (::kj::_::Debug::Fault f(__FILE__, __LINE__, ::kj::Exception::Type::UNIMPLEMENTED, \
-                               nullptr, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+  KJ_FAIL_NORETURN_ ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::UNIMPLEMENTED, \
+      nullptr, #__VA_ARGS__ __VA_OPT__(,) __VA_ARGS__)
+
+#define KJ_DTOR_REQUIRE(cond, ...) \
+  if (auto _kjCondition = ::kj::_::MAGIC_ASSERT << cond) {} else \
+    ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+        #cond, "_kjCondition," #__VA_ARGS__, _kjCondition, ##__VA_ARGS__)
+// Like KJ_REQUIRE, but for destructors: if the check fails while another exception is unwinding
+// the stack, the failure is logged and execution continues with the next statement, instead of
+// throwing (which would terminate the process). See `kj::throwExceptionUnlessUnwinding()`.
+
+#define KJ_DTOR_FAIL_REQUIRE(...) \
+  ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+      nullptr, #__VA_ARGS__ __VA_OPT__(,) __VA_ARGS__)
+
+#define KJ_DTOR_SYSCALL(call, ...) \
+  if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);}, false)) {} else \
+    ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, \
+        _kjSyscallResult.getErrorNumber(), #call, #__VA_ARGS__, ##__VA_ARGS__)
+
+#define KJ_DTOR_FAIL_SYSCALL(code, errorNumber, ...) \
+  ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, errorNumber, code, \
+      #__VA_ARGS__, ##__VA_ARGS__)
+
+#if _WIN32 || __CYGWIN__
+
+#define KJ_DTOR_WIN32(call, ...) \
+  if (auto _kjWin32Result = ::kj::_::Debug::win32Call(call)) {} else \
+    ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, \
+        _kjWin32Result, #call, #__VA_ARGS__, ##__VA_ARGS__)
+
+#define KJ_DTOR_WINSOCK(call, ...) \
+  if (auto _kjWin32Result = ::kj::_::Debug::winsockCall(call)) {} else \
+    ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, \
+        _kjWin32Result, #call, #__VA_ARGS__, ##__VA_ARGS__)
+
+#define KJ_DTOR_FAIL_WIN32(code, errorNumber, ...) \
+  ::kj::_::Debug::failUnlessUnwinding(__FILE__, __LINE__, \
+      ::kj::_::Debug::Win32Result(errorNumber), code, #__VA_ARGS__, ##__VA_ARGS__)
+
+#endif  // _WIN32 || __CYGWIN__
 
 #define KJ_CONTEXT(...) \
   auto KJ_UNIQUE_NAME(_kjContextFunc) = [&]() -> ::kj::_::Debug::Context::Value { \
         return ::kj::_::Debug::Context::Value(__FILE__, __LINE__, \
-            ::kj::_::Debug::makeDescription(#__VA_ARGS__, ##__VA_ARGS__)); \
+            ::kj::_::Debug::makeDescription(#__VA_ARGS__ __VA_OPT__(,) __VA_ARGS__)); \
       }; \
   ::kj::_::Debug::ContextImpl<decltype(KJ_UNIQUE_NAME(_kjContextFunc))> \
       KJ_UNIQUE_NAME(_kjContext)(KJ_UNIQUE_NAME(_kjContextFunc))
@@ -351,8 +431,8 @@ namespace kj {
   (*([&] { \
     auto _kj_result = ::kj::_::readMaybe(value); \
     if (KJ_UNLIKELY(!_kj_result)) { \
-      ::kj::_::Debug::Fault(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
-                            #value " != nullptr", #__VA_ARGS__, ##__VA_ARGS__).fatal(); \
+      ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+          #value " != nullptr", #__VA_ARGS__, ##__VA_ARGS__); \
     } \
     return _kj_result; \
   }()))
@@ -361,9 +441,9 @@ namespace kj {
   (*([&] { \
     auto _kj_result = ::kj::_::readMaybe(value); \
     if (KJ_UNLIKELY(!_kj_result)) { \
-      ::kj::_::Debug::Fault(location.fileName, location.lineNumber, \
-                            ::kj::Exception::Type::FAILED, #value " != nullptr", #__VA_ARGS__, \
-                            ##__VA_ARGS__).fatal(); \
+      ::kj::_::Debug::fail(location.fileName, location.lineNumber, \
+          ::kj::Exception::Type::FAILED, #value " != nullptr", #__VA_ARGS__, \
+          ##__VA_ARGS__); \
     } \
     return _kj_result; \
   }()))
@@ -374,8 +454,8 @@ namespace kj {
   (*({ \
     auto _kj_result = ::kj::_::readMaybe(value); \
     if (KJ_UNLIKELY(!_kj_result)) { \
-      ::kj::_::Debug::Fault(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
-                            #value " != nullptr", #__VA_ARGS__, ##__VA_ARGS__).fatal(); \
+      ::kj::_::Debug::fail(__FILE__, __LINE__, ::kj::Exception::Type::FAILED, \
+          #value " != nullptr", #__VA_ARGS__, ##__VA_ARGS__); \
     } \
     kj::mv(_kj_result); \
   }))
@@ -384,9 +464,9 @@ namespace kj {
   (*({ \
     auto _kj_result = ::kj::_::readMaybe(value); \
     if (KJ_UNLIKELY(!_kj_result)) { \
-      ::kj::_::Debug::Fault(location.fileName, location.lineNumber, \
-                            ::kj::Exception::Type::FAILED, #value " != nullptr", #__VA_ARGS__, \
-                            ##__VA_ARGS__).fatal(); \
+      ::kj::_::Debug::fail(location.fileName, location.lineNumber, \
+          ::kj::Exception::Type::FAILED, #value " != nullptr", #__VA_ARGS__, \
+          ##__VA_ARGS__); \
     } \
     kj::mv(_kj_result); \
   }))
@@ -441,6 +521,8 @@ namespace kj {
 
 #endif
 
+// NOLINTEND(readability-inconsistent-ifelse-braces)
+
 #if _MSC_VER && !defined(__clang__)
 
 #define KJ_SYSCALL_FD(...) \
@@ -469,6 +551,8 @@ namespace kj {
 #define KJ_ASSERT_AT KJ_REQUIRE_AT
 #define KJ_FAIL_ASSERT_AT KJ_FAIL_REQUIRE_AT
 #define KJ_ASSERT_NONNULL_AT KJ_REQUIRE_NONNULL_AT
+#define KJ_DTOR_ASSERT KJ_DTOR_REQUIRE
+#define KJ_DTOR_FAIL_ASSERT KJ_DTOR_FAIL_REQUIRE
 // Use "ASSERT" in place of "REQUIRE" when the problem is local to the immediate surrounding code.
 // That is, if the assert ever fails, it indicates that the immediate surrounding code is broken.
 
@@ -482,7 +566,7 @@ namespace kj {
 #define KJ_DASSERT(...) do {} while (false)
 #define KJ_DREQUIRE(...) do {} while (false)
 #if defined(__GNUC__)
-#define KJ_ASSUME(cond, ...) do { if (cond) {} else __builtin_unreachable(); } while (false)
+#define KJ_ASSUME(cond, ...) do { if (cond) {} else { __builtin_unreachable(); } } while (false)
 #elif defined(__clang__)
 #define KJ_ASSUME(cond, ...) __builtin_assume(cond)
 #elif defined(_MSC_VER)
@@ -521,36 +605,21 @@ public:
   static void log(const char* file, int line, LogSeverity severity, const char* macroArgs,
                   Params&&... params);
 
-  class Fault {
-  public:
-    template <typename Code, typename... Params>
-    Fault(const char* file, int line, Code code,
-          const char* condition, const char* macroArgs, Params&&... params);
-    Fault(const char* file, int line, Exception::Type type,
-          const char* condition, const char* macroArgs);
-    Fault(const char* file, int line, int osErrorNumber,
-          const char* condition, const char* macroArgs);
-#if _WIN32 || __CYGWIN__
-    Fault(const char* file, int line, Win32Result osErrorNumber,
-          const char* condition, const char* macroArgs);
-#endif
-    ~Fault() noexcept(false);
+  template <typename Code, typename... Params>
+  static KJ_NOINLINE KJ_NORETURN(void fail(const char* file, int line, Code code,
+      const char* condition, const char* macroArgs, Params&&... params));
+  // Throws an exception describing a failed check. Used by the check macros. Kept out of line so
+  // that the call site is just a branch and a call.
 
-    KJ_NOINLINE KJ_NORETURN(void fatal());
-    // Throw the exception.
-
-  private:
-    void init(const char* file, int line, Exception::Type type,
-              const char* condition, const char* macroArgs, ArrayPtr<String> argValues);
-    void init(const char* file, int line, int osErrorNumber,
-              const char* condition, const char* macroArgs, ArrayPtr<String> argValues);
-#if _WIN32 || __CYGWIN__
-    void init(const char* file, int line, Win32Result osErrorNumber,
-              const char* condition, const char* macroArgs, ArrayPtr<String> argValues);
-#endif
-
-    Exception* exception;
-  };
+  template <typename Code, typename... Params>
+  static KJ_NOINLINE KJ_NOT_TAIL_CALLED void failUnlessUnwinding(const char* file, int line,
+      Code code, const char* condition, const char* macroArgs, Params&&... params);
+  // Throws an exception describing a failed check, unless another exception is unwinding the
+  // stack, in which case it logs the failure and returns; see
+  // `kj::throwExceptionUnlessUnwinding()`. Used by the `KJ_DTOR_*` macros. The unwinding check
+  // only happens here, on the failure path, so the call site is a branch and a call, with no
+  // try/catch. Not tail-called, so that the trace (which skips this frame) still starts with the
+  // function containing the check.
 
   class SyscallResult {
   public:
@@ -591,8 +660,7 @@ public:
 
     virtual Value evaluate() = 0;
 
-    virtual void onRecoverableException(Exception&& exception) override;
-    virtual void onFatalException(Exception&& exception) override;
+    virtual void onException(Exception&& exception) override;
     virtual void logMessage(LogSeverity severity, const char* file, int line, int contextDepth,
                             String&& text) override;
 
@@ -602,8 +670,8 @@ public:
     // Set true if an attempt to evaluate() the context threw an exception. Once this happens we
     // permanently drop the context. This prevents re-evaluation, which could throw again, leading
     // to infinite recursion: evaluate() throwing an exception re-enters the exception callback
-    // chain, which includes this very Context, so onFatalException()/onRecoverableException() would
-    // be invoked recursively.
+    // chain, which includes this very Context, so onException() would be invoked
+    // recursively.
     bool evaluating = false;
     // Set true while evaluate() is running, so that we can detect the re-entrant case described
     // above and bail out.
@@ -639,6 +707,16 @@ private:
 
   static int getOsErrorNumber(bool nonblocking);
   // Get the error code of the last error (e.g. from errno).  Returns -1 on EINTR.
+
+  static Exception makeFailure(const char* file, int line, Exception::Type type,
+      const char* condition, const char* macroArgs, ArrayPtr<String> argValues);
+  static Exception makeFailure(const char* file, int line, int osErrorNumber,
+      const char* condition, const char* macroArgs, ArrayPtr<String> argValues);
+#if _WIN32 || __CYGWIN__
+  static Exception makeFailure(const char* file, int line, Win32Result osErrorNumber,
+      const char* condition, const char* macroArgs, ArrayPtr<String> argValues);
+#endif
+  // Builds the exception describing a failed check.
 };
 
 template <typename... Params>
@@ -654,33 +732,34 @@ inline void Debug::log<>(const char* file, int line, LogSeverity severity, const
 }
 
 template <typename Code, typename... Params>
-Debug::Fault::Fault(const char* file, int line, Code code,
-                    const char* condition, const char* macroArgs, Params&&... params)
-    : exception(nullptr) {
-  String argValues[sizeof...(Params)] = {str(params)...};
-  init(file, line, code, condition, macroArgs,
-       arrayPtr(argValues, sizeof...(Params)));
+void Debug::fail(const char* file, int line, Code code,
+                 const char* condition, const char* macroArgs, Params&&... params) {
+  // ignoreCount = 1 to skip this frame, so the trace starts at the failed check.
+  if constexpr (sizeof...(Params) == 0) {
+    throwException(makeFailure(file, line, code, condition, macroArgs, nullptr), 1);
+  } else {
+    String argValues[sizeof...(Params)] = {str(params)...};
+    throwException(makeFailure(file, line, code, condition, macroArgs,
+                               arrayPtr(argValues, sizeof...(Params))), 1);
+  }
 }
 
-inline Debug::Fault::Fault(const char* file, int line, int osErrorNumber,
-                           const char* condition, const char* macroArgs)
-    : exception(nullptr) {
-  init(file, line, osErrorNumber, condition, macroArgs, nullptr);
-}
-
-inline Debug::Fault::Fault(const char* file, int line, kj::Exception::Type type,
-                           const char* condition, const char* macroArgs)
-    : exception(nullptr) {
-  init(file, line, type, condition, macroArgs, nullptr);
+template <typename Code, typename... Params>
+void Debug::failUnlessUnwinding(const char* file, int line, Code code,
+                                const char* condition, const char* macroArgs,
+                                Params&&... params) {
+  // ignoreCount = 1 to skip this frame, so the trace starts at the failed check.
+  if constexpr (sizeof...(Params) == 0) {
+    throwExceptionUnlessUnwinding(
+        makeFailure(file, line, code, condition, macroArgs, nullptr), 1);
+  } else {
+    String argValues[sizeof...(Params)] = {str(params)...};
+    throwExceptionUnlessUnwinding(makeFailure(file, line, code, condition, macroArgs,
+                                              arrayPtr(argValues, sizeof...(Params))), 1);
+  }
 }
 
 #if _WIN32 || __CYGWIN__
-inline Debug::Fault::Fault(const char* file, int line, Win32Result osErrorNumber,
-                           const char* condition, const char* macroArgs)
-    : exception(nullptr) {
-  init(file, line, osErrorNumber, condition, macroArgs, nullptr);
-}
-
 inline Debug::Win32Result Debug::win32Call(int boolean) {
   return boolean ? Win32Result(0) : Win32Result(getWin32ErrorCode());
 }

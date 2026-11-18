@@ -82,13 +82,19 @@ KJ_TEST("HttpOverCapnpFactory::capnpToKj rejects out of range common values") {
   }
 }
 
-KJ_TEST("KJ and RPC HTTP method enums match") {
-#define EXPECT_MATCH(METHOD) \
-  KJ_EXPECT(static_cast<uint>(kj::HttpMethod::METHOD) == \
-            static_cast<uint>(capnp::HttpMethod::METHOD));
+KJ_TEST("HTTP method conversion") {
+  // Every method kj lists except CONNECT travels as the capnp enumerant of the same name.
+#define EXPECT_ROUND_TRIP(METHOD) \
+  KJ_EXPECT(httpMethodToCapnp(kj::HttpMethod::METHOD) == capnp::HttpMethod::METHOD); \
+  KJ_EXPECT(httpMethodFromCapnp(capnp::HttpMethod::METHOD) == kj::HttpMethod::METHOD);
 
-  KJ_HTTP_FOR_EACH_METHOD(EXPECT_MATCH);
-#undef EXPECT_MATCH
+  KJ_HTTP_FOR_EACH_REQUEST_METHOD(EXPECT_ROUND_TRIP);
+#undef EXPECT_ROUND_TRIP
+
+  KJ_EXPECT_THROW_MESSAGE("use connect() for CONNECT requests",
+      httpMethodToCapnp(kj::HttpMethod::CONNECT));
+  KJ_EXPECT_THROW_MESSAGE("unknown method",
+      httpMethodFromCapnp(static_cast<capnp::HttpMethod>(100)));
 }
 
 // =======================================================================================
@@ -785,6 +791,43 @@ KJ_TEST("HttpService isn't destroyed while call outstanding") {
   KJ_EXPECT(!destroyed);
 }
 
+KJ_TEST("HTTP-over-Cap'n-Proto won't send CONNECT in request()") {
+  kj::EventLoop eventLoop;
+  kj::WaitScope waitScope(eventLoop);
+
+  ByteStreamFactory streamFactory;
+  kj::HttpHeaderTable::Builder tableBuilder;
+  HttpOverCapnpFactory factory(streamFactory, tableBuilder, TEST_PEER_OPTIMIZATION_LEVEL);
+  auto headerTable = tableBuilder.build();
+
+  class NoRequestServer final: public capnp::HttpService::Server {
+  protected:
+    kj::Promise<void> request(RequestContext context) override {
+      KJ_FAIL_ASSERT("request() reached the server");
+    }
+  };
+
+  class NoResponse final: public kj::HttpService::Response {
+  public:
+    kj::Own<kj::AsyncOutputStream> send(
+        uint statusCode, kj::StringPtr statusText, const kj::HttpHeaders& headers,
+        kj::Maybe<uint64_t> expectedBodySize) override {
+      KJ_UNREACHABLE;
+    }
+
+    kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+      KJ_UNREACHABLE;
+    }
+  };
+
+  auto frontService = factory.capnpToKj(kj::heap<NoRequestServer>());
+  kj::NullStream requestBody;
+  NoResponse response;
+  KJ_EXPECT_THROW_MESSAGE("use connect() for CONNECT requests",
+      frontService->request(kj::HttpMethod::CONNECT, "example.org:443",
+          kj::HttpHeaders(*headerTable), requestBody, response).wait(waitScope));
+}
+
 
 class ConnectWriteCloseService final: public kj::HttpService {
   // A simple CONNECT server that will accept a connection, write some data and close the
@@ -1021,6 +1064,30 @@ kj::Promise<void> expectEnd(kj::AsyncInputStream& in) {
   });
 }
 
+// Fills in the tlsStarter of every CONNECT it passes on with `startTls`.
+class StartTlsHttpClient final: public kj::HttpClient {
+public:
+  StartTlsHttpClient(kj::HttpClient& inner, kj::Function<kj::Promise<void>()> startTls)
+      : inner(inner), startTls(kj::mv(startTls)) {}
+
+  kj::Promise<WebSocketResponse> openWebSocket(
+    kj::StringPtr url, const kj::HttpHeaders& headers) override { KJ_UNREACHABLE; }
+  Request request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+                kj::Maybe<uint64_t> expectedBodySize = kj::none) override { KJ_UNREACHABLE; }
+
+  ConnectRequest connect(kj::StringPtr host, const kj::HttpHeaders& headers,
+      kj::HttpConnectSettings settings) override {
+    KJ_IF_SOME(starter, settings.tlsStarter) {
+      starter = [this](kj::StringPtr) { return startTls(); };
+    }
+    return inner.connect(host, headers, settings);
+  }
+
+private:
+  kj::HttpClient& inner;
+  kj::Function<kj::Promise<void>()> startTls;
+};
+
 KJ_TEST("HTTP-over-Cap'n-Proto Connect with startTls") {
   kj::EventLoop eventLoop;
   kj::WaitScope waitScope(eventLoop);
@@ -1040,31 +1107,9 @@ KJ_TEST("HTTP-over-Cap'n-Proto Connect with startTls") {
 
   auto client = newHttpClient(*table, *pipe.ends[1]);
 
-  class WrapperHttpClient final: public kj::HttpClient {
-  public:
-    kj::HttpClient& inner;
-
-    WrapperHttpClient(kj::HttpClient& client) : inner(client) {};
-
-    kj::Promise<WebSocketResponse> openWebSocket(
-      kj::StringPtr url, const kj::HttpHeaders& headers) override { KJ_UNREACHABLE; }
-    Request request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
-                  kj::Maybe<uint64_t> expectedBodySize = kj::none) override { KJ_UNREACHABLE; }
-
-    ConnectRequest connect(kj::StringPtr host, const kj::HttpHeaders& headers,
-        kj::HttpConnectSettings settings) override {
-      KJ_IF_SOME(starter, settings.tlsStarter) {
-        starter = [](kj::StringPtr) {
-          return kj::READY_NOW;
-        };
-      }
-
-      return inner.connect(host, headers, settings);
-    }
-  };
-
   // Only need this wrapper to define a dummy tlsStarter.
-  auto wrappedClient = kj::heap<WrapperHttpClient>(*client);
+  auto wrappedClient = kj::heap<StartTlsHttpClient>(
+      *client, []() -> kj::Promise<void> { return kj::READY_NOW; });
   capnp::HttpService::Client httpService = factory.kjToCapnp(newHttpService(*wrappedClient));
   auto frontCapnpHttpService = factory.capnpToKj(httpService);
 
@@ -1096,6 +1141,48 @@ KJ_TEST("HTTP-over-Cap'n-Proto Connect with startTls") {
     });
   }).wait(waitScope);
 
+  listenTask.wait(waitScope);
+}
+
+KJ_TEST("HTTP-over-Cap'n-Proto Connect reports the outcome of startTls") {
+  kj::EventLoop eventLoop;
+  kj::WaitScope waitScope(eventLoop);
+
+  auto pipe = kj::newTwoWayPipe();
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+
+  ByteStreamFactory streamFactory;
+  kj::HttpHeaderTable::Builder tableBuilder;
+  HttpOverCapnpFactory factory(streamFactory, tableBuilder, TEST_PEER_OPTIMIZATION_LEVEL);
+  kj::Own<kj::HttpHeaderTable> table = tableBuilder.build();
+  ConnectWriteRespService service(*table);
+  kj::HttpServer server(timer, *table, service);
+  auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
+  auto client = newHttpClient(*table, *pipe.ends[1]);
+
+  // The upgrade on the far side of the capnp hop takes as long as the test says, and fails.
+  kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> upgrade;
+  auto wrappedClient = kj::heap<StartTlsHttpClient>(*client, [&upgrade]() {
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    upgrade = kj::mv(paf.fulfiller);
+    return kj::mv(paf.promise);
+  });
+  capnp::HttpService::Client httpService = factory.kjToCapnp(newHttpService(*wrappedClient));
+  auto frontCapnpHttpService = factory.capnpToKj(httpService);
+  auto frontCapnpHttpClient = kj::newHttpClient(*frontCapnpHttpService);
+
+  kj::TlsStarterCallback tlsStarter;
+  auto request = frontCapnpHttpClient->connect(
+      "https://example.org"_kj, kj::HttpHeaders(*table), {.useTls = false, .tlsStarter = tlsStarter});
+  KJ_ASSERT(request.status.wait(waitScope).statusCode == 200);
+
+  auto started = KJ_ASSERT_NONNULL(tlsStarter)("example.com");
+  KJ_EXPECT(!started.poll(waitScope));
+  KJ_ASSERT_NONNULL(upgrade)->reject(KJ_EXCEPTION(FAILED, "handshake failed"));
+  KJ_EXPECT_THROW_MESSAGE("handshake failed", started.wait(waitScope));
+
+  request.connection->shutdownWrite();
+  expectEnd(*request.connection).wait(waitScope);
   listenTask.wait(waitScope);
 }
 

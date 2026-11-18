@@ -1,0 +1,205 @@
+name: Newtype Release
+
+# Builds portable tools from the newtype-v2 branch and publishes them, with the source tarball,
+# as the rolling "newtype-latest" release, plus a scratch container image on GHCR.
+#
+# Tool archives have stable names, so the latest build can always be fetched from e.g.
+#   https://github.com/<owner>/capnproto/releases/download/newtype-latest/capnproto-tools-newtype-linux-x86_64.tar.gz
+#
+# The build scripts live in .github/newtype/ and can be run locally.
+
+on:
+  push:
+    branches:
+      - newtype-v2
+  workflow_dispatch:
+
+concurrency:
+  group: newtype-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-tools:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            arch: x86_64
+          - runner: ubuntu-26.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: set version
+        run: .github/newtype/set-version.sh
+      - name: build (static, musl)
+        # Run Alpine via docker rather than as a job container: JavaScript actions aren't supported
+        # in Alpine containers on arm64 runners, and this is how the build is run locally anyway.
+        run: |
+          docker run --rm -v "$PWD":/src -w /src alpine:3.23 .github/newtype/build-linux-static.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tools-linux-${{ matrix.arch }}
+          path: build-newtype/capnproto-tools-newtype-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  macos-tools:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: set version
+        run: .github/newtype/set-version.sh
+      - name: build (universal)
+        # Links only libSystem and the system libc++ dynamically.
+        run: |
+          .github/newtype/build-tools.sh macos-universal \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tools-macos-universal
+          path: build-newtype/capnproto-tools-newtype-macos-universal.tar.gz
+          if-no-files-found: error
+
+  windows-tools:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: set version
+        run: .github/newtype/set-version.sh
+      - name: build (MSVC, static runtime)
+        run: |
+          .github/newtype/build-tools.sh windows-x86_64 \
+            -A x64 \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tools-windows-x86_64
+          path: build-newtype/capnproto-tools-newtype-windows-x86_64.zip
+          if-no-files-found: error
+
+  tests:
+    # The test suite is run in a separate debug build because it doesn't pass in release mode on
+    # the upstream v2 branch: several kj tests expect debug-only checks (KJ_IREQUIRE etc.) to fire,
+    # and those are compiled out under NDEBUG.
+    # TODO: Test the release build itself if/when the test suite works in release mode.
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: build
+        run: |
+          cmake -S c++ -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          cmake --build build --parallel "$(nproc)"
+      - name: test
+        run: ctest --test-dir build --output-on-failure --parallel "$(nproc)"
+
+  source:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y autoconf automake libtool
+      - name: set version
+        id: version
+        run: echo "version=$(.github/newtype/set-version.sh)" >> "$GITHUB_OUTPUT"
+      - name: make dist
+        run: |
+          cd c++
+          autoreconf -i
+          ./configure
+          make -j"$(nproc)" dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source
+          path: c++/capnproto-c++-${{ steps.version.outputs.version }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: github.ref == 'refs/heads/newtype-v2'
+    needs: [linux-tools, macos-tools, windows-tools, tests, source]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: set version
+        id: version
+        run: echo "version=$(.github/newtype/set-version.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: publish newtype-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag=newtype-latest
+          title="Cap'n Proto $VERSION"
+          notes="Rolling build of the \`newtype-v2\` branch at ${GITHUB_SHA}.
+
+          The \`capnproto-tools-newtype-*\` archives contain the \`capnp\` tool, plugins and standard schemas. They can be unpacked anywhere: \`capnp config\` shows where it finds its schemas and plugins. The Linux tools are statically linked and also available as a scratch image: \`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/capnproto-newtype\`."
+
+          ls -l dist
+
+          git tag -f "$tag" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$tag"
+
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --notes "$notes" --latest
+            # Remove assets from previous builds that aren't being replaced (e.g. old source tarballs).
+            gh release view "$tag" --json assets --jq '.assets[].name' | while read -r asset; do
+              if [ ! -e "dist/$asset" ]; then
+                gh release delete-asset "$tag" "$asset" --yes
+              fi
+            done
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "$title" --notes "$notes" --latest --verify-tag
+          fi
+
+  container:
+    if: github.ref == 'refs/heads/newtype-v2'
+    needs: [linux-tools, tests]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: set version
+        id: version
+        run: echo "version=$(.github/newtype/set-version.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: tools-linux-*
+          path: dist
+          merge-multiple: true
+      - name: build and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/capnproto-newtype
+
+          mkdir -p context/amd64 context/arm64
+          tar -C context/amd64 --strip-components=1 -xzf dist/capnproto-tools-newtype-linux-x86_64.tar.gz
+          tar -C context/arm64 --strip-components=1 -xzf dist/capnproto-tools-newtype-linux-aarch64.tar.gz
+
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx create --use
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f .github/newtype/Dockerfile \
+            -t "$image:latest" \
+            -t "$image:$VERSION" \
+            --push \
+            context
+
+          docker run --rm "$image:$VERSION" config

@@ -132,7 +132,7 @@ Promise<uint64_t> unoptimizedPumpTo(
   // streams cannot starve other events.
   static constexpr size_t MAX_SYNC_ITERATIONS = 64;
 
-  byte buffer[4096];
+  byte buffer[4096]{};
   uint64_t doneSoFar = completedSoFar;
 
   for (;;) {
@@ -230,11 +230,8 @@ private:
   }
 
   void copyInto(ArrayPtr<byte> out) {
-    size_t pos = 0;
     for (auto& part: parts) {
-      size_t n = kj::min(part.size(), out.size() - pos);
-      memcpy(out.begin() + pos, part.begin(), n);
-      pos += n;
+      out.write(part.first(kj::min(part.size(), out.size())));
     }
   }
 };
@@ -271,11 +268,8 @@ namespace {
 class AsyncPipe final: public AsyncCapabilityStream, public Refcounted {
 public:
   ~AsyncPipe() noexcept(false) {
-    KJ_REQUIRE(state == kj::none || ownState.get() != nullptr,
-        "destroying AsyncPipe with operation still in-progress; probably going to segfault") {
-      // Don't std::terminate().
-      break;
-    }
+    KJ_DTOR_REQUIRE(state == kj::none || ownState.get() != nullptr,
+        "destroying AsyncPipe with operation still in-progress; probably going to segfault");
   }
 
   Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
@@ -603,7 +597,7 @@ private:
       {  // TODO(cleanup): Remove redundant braces when we update to C++17.
         KJ_SWITCH_ONEOF(capBuffer) {
           KJ_CASE_ONEOF(fds, ArrayPtr<const int>) {
-            capCount = kj::max(fds.size(), maxFds);
+            capCount = kj::min(fds.size(), maxFds);
             // Unfortunately, we have to dup() each FD, because the writer doesn't release ownership
             // by default.
             // TODO(perf): Should we add an ownership-releasing version of writeWithFds()?
@@ -661,7 +655,7 @@ private:
             }
           }
           KJ_CASE_ONEOF(streams, Array<Own<AsyncCapabilityStream>>) {
-            capCount = kj::max(streams.size(), maxStreams);
+            capCount = kj::min(streams.size(), maxStreams);
             for (auto i: kj::zeroTo(capCount)) {
               streamBuffer[i] = kj::mv(streams[i]);
             }
@@ -823,12 +817,8 @@ private:
       while (readBuffer.size() >= writeBuffer.size()) {
         // The whole current write buffer can be copied into the read buffer.
 
-        {
-          auto n = writeBuffer.size();
-          memcpy(readBuffer.begin(), writeBuffer.begin(), n);
-          totalRead += n;
-          readBuffer = readBuffer.slice(n, readBuffer.size());
-        }
+        readBuffer.write(writeBuffer);
+        totalRead += writeBuffer.size();
 
         if (morePieces.size() == 0) {
           // All done writing.
@@ -851,7 +841,7 @@ private:
       // it completely.
       {
         auto n = readBuffer.size();
-        memcpy(readBuffer.begin(), writeBuffer.begin(), n);
+        readBuffer.copyFrom(writeBuffer.first(n));
         writeBuffer = writeBuffer.slice(n, writeBuffer.size());
         totalRead += n;
       }
@@ -1215,7 +1205,7 @@ private:
       {  // TODO(cleanup): Remove redundant braces when we update to C++17.
         KJ_SWITCH_ONEOF(capBuffer) {
           KJ_CASE_ONEOF(fdBuffer, ArrayPtr<OwnFd>) {
-            size_t count = kj::max(fdBuffer.size(), fds.size());
+            size_t count = kj::min(fdBuffer.size(), fds.size());
             // Unfortunately, we have to dup() each FD, because the writer doesn't release ownership
             // by default.
             // TODO(perf): Should we add an ownership-releasing version of writeWithFds()?
@@ -1268,7 +1258,7 @@ private:
             }
           }
           KJ_CASE_ONEOF(streamBuffer, ArrayPtr<Own<AsyncCapabilityStream>>) {
-            size_t count = kj::max(streamBuffer.size(), streams.size());
+            size_t count = kj::min(streamBuffer.size(), streams.size());
             for (auto i: kj::zeroTo(count)) {
               streamBuffer[i] = kj::mv(streams[i]);
             }
@@ -1361,9 +1351,8 @@ private:
         if (data.size() < readBuffer.size()) {
           // First write segment consumes a portion of the read buffer but not all of it.
           auto n = data.size();
-          memcpy(readBuffer.begin(), data.begin(), n);
+          readBuffer.write(data);
           readSoFar.byteCount += n;
-          readBuffer = readBuffer.slice(n, readBuffer.size());
           if (moreData.size() == 0) {
             // Consumed all written pieces.
             if (readSoFar.byteCount >= minBytes) {
@@ -1382,7 +1371,7 @@ private:
           readSoFar.byteCount += n;
           fulfiller.fulfill(kj::cp(readSoFar));
           pipe.endState(*this);
-          memcpy(readBuffer.begin(), data.begin(), n);
+          readBuffer.copyFrom(data.first(n));
 
           data = data.slice(n, data.size());
           if (data.size() == 0 && moreData.size() == 0) {
@@ -1683,7 +1672,7 @@ private:
       return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
     }
     Maybe<size_t> tryReadSync(ArrayPtr<byte> buffer, size_t minBytes) override {
-      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
+      kj::throwException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
     }
     Promise<ReadResult> tryReadWithFds(void* readBuffer, size_t minBytes, size_t maxBytes,
                                        OwnFd* fdBuffer, size_t maxFds) override {
@@ -1708,10 +1697,10 @@ private:
       return KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called");
     }
     bool tryWriteSync(ArrayPtr<const byte> buffer) override {
-      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
+      kj::throwException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
     }
     bool tryWriteSync(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
-      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
+      kj::throwException(KJ_EXCEPTION(DISCONNECTED, "abortRead() has been called"));
     }
     Promise<void> writeWithFds(ArrayPtr<const byte> data,
                               ArrayPtr<const ArrayPtr<const byte>> moreData,
@@ -2112,17 +2101,14 @@ public:
     }
 
     ~Branch() noexcept(false) {
-      KJ_ASSERT(link.isLinked()) {
-        // Don't std::terminate().
+      if (!link.isLinked()) {
+        KJ_DTOR_FAIL_ASSERT("destroying tee branch which is not linked");
         return;
       }
       tee->branches.remove(*this);
 
-      KJ_REQUIRE(sink == kj::none,
-          "destroying tee branch with operation still in-progress; probably going to segfault") {
-        // Don't std::terminate().
-        break;
-      }
+      KJ_DTOR_REQUIRE(sink == kj::none,
+          "destroying tee branch with operation still in-progress; probably going to segfault");
     }
 
     Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
@@ -2160,10 +2146,7 @@ public:
   explicit AsyncTee(Own<AsyncInputStream> inner, uint64_t bufferSizeLimit)
       : inner(mv(inner)), bufferSizeLimit(bufferSizeLimit), length(this->inner->tryGetLength()) {}
   ~AsyncTee() noexcept(false) {
-    KJ_ASSERT(branches.size() == 0, "destroying AsyncTee with branch still alive") {
-      // Don't std::terminate().
-      break;
-    }
+    KJ_DTOR_ASSERT(branches.size() == 0, "destroying AsyncTee with branch still alive");
   }
 
   Promise<size_t> tryRead(Branch& branch, void* buffer, size_t minBytes, size_t maxBytes)  {
@@ -2592,10 +2575,8 @@ uint64_t AsyncTee::Buffer::consume(ArrayPtr<byte>& readBuffer, size_t& minBytes)
   while (readBuffer.size() > 0 && !bufferList.empty()) {
     auto& bytes = bufferList.front();
     auto amount = kj::min(bytes.size(), readBuffer.size());
-    memcpy(readBuffer.begin(), bytes.begin(), amount);
+    readBuffer.write(bytes.first(amount));
     totalAmount += amount;
-
-    readBuffer = readBuffer.slice(amount, readBuffer.size());
     minBytes -= kj::min(amount, minBytes);
 
     if (amount == bytes.size()) {
@@ -3030,9 +3011,7 @@ kj::Promise<Maybe<Own<AsyncCapabilityStream>>> AsyncCapabilityStream::tryReceive
     }
 
     KJ_REQUIRE(actual.capCount == 1,
-        "expected to receive a capability (e.g. file descriptor via SCM_RIGHTS), but didn't") {
-      return kj::none;
-    }
+        "expected to receive a capability (e.g. file descriptor via SCM_RIGHTS), but didn't");
 
     return kj::mv(result->stream);
   });
@@ -3069,9 +3048,7 @@ kj::Promise<kj::Maybe<OwnFd>> AsyncCapabilityStream::tryReceiveFd() {
     }
 
     KJ_REQUIRE(actual.capCount == 1,
-        "expected to receive a file descriptor (e.g. via SCM_RIGHTS), but didn't") {
-      return kj::none;
-    }
+        "expected to receive a file descriptor (e.g. via SCM_RIGHTS), but didn't");
 
     return kj::mv(result->fd);
   });
@@ -3086,31 +3063,31 @@ Promise<void> AsyncCapabilityStream::sendFd(int fd) {
 }
 
 void AsyncIoStream::getsockopt(int level, int option, void* value, uint* length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { *length = 0; break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 void AsyncIoStream::setsockopt(int level, int option, const void* value, uint length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 void AsyncIoStream::getsockname(struct sockaddr* addr, uint* length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { *length = 0; break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 void AsyncIoStream::getpeername(struct sockaddr* addr, uint* length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { *length = 0; break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 void ConnectionReceiver::getsockopt(int level, int option, void* value, uint* length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { *length = 0; break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 void ConnectionReceiver::setsockopt(int level, int option, const void* value, uint length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 void ConnectionReceiver::getsockname(struct sockaddr* addr, uint* length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { *length = 0; break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 void DatagramPort::getsockopt(int level, int option, void* value, uint* length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { *length = 0; break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 void DatagramPort::setsockopt(int level, int option, const void* value, uint length) {
-  KJ_UNIMPLEMENTED("Not a socket.") { break; }
+  KJ_UNIMPLEMENTED("Not a socket.");
 }
 Own<DatagramPort> NetworkAddress::bindDatagramPort() {
   KJ_UNIMPLEMENTED("Datagram sockets not implemented.");
