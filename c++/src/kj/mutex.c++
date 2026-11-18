@@ -161,7 +161,7 @@ struct timespec toAbsoluteTimespec(TimePoint time) {
 Mutex::Mutex(): futex(0) {}
 Mutex::~Mutex() {
   // This will crash anyway, might as well crash with a nice error message.
-  KJ_ASSERT(futex == 0, "Mutex destroyed while locked.") { break; }
+  KJ_DTOR_ASSERT(futex == 0, "Mutex destroyed while locked.");
 }
 
 bool Mutex::lock(Exclusivity exclusivity, Maybe<Duration> timeout, LockSourceLocationArg location) {
@@ -481,11 +481,7 @@ void Mutex::wait(Predicate& predicate, Maybe<Duration> timeout, LockSourceLocati
 
         KJ_IF_SOME(exception, waiter.exception) {
           // The predicate threw an exception, apparently. Propagate it.
-          // TODO(someday): Could we somehow have this be a recoverable exception? Presumably we'd
-          //   then want MutexGuarded::when() to skip calling the callback, but then what should it
-          //   return, since it normally returns the callback's result? Or maybe people who disable
-          //   exceptions just really should not write predicates that can throw.
-          kj::throwFatalException(kj::mv(*exception));
+          kj::throwException(kj::mv(*exception));
         }
 
         return;
@@ -714,11 +710,7 @@ void Mutex::wait(Predicate& predicate, Maybe<Duration> timeout, NoopSourceLocati
 
     KJ_IF_SOME(exception, waiter.exception) {
       // The predicate threw an exception, apparently. Propagate it.
-      // TODO(someday): Could we somehow have this be a recoverable exception? Presumably we'd
-      //   then want MutexGuarded::when() to skip calling the callback, but then what should it
-      //   return, since it normally returns the callback's result? Or maybe people who disable
-      //   exceptions just really should not write predicates that can throw.
-      kj::throwFatalException(kj::mv(*exception));
+      kj::throwException(kj::mv(*exception));
     }
 
     // Recompute sleep time.
@@ -984,11 +976,7 @@ void Mutex::wait(Predicate& predicate, Maybe<Duration> timeout, NoopSourceLocati
 
     KJ_IF_SOME(exception, waiter.exception) {
       // The predicate threw an exception, apparently. Propagate it.
-      // TODO(someday): Could we somehow have this be a recoverable exception? Presumably we'd
-      //   then want MutexGuarded::when() to skip calling the callback, but then what should it
-      //   return, since it normally returns the callback's result? Or maybe people who disable
-      //   exceptions just really should not write predicates that can throw.
-      kj::throwFatalException(kj::mv(*exception));
+      kj::throwException(kj::mv(*exception));
     }
 
     if (timedOut) {

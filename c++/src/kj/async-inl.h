@@ -99,7 +99,7 @@ inline T convertToReturn(ExceptionOr<T>&& result) {
     }
     return _::returnMaybeVoid(kj::mv(value));
   } else KJ_IF_SOME(exception, result.exception) {
-    throwFatalException(kj::mv(exception));
+    throwException(kj::mv(exception));
   } else {
     // Result contained neither a value nor an exception?
     KJ_UNREACHABLE;
@@ -263,7 +263,9 @@ protected:
     // automatically arm the event.
 
     inline void traceEvent(TraceBuilder& builder) {
-      if (event != nullptr && !builder.full()) event->traceEvent(builder);
+      // Once armed, `event` holds a sentinel rather than an Event. A coroutine arms at co_return,
+      // before destroying its locals, so a destructor can trace it in that state.
+      if (event != nullptr && !armed() && !builder.full()) event->traceEvent(builder);
     }
 
     bool armed() const;
@@ -534,6 +536,9 @@ class PtmfHelper {
     }
   }
 
+  void* applyNonVirtual() { return ptr; }
+  // Like apply(), for a pointer to a member function known not to be virtual.
+
 #define BODY \
     PtmfHelper result; \
     static_assert(sizeof(p) == sizeof(result), "unknown ptmf layout"); \
@@ -543,6 +548,7 @@ class PtmfHelper {
 #else  // __GNUG__
 
   void* apply(const void* obj) { return nullptr; }
+  void* applyNonVirtual() { return nullptr; }
   // TODO(port):  PTMF instruction address extraction
 
 #define BODY return PtmfHelper{}
@@ -596,8 +602,14 @@ struct GetFunctorStartAddress {
   template <typename Func>
   static void* apply(Func&& func) {
     typedef decltype(func(instance<ParamTypes>()...)) ReturnType;
-    return PtmfHelper::from<ReturnType, Decay<Func>, ParamTypes...>(
-        &Decay<Func>::operator()).apply(&func);
+    auto ptmf =
+        PtmfHelper::from<ReturnType, Decay<Func>, ParamTypes...>(&Decay<Func>::operator());
+    if constexpr (__is_polymorphic(Decay<Func>)) {
+      return ptmf.apply(&func);
+    } else {
+      // A non-polymorphic functor, such as a lambda, has no vtable to look operator() up in.
+      return ptmf.applyNonVirtual();
+    }
   }
 };
 
@@ -1431,8 +1443,13 @@ bool Promise<T>::poll(WaitScope& waitScope, SourceLocation location) {
 
 template <typename T>
 ForkedPromise<T> Promise<T>::fork(SourceLocation location) {
+  // Place the hub in the inner chain's arena when there is room, rather than starting a new
+  // arena for it. Nothing is ever appended after the hub (each branch starts its own arena), so a
+  // dedicated arena would be almost entirely unused. This satisfies appendPromise()'s requirement:
+  // the hub never gives away `inner`, and destroys it in fire() or in its own destructor.
   return ForkedPromise<T>(false,
-      _::PromiseDisposer::alloc<_::ForkHub<_::FixVoid<T>>, _::ForkHubBase>(kj::mv(node), location));
+      _::PromiseDisposer::appendPromise<_::ForkHub<_::FixVoid<T>>, _::ForkHubBase>(
+          kj::mv(node), location));
 }
 
 template <typename T>
@@ -1447,7 +1464,8 @@ bool ForkedPromise<T>::hasBranches() {
 
 template <typename T>
 _::SplitTuplePromise<T> Promise<T>::split(SourceLocation location) {
-  return _::PromiseDisposer::alloc<_::ForkHub<_::FixVoid<T>>, _::ForkHubBase>(
+  // See fork() for why the hub shares the inner chain's arena.
+  return _::PromiseDisposer::appendPromise<_::ForkHub<_::FixVoid<T>>, _::ForkHubBase>(
       kj::mv(node), location)->split(location);
 }
 
@@ -1842,12 +1860,11 @@ private:
   // yet. Do NOT call under lock.
 
   void setDoneState();
-  // Assigns `state` to `DONE`, being careful to use an atomic-release-store if needed. This must
-  // only be called in the destination thread, and must either be called under lock, or the thread
-  // must take the lock and release it again shortly after setting the state (because some threads
-  // may be waiting on the DONE state using a conditional wait on the mutex). After calling
-  // setDoneState(), the destination thread MUST NOT touch this object ever again; it now belongs
-  // solely to the requesting thread.
+  // Assigns `state` to `DONE` with an atomic release store. Called by the destination thread, or
+  // by the requesting thread when canceling an event that is still QUEUED. The caller must either
+  // hold the executor mutex, or take and release it shortly afterward, so threads waiting for DONE
+  // using a conditional wait on the mutex are notified. After calling setDoneState(), the
+  // destination thread MUST NOT touch this object again; only the requesting thread may use it.
 
   void setDisconnected();
   // Sets the result to a DISCONNECTED exception indicating that the target event loop exited.

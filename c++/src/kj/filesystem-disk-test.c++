@@ -155,9 +155,9 @@ private:
     if (handle == INVALID_HANDLE_VALUE) {
       auto error = GetLastError();
       if (error == ERROR_FILE_NOT_FOUND) return;
-      KJ_FAIL_WIN32("FindFirstFile", error, path) { return; }
+      KJ_FAIL_WIN32("FindFirstFile", error, path);
     }
-    KJ_DEFER(KJ_WIN32(FindClose(handle)) { break; });
+    KJ_DEFER(KJ_DTOR_WIN32(FindClose(handle)));
 
     do {
       // Ignore "." and "..", ugh.
@@ -182,7 +182,7 @@ private:
 
     auto error = GetLastError();
     if (error != ERROR_NO_MORE_FILES) {
-      KJ_FAIL_WIN32("FindNextFile", error, path) { return; }
+      KJ_FAIL_WIN32("FindNextFile", error, path);
     }
 
     uint retryCount = 0;
@@ -195,7 +195,7 @@ private:
         }
         KJ_FALLTHROUGH;
       default:
-        KJ_FAIL_WIN32("RemoveDirectory", error) { break; }
+        KJ_FAIL_WIN32("RemoveDirectory", error);
     }
   }
 };
@@ -373,6 +373,59 @@ KJ_TEST("DiskFile") {
   KJ_EXPECT(file->readAllText() == StringPtr("qux\0\0\0", 6));
 }
 
+KJ_TEST("DiskFile zero() spanning more than IOV_MAX 4k chunks") {
+  // Without hole punching, zero() writes 4k chunks with pwritev(), at most IOV_MAX per call.
+  // Zero a range that needs several such calls and does not end on a 4k boundary.
+  auto file = newTempFile();
+  auto data = heapArray<byte>(9 << 20);
+  data.asPtr().fill('x');
+  file->write(0, data);
+
+  uint64_t offset = 100;
+  uint64_t size = (8 << 20) + 5;
+  file->zero(offset, size);
+
+  auto result = file->readAllBytes();
+  KJ_ASSERT(result.size() == data.size());
+  for (auto i: kj::indices(result)) {
+    byte expected = i >= offset && i < offset + size ? 0 : 'x';
+    KJ_ASSERT(result[i] == expected, i);
+  }
+
+  file->zero(offset, 0);
+  KJ_EXPECT(file->readAllBytes() == result);
+}
+
+KJ_TEST("DiskFile gather-write") {
+  auto file = newTempFile();
+  file->writeAll("0123456789");
+
+  // Overwrites and extends from a nonzero offset, skipping empty pieces.
+  file->write(7, kj::arr<ArrayPtr<const byte>>(""_kjb, "foo"_kjb, ""_kjb, "barbaz"_kjb, ""_kjb));
+  KJ_EXPECT(file->readAllText() == "0123456foobarbaz");
+
+  // Writing nothing leaves the file alone, even past its end.
+  file->write(20, kj::arr<ArrayPtr<const byte>>(""_kjb, ""_kjb));
+  KJ_EXPECT(file->readAllText() == "0123456foobarbaz");
+
+  // More pieces than a single pwritev() accepts (IOV_MAX is 1024 on Linux), with empty pieces at
+  // various positions, including batch boundaries.
+  auto source = kj::heapArray<byte>(3000);
+  for (auto i: kj::indices(source)) source[i] = 'a' + i % 26;
+  auto pieces = kj::heapArray<ArrayPtr<const byte>>(4000);
+  size_t pos = 0;
+  for (auto i: kj::indices(pieces)) {
+    size_t size = i % 4 == 0 ? 0 : 1;
+    pieces[i] = source.slice(pos, pos + size);
+    pos += size;
+  }
+  KJ_ASSERT(pos == source.size());
+  file->write(3, pieces);
+  auto bytes = file->readAllBytes();
+  KJ_EXPECT(bytes.first(3) == "012"_kjb);
+  KJ_EXPECT(bytes.slice(3) == source);
+}
+
 KJ_TEST("DiskFile::copy()") {
   auto source = newTempFile();
   source->writeAll("foobarbaz");
@@ -438,7 +491,7 @@ KJ_TEST("DiskDirectory") {
 
   KJ_EXPECT(dir->tryOpenFile(Path({"foo", "bar"}), WriteMode::MODIFY) == kj::none);
   KJ_EXPECT(dir->tryOpenFile(Path({"bar", "baz"}), WriteMode::MODIFY) == kj::none);
-  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
+  KJ_EXPECT_THROW_MESSAGE("parent is not a directory",
       dir->tryOpenFile(Path({"bar", "baz"}), WriteMode::CREATE));
 
   {
@@ -565,9 +618,9 @@ KJ_TEST("DiskDirectory symlinks") {
   KJ_EXPECT(dir->tryOpenFile(Path("foo")) == kj::none);
   KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::CREATE) == kj::none);
   KJ_EXPECT(dir->tryOpenFile(Path("foo"), WriteMode::MODIFY) == kj::none);
-  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
+  KJ_EXPECT_THROW_MESSAGE("parent is not a directory",
       dir->tryOpenFile(Path("foo"), WriteMode::CREATE | WriteMode::MODIFY));
-  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("parent is not a directory",
+  KJ_EXPECT_THROW_MESSAGE("parent is not a directory",
       dir->tryOpenFile(Path("foo"),
           WriteMode::CREATE | WriteMode::MODIFY | WriteMode::CREATE_PARENT));
 
@@ -872,8 +925,7 @@ KJ_TEST("DiskFile holes") {
   auto file = dir->openFile(Path("holes"), WriteMode::CREATE);
 
 #if _WIN32
-  FILE_SET_SPARSE_BUFFER sparseInfo;
-  memset(&sparseInfo, 0, sizeof(sparseInfo));
+  FILE_SET_SPARSE_BUFFER sparseInfo{};
   sparseInfo.SetSparse = TRUE;
   DWORD dummy;
   KJ_WIN32(DeviceIoControl(

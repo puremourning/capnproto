@@ -140,7 +140,7 @@ TEST(Async, Exception) {
   WaitScope waitScope(loop);
 
   Promise<int> promise = evalLater(
-      [&]() -> int { KJ_FAIL_ASSERT("foo") { return 123; } });
+      [&]() -> int { KJ_FAIL_ASSERT("foo"); });
   KJ_EXPECT_THROW_MESSAGE("foo", promise.wait(waitScope));
 }
 
@@ -149,7 +149,7 @@ TEST(Async, HandleException) {
   WaitScope waitScope(loop);
 
   Promise<int> promise = evalLater(
-      [&]() -> int { KJ_FAIL_ASSERT("foo") { return 123; } });
+      [&]() -> int { KJ_FAIL_ASSERT("foo"); });
   int line = __LINE__ - 1;
 
   promise = promise.then(
@@ -164,7 +164,7 @@ TEST(Async, PropagateException) {
   WaitScope waitScope(loop);
 
   Promise<int> promise = evalLater(
-      [&]() -> int { KJ_FAIL_ASSERT("foo") { return 123; } });
+      [&]() -> int { KJ_FAIL_ASSERT("foo"); });
   int line = __LINE__ - 1;
 
   promise = promise.then([](int i) { return i + 1; });
@@ -181,7 +181,7 @@ TEST(Async, PropagateExceptionTypeChange) {
   WaitScope waitScope(loop);
 
   Promise<int> promise = evalLater(
-      [&]() -> int { KJ_FAIL_ASSERT("foo") { return 123; } });
+      [&]() -> int { KJ_FAIL_ASSERT("foo"); });
   int line = __LINE__ - 1;
 
   Promise<StringPtr> promise2 = promise.then([](int i) -> StringPtr { return "foo"; });
@@ -416,7 +416,7 @@ TEST(Async, SeparateFulfillerDiscarded) {
   auto pair = newPromiseAndFulfiller<void>();
   pair.fulfiller = nullptr;
 
-  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+  KJ_EXPECT_THROW_MESSAGE(
       "PromiseFulfiller was destroyed without fulfilling the promise",
       pair.promise.wait(waitScope));
 }
@@ -428,10 +428,10 @@ TEST(Async, SeparateFulfillerDiscardedDuringUnwind) {
   auto pair = newPromiseAndFulfiller<int>();
   kj::runCatchingExceptions([&]() {
     auto fulfillerToDrop = kj::mv(pair.fulfiller);
-    kj::throwFatalException(KJ_EXCEPTION(FAILED, "test exception"));
+    kj::throwException(KJ_EXCEPTION(FAILED, "test exception"));
   });
 
-  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+  KJ_EXPECT_THROW_MESSAGE(
       "test exception", pair.promise.wait(waitScope));
 }
 
@@ -781,7 +781,7 @@ TEST(Async, RaceSuccessful) {
 
     auto left = evalLater([&]() { return 123; });
     auto right = evalLater([&]() -> Promise<int>{
-      kj::throwFatalException(KJ_EXCEPTION(FAILED, "evaluation failed"));
+      kj::throwException(KJ_EXCEPTION(FAILED, "evaluation failed"));
     });
 
     EXPECT_EQ(123, raceSuccessful(kj::arr(kj::mv(left), kj::mv(right))).wait(waitScope));
@@ -791,7 +791,7 @@ TEST(Async, RaceSuccessful) {
     WaitScope waitScope(loop);
 
     auto left = evalLater([&]() -> Promise<int>{
-      kj::throwFatalException(KJ_EXCEPTION(FAILED, "evaluation failed"));
+      kj::throwException(KJ_EXCEPTION(FAILED, "evaluation failed"));
     });
     auto right = evalLater([&]() { return 123; });
 
@@ -803,10 +803,10 @@ TEST(Async, RaceSuccessful) {
     WaitScope waitScope(loop);
 
     auto left = evalLater([&]() -> Promise<int>{
-      kj::throwFatalException(KJ_EXCEPTION(FAILED, "evaluation failed"));
+      kj::throwException(KJ_EXCEPTION(FAILED, "evaluation failed"));
     });
     auto right = evalLater([&]() -> Promise<int>{
-      kj::throwFatalException(KJ_EXCEPTION(FAILED, "evaluation failed"));
+      kj::throwException(KJ_EXCEPTION(FAILED, "evaluation failed"));
     });
 
     KJ_EXPECT_THROW(FAILED, raceSuccessful(kj::arr(kj::mv(left), kj::mv(right))).wait(waitScope));
@@ -917,7 +917,7 @@ TEST(Async, ArrayJoinException) {
 
     // The final fulfillment makes the promise ready.
     fulfillers[i++]->fulfill();
-    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("Test exception", promise.wait(waitScope));
+    KJ_EXPECT_THROW_MESSAGE("Test exception", promise.wait(waitScope));
     KJ_EXPECT(tasksCompleted == 4);
   }
 }
@@ -947,7 +947,7 @@ TEST(Async, ArrayJoinFailFastException) {
     fulfillers[i++]->reject(KJ_EXCEPTION(FAILED, "Test exception"));
 
     // The first rejection makes the promise ready.
-    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("Test exception", promise.wait(waitScope));
+    KJ_EXPECT_THROW_MESSAGE("Test exception", promise.wait(waitScope));
     KJ_EXPECT(tasksCompleted == i - 1);
   }
 }
@@ -969,7 +969,7 @@ TEST(Async, Canceler) {
 
   canceler.cancel("foobar");
 
-  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("foobar", never.wait(waitScope));
+  KJ_EXPECT_THROW_MESSAGE("foobar", never.wait(waitScope));
   now.wait(waitScope);
   KJ_EXPECT_THROW_MESSAGE("foobar", neverI.wait(waitScope));
   KJ_EXPECT(nowI.wait(waitScope) == 123u);
@@ -1007,7 +1007,7 @@ TEST(Async, TaskSet) {
   }));
   tasks.add(evalLater([&]() {
     EXPECT_EQ(1, counter++);
-    KJ_FAIL_ASSERT("example TaskSet failure") { break; }
+    KJ_FAIL_ASSERT("example TaskSet failure");
   }));
   tasks.add(evalLater([&]() {
     EXPECT_EQ(2, counter++);
@@ -1364,7 +1364,7 @@ TEST(Async, Detach) {
     auto ignore KJ_UNUSED = evalLater([&]() { ran1 = true; });
   }
   evalLater([&]() { ran2 = true; }).detach([](kj::Exception&&) { ADD_FAILURE(); });
-  evalLater([]() { KJ_FAIL_ASSERT("foo"){break;} }).detach([&](kj::Exception&& e) { ran3 = true; });
+  evalLater([]() { KJ_FAIL_ASSERT("foo"); }).detach([&](kj::Exception&& e) { ran3 = true; });
 
   EXPECT_FALSE(ran1);
   EXPECT_FALSE(ran2);
@@ -1714,7 +1714,7 @@ KJ_TEST("throw from a fiber") {
   paf.fulfiller->reject(KJ_EXCEPTION(FAILED, "test exception"));
 
   KJ_ASSERT(fiber.poll(waitScope));
-  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("test exception", fiber.wait(waitScope));
+  KJ_EXPECT_THROW_MESSAGE("test exception", fiber.wait(waitScope));
 }
 
 #if !__MINGW32__ || __MINGW64__
@@ -1726,7 +1726,6 @@ KJ_TEST("cancel a fiber") {
   EventLoop loop;
   WaitScope waitScope(loop);
 
-  // When exceptions are disabled we can't wait() on a non-void promise that throws.
   auto paf = newPromiseAndFulfiller<void>();
 
   bool exited = false;
@@ -2115,7 +2114,7 @@ KJ_TEST("retryOnDisconnect") {
       }
     });
     KJ_EXPECT(i == 0);
-    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("test disconnect; i = 2",
+    KJ_EXPECT_THROW_MESSAGE("test disconnect; i = 2",
         promise.ignoreResult().wait(waitScope));
     KJ_EXPECT(i == 2);
   }

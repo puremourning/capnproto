@@ -50,11 +50,7 @@ BufferedOutputStream::~BufferedOutputStream() noexcept(false) {}
 
 size_t InputStream::read(ArrayPtr<byte> buffer, size_t minBytes) {
   size_t n = tryRead(buffer, minBytes);
-  KJ_REQUIRE(n >= minBytes, "Premature EOF") {
-    // Pretend we read zeros from the input.
-    buffer.slice(n).first(minBytes-n).fill(0);
-    return minBytes;
-  }
+  KJ_REQUIRE(n >= minBytes, "Premature EOF");
   return n;
 }
 
@@ -255,10 +251,7 @@ size_t ArrayInputStream::tryRead(ArrayPtr<byte> dst, size_t minBytes) {
 }
 
 void ArrayInputStream::skip(size_t bytes) {
-  KJ_REQUIRE(array.size() >= bytes, "ArrayInputStream ended prematurely.") {
-    bytes = array.size();
-    break;
-  }
+  KJ_REQUIRE(array.size() >= bytes, "ArrayInputStream ended prematurely.");
   array = array.slice(bytes, array.size());
 }
 
@@ -331,10 +324,7 @@ OwnFd::~OwnFd() noexcept(false) {
   if (fd >= 0) {
     // Don't use SYSCALL() here because close() should not be repeated on EINTR.
     if (miniposix::close(fd) < 0) {
-      KJ_FAIL_SYSCALL("close", errno, fd) {
-        // This ensures we don't throw an exception if unwinding.
-        break;
-      }
+      KJ_DTOR_FAIL_SYSCALL("close", errno, fd);
     }
   }
 }
@@ -480,7 +470,7 @@ void FdOutputStream::write(ArrayPtr<const ArrayPtr<const byte>> pieces) {
 
 AutoCloseHandle::~AutoCloseHandle() noexcept(false) {
   if (handle != (void*)-1) {
-    KJ_WIN32(CloseHandle(handle));
+    KJ_DTOR_WIN32(CloseHandle(handle));
   }
 }
 

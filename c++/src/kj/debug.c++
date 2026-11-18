@@ -241,7 +241,7 @@ static String makeDescriptionImpl(DescriptionStyle style, const char* code, int 
   if (style == SYSCALL) {
     // Strip off leading "foo = " from code, since callers will sometimes write things like:
     //   ssize_t n;
-    //   RECOVERABLE_SYSCALL(n = read(fd, buffer, sizeof(buffer))) { return ""; }
+    //   KJ_SYSCALL(n = read(fd, buffer, sizeof(buffer)));
     //   return std::string(buffer, n);
     const char* equalsPos = strchr(code, '=');
     if (equalsPos != nullptr && equalsPos[1] != '=') {
@@ -369,38 +369,22 @@ void Debug::logInternal(const char* file, int line, LogSeverity severity, const 
       makeDescriptionImpl(LOG, nullptr, 0, nullptr, macroArgs, argValues));
 }
 
-Debug::Fault::~Fault() noexcept(false) {
-  if (exception != nullptr) {
-    Exception copy = mv(*exception);
-    delete exception;
-    throwRecoverableException(mv(copy), 1);
-  }
-}
-
-void Debug::Fault::fatal() {
-  Exception copy = mv(*exception);
-  delete exception;
-  exception = nullptr;
-  throwFatalException(mv(copy), 1);
-  KJ_KNOWN_UNREACHABLE(abort());
-}
-
-void Debug::Fault::init(
+Exception Debug::makeFailure(
     const char* file, int line, Exception::Type type,
     const char* condition, const char* macroArgs, ArrayPtr<String> argValues) {
-  exception = new Exception(type, file, line,
+  return Exception(type, file, line,
       makeDescriptionImpl(ASSERTION, condition, 0, nullptr, macroArgs, argValues));
 }
 
-void Debug::Fault::init(
+Exception Debug::makeFailure(
     const char* file, int line, int osErrorNumber,
     const char* condition, const char* macroArgs, ArrayPtr<String> argValues) {
-  exception = new Exception(typeOfErrno(osErrorNumber), file, line,
+  return Exception(typeOfErrno(osErrorNumber), file, line,
       makeDescriptionImpl(SYSCALL, condition, osErrorNumber, nullptr, macroArgs, argValues));
 }
 
 #if _WIN32 || __CYGWIN__
-void Debug::Fault::init(
+Exception Debug::makeFailure(
     const char* file, int line, Win32Result osErrorNumber,
     const char* condition, const char* macroArgs, ArrayPtr<String> argValues) {
   LPVOID ptr;
@@ -425,7 +409,7 @@ void Debug::Fault::init(
     message = kj::str("win32 error code: ", osErrorNumber.number);
   }
 
-  exception = new Exception(typeOfWin32Error(osErrorNumber.number), file, line,
+  return Exception(typeOfWin32Error(osErrorNumber.number), file, line,
       makeDescriptionImpl(SYSCALL, condition, 0, message.cStr(),
                           macroArgs, argValues));
 }
@@ -486,17 +470,11 @@ Maybe<Debug::Context::Value> Debug::Context::ensureInitialized() {
   }
 }
 
-void Debug::Context::onRecoverableException(Exception&& exception) {
+void Debug::Context::onException(Exception&& exception) {
   KJ_IF_SOME(v, ensureInitialized()) {
     exception.wrapContext(v.file, v.line, mv(v.description));
   }
-  next.onRecoverableException(kj::mv(exception));
-}
-void Debug::Context::onFatalException(Exception&& exception) {
-  KJ_IF_SOME(v, ensureInitialized()) {
-    exception.wrapContext(v.file, v.line, mv(v.description));
-  }
-  next.onFatalException(kj::mv(exception));
+  next.onException(kj::mv(exception));
 }
 void Debug::Context::logMessage(LogSeverity severity, const char* file, int line, int contextDepth,
                                 String&& text) {

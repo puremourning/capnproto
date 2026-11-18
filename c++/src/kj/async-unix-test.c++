@@ -105,8 +105,7 @@ bool checkForQemuEpollPwaitBug() {
   KJ_SYSCALL(pthread_sigmask(SIG_BLOCK, &mask, &origMask));
   KJ_DEFER(KJ_SYSCALL(pthread_sigmask(SIG_SETMASK, &origMask, nullptr)));
 
-  struct sigaction action;
-  memset(&action, 0, sizeof(action));
+  struct sigaction action{};
   action.sa_sigaction = &qemuBugTestSignalHandler;
   action.sa_flags = SA_SIGINFO;
 
@@ -178,7 +177,7 @@ TEST(AsyncUnixTest, SignalWithValue) {
   WaitScope waitScope(loop);
 
   union sigval value;
-  memset(&value, 0, sizeof(value));
+  kj::memzero(value);
   value.sival_int = 123;
   KJ_SYSCALL_HANDLE_ERRORS(sigqueue(getpid(), SIGURG, value)) {
     case ENOSYS:
@@ -215,7 +214,7 @@ TEST(AsyncUnixTest, SignalWithPointerValue) {
   WaitScope waitScope(loop);
 
   union sigval value;
-  memset(&value, 0, sizeof(value));
+  kj::memzero(value);
   value.sival_ptr = &port;
   KJ_SYSCALL_HANDLE_ERRORS(sigqueue(getpid(), SIGURG, value)) {
     case ENOSYS:
@@ -614,8 +613,7 @@ TEST(AsyncUnixTest, UrgentObserver) {
 
   // Spawn a TCP server
   auto serverFd = KJ_SYSCALL_FD(socket(AF_INET, SOCK_STREAM, 0));
-  sockaddr_in saddr;
-  memset(&saddr, 0, sizeof(saddr));
+  sockaddr_in saddr{};
   saddr.sin_family = AF_INET;
   saddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   KJ_SYSCALL(bind(serverFd, reinterpret_cast<sockaddr*>(&saddr), sizeof(saddr)));
@@ -764,8 +762,7 @@ TEST(AsyncUnixTest, InterruptedTimer) {
   if (signal(SIGALRM, &dummySignalHandler) == SIG_ERR) {
     KJ_FAIL_SYSCALL("signal(SIGALRM)", errno);
   }
-  struct itimerval itv;
-  memset(&itv, 0, sizeof(itv));
+  struct itimerval itv{};
   itv.it_value.tv_usec = 50000 * OS_SLOWNESS_FACTOR;  // signal after 50ms
   setitimer(ITIMER_REAL, &itv, nullptr);
 
@@ -869,9 +866,9 @@ struct TestChild {
 
   ~TestChild() noexcept(false) {
     KJ_IF_SOME(p, pid) {
-      KJ_SYSCALL(::kill(p, SIGKILL)) { return; }
+      KJ_DTOR_SYSCALL(::kill(p, SIGKILL));
       int status;
-      KJ_SYSCALL(waitpid(p, &status, 0)) { return; }
+      KJ_DTOR_SYSCALL(waitpid(p, &status, 0));
     }
   }
 
@@ -892,7 +889,7 @@ TEST(AsyncUnixTest, ChildProcess) {
   KJ_SYSCALL(sigemptyset(&sigs));
   KJ_SYSCALL(sigaddset(&sigs, SIGTERM));
   KJ_SYSCALL(pthread_sigmask(SIG_BLOCK, &sigs, &oldsigs));
-  KJ_DEFER(KJ_SYSCALL(pthread_sigmask(SIG_SETMASK, &oldsigs, nullptr)) { break; });
+  KJ_DEFER(KJ_DTOR_SYSCALL(pthread_sigmask(SIG_SETMASK, &oldsigs, nullptr)));
 
   UnixEventPort port;
   EventLoop loop(port);
@@ -1035,7 +1032,7 @@ KJ_TEST("UnixEventPort poll for signals") {
 
 void testRtSignals(UnixEventPort& port, WaitScope& waitScope, bool doPoll) {
   union sigval value;
-  memset(&value, 0, sizeof(value));
+  kj::memzero(value);
 
   // Queue three copies of the signal upfront.
   for (uint i = 0; i < 3; i++) {
@@ -1120,8 +1117,7 @@ KJ_TEST("UnixEventPoll::getPollableFd() for external waiting") {
   kj::WaitScope ws(loop);
 
   auto portIsReady = [&port](int timeout = 0) {
-    struct pollfd pfd;
-    memset(&pfd, 0, sizeof(pfd));
+    struct pollfd pfd{};
     pfd.events = POLLIN;
     pfd.fd = port.getPollableFd();
 
@@ -1186,6 +1182,34 @@ KJ_TEST("UnixEventPoll::getPollableFd() for external waiting") {
     promise.wait(ws);
   }
 
+  // Test wakeup on timeout after sleeping and waking for other reasons while it was pending. The
+  // timerfd is left alone each time, since its expiration doesn't change.
+  {
+    auto timeout = port.getTimer().afterDelay(50 * kj::MILLISECONDS);
+    KJ_EXPECT(!timeout.poll(ws));
+
+    for (auto i KJ_UNUSED: kj::zeroTo(3)) {
+      ws.poll();
+      port.preparePollableFdForSleep();
+
+      KJ_EXPECT(!portIsReady());
+
+      auto promise = yield().eagerlyEvaluate(nullptr);
+
+      KJ_EXPECT(portIsReady());
+      KJ_ASSERT(promise.poll(ws));
+      promise.wait(ws);
+    }
+
+    ws.poll();
+    port.preparePollableFdForSleep();
+
+    KJ_EXPECT(portIsReady(100));
+
+    KJ_ASSERT(timeout.poll(ws));
+    timeout.wait(ws);
+  }
+
   // Test wakeup on time in past. This verifies timerfd_settime() won't just silently fail if the
   // time is already past.
   {
@@ -1236,6 +1260,113 @@ KJ_TEST("UnixEventPoll::getPollableFd() for external waiting") {
     KJ_ASSERT(promise.poll(ws));
     promise.wait(ws);
   }
+}
+
+KJ_TEST("UnixEventPort only wakes for write space while awaiting writability") {
+  // For unix sockets, the kernel signals write space every time the peer consumes something we
+  // wrote, even if our buffer was never full. That must not wake the event loop unless someone is
+  // waiting for writability.
+
+  kj::UnixEventPort port;
+  kj::EventLoop loop(port);
+  kj::WaitScope ws(loop);
+
+  auto portIsReady = [&port]() {
+    struct pollfd pfd{};
+    pfd.events = POLLIN;
+    pfd.fd = port.getPollableFd();
+
+    int n;
+    KJ_SYSCALL(n = poll(&pfd, 1, 0));
+    return n > 0;
+  };
+
+  int pair[2]{};
+  KJ_SYSCALL(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair));
+  kj::OwnFd ours(pair[0]);
+  kj::OwnFd theirs(pair[1]);
+  kj::UnixEventPort::FdObserver observer(
+      port, ours, kj::UnixEventPort::FdObserver::OBSERVE_READ_WRITE);
+
+  auto writeAndLetPeerRead = [&]() {
+    KJ_SYSCALL(write(ours, "foo", 3));
+    char buffer[16]{};
+    KJ_SYSCALL(read(theirs, buffer, sizeof(buffer)));
+  };
+  auto sleep = [&]() {
+    ws.poll();
+    port.preparePollableFdForSleep();
+    KJ_EXPECT(!portIsReady());
+  };
+
+  // Nobody is waiting for writability, so the peer reading doesn't wake us.
+  sleep();
+  writeAndLetPeerRead();
+  KJ_EXPECT(!portIsReady());
+
+  // Fill our buffer and wait for writability. Now the peer reading does wake us.
+  ssize_t n;
+  char data[4096]{};
+  do {
+    KJ_NONBLOCKING_SYSCALL(n = write(ours, data, sizeof(data)));
+  } while (n >= 0);
+  auto promise = observer.whenBecomesWritable();
+  KJ_EXPECT(!promise.poll(ws));
+  sleep();
+  do {
+    KJ_NONBLOCKING_SYSCALL(n = read(theirs, data, sizeof(data)));
+  } while (n > 0);
+  KJ_EXPECT(portIsReady());
+  KJ_ASSERT(promise.poll(ws));
+  promise.wait(ws);
+
+  // We keep observing writability until it is reported while nobody is waiting, which wakes us
+  // once more. After that, the peer reading doesn't wake us again.
+  sleep();
+  writeAndLetPeerRead();
+  KJ_EXPECT(portIsReady());
+  sleep();
+  writeAndLetPeerRead();
+  KJ_EXPECT(!portIsReady());
+
+  // If the buffer gained space before we started waiting, the wait still ends.
+  do {
+    KJ_NONBLOCKING_SYSCALL(n = write(ours, data, sizeof(data)));
+  } while (n >= 0);
+  do {
+    KJ_NONBLOCKING_SYSCALL(n = read(theirs, data, sizeof(data)));
+  } while (n > 0);
+  promise = observer.whenBecomesWritable();
+  KJ_ASSERT(promise.poll(ws));
+  promise.wait(ws);
+}
+
+KJ_TEST("UnixEventPort retries observing writability after the kernel refuses") {
+  // If epoll_ctl() fails to add EPOLLOUT, a later wait must try again rather than assume that
+  // writability is observed and wait forever.
+
+  kj::UnixEventPort port;
+  kj::EventLoop loop(port);
+  kj::WaitScope ws(loop);
+
+  int pipefds[2]{};
+  KJ_SYSCALL(pipe2(pipefds, O_NONBLOCK | O_CLOEXEC));
+  kj::OwnFd infd(pipefds[0]), outfd(pipefds[1]);
+  KJ_SYSCALL(pipe2(pipefds, O_NONBLOCK | O_CLOEXEC));
+  kj::OwnFd otherInfd(pipefds[0]), otherOutfd(pipefds[1]);
+
+  auto observeReplacedFd = [&]() {
+    kj::UnixEventPort::FdObserver observer(
+        port, outfd, kj::UnixEventPort::FdObserver::OBSERVE_WRITE);
+
+    // Put a file that epoll doesn't know in place of the observed one, so epoll_ctl() fails.
+    KJ_SYSCALL(dup2(otherOutfd, outfd));
+    KJ_EXPECT_THROW_MESSAGE("epoll_ctl", observer.whenBecomesWritable());
+    KJ_EXPECT_THROW_MESSAGE("epoll_ctl", observer.whenBecomesWritable());
+
+    // The observer's destructor fails for the same reason.
+  };
+  KJ_EXPECT_THROW_MESSAGE("epoll_ctl", observeReplacedFd());
 }
 
 KJ_TEST("m:n threads:EventLoops") {

@@ -22,7 +22,9 @@
 #include "exception.h"
 #include "debug.h"
 #include "main.h"
+#include "thread.h"
 #include <kj/compat/gtest.h>
+#include <atomic>
 #include <stdexcept>
 #include <stdint.h>
 #include <signal.h>
@@ -46,6 +48,41 @@ KJ_TEST("crash handler stack trace is signal-safe") {
   // TSan reports any allocation made by getStackTrace() while handling this signal.
   KJ_SYSCALL(raise(SIGUSR1));
 }
+
+std::atomic<uint> signalTraceCount = 0;
+
+void countTraceFromSignal(int) {
+  void* traceSpace[32]{};
+  getStackTrace(traceSpace, 0);
+  signalTraceCount.fetch_add(1, std::memory_order_release);
+}
+
+KJ_TEST("stack trace from a signal that interrupted a stack trace") {
+  // A crash handler traces whatever its thread was doing, which is often taking a stack trace for
+  // an exception. Under ASan, backtrace()'s interceptor would then spin forever on a lock that the
+  // interrupted thread holds. (TSan delivers SIGUSR2 only once the thread leaves its runtime, so
+  // there this passes either way.)
+  struct sigaction action = {};
+  action.sa_handler = &countTraceFromSignal;
+  KJ_SYSCALL(sigaction(SIGUSR2, &action, nullptr));
+  signalTraceCount = 0;
+
+  std::atomic<bool> done = false;
+  Thread tracer([&]() {
+    while (!done.load(std::memory_order_relaxed)) {
+      void* traceSpace[32]{};
+      getStackTrace(traceSpace, 0);
+    }
+  });
+  KJ_DEFER(done = true);
+
+  // If the handler deadlocks, this hangs until the test times out. Failing sooner doesn't help:
+  // reporting the failure would need the same lock.
+  for (uint i: kj::zeroTo(10000)) {
+    tracer.sendSignal(SIGUSR2);
+    while (signalTraceCount.load(std::memory_order_acquire) == i) {}
+  }
+}
 #endif
 
 TEST(Exception, TrimSourceFilename) {
@@ -58,15 +95,9 @@ TEST(Exception, TrimSourceFilename) {
 }
 
 TEST(Exception, RunCatchingExceptions) {
-  bool recovered = false;
   Maybe<Exception> e = kj::runCatchingExceptions([&]() {
-    KJ_FAIL_ASSERT("foo") {
-      break;
-    }
-    recovered = true;
+    KJ_FAIL_ASSERT("foo");
   });
-
-  EXPECT_FALSE(recovered);
 
   KJ_IF_SOME(ex, e) {
     EXPECT_EQ("foo", ex.getDescription());
@@ -127,9 +158,7 @@ TEST(Exception, UnwindDetector) {
   // If another exception is happening, ThrowingDestructor's destructor's exception is squelched.
   e = kj::runCatchingExceptions([&]() {
     ThrowingDestructor t;
-    KJ_FAIL_ASSERT("baz") {
-      break;
-    }
+    KJ_FAIL_ASSERT("baz");
   });
 
   KJ_IF_SOME(ex, e) {
@@ -137,6 +166,106 @@ TEST(Exception, UnwindDetector) {
   } else {
     ADD_FAILURE() << "Expected exception";
   }
+}
+
+void throwTestExceptionIf(bool shouldThrow) {
+  if (shouldThrow) KJ_FAIL_ASSERT("this is a test, not a real bug");
+}
+
+struct DestructorUsingLogExceptionsIfUnwinding {
+  bool& reachedEnd;
+  bool shouldThrow;
+
+  DestructorUsingLogExceptionsIfUnwinding(bool& reachedEnd, bool shouldThrow = true)
+      : reachedEnd(reachedEnd), shouldThrow(shouldThrow) {}
+
+  ~DestructorUsingLogExceptionsIfUnwinding() noexcept(false) {
+    KJ_DTOR_CALL(throwTestExceptionIf(shouldThrow));
+    reachedEnd = true;
+  }
+};
+
+KJ_TEST("logExceptionsIfUnwinding() runs the function normally if it doesn't throw") {
+  bool reachedEnd = false;
+  {
+    DestructorUsingLogExceptionsIfUnwinding d(reachedEnd, false);
+  }
+  KJ_EXPECT(reachedEnd);
+
+  // Also while unwinding.
+  reachedEnd = false;
+  KJ_EXPECT_THROW_MESSAGE("primary exception", {
+    DestructorUsingLogExceptionsIfUnwinding d(reachedEnd, false);
+    KJ_FAIL_ASSERT("primary exception");
+  });
+  KJ_EXPECT(reachedEnd);
+}
+
+KJ_TEST("logExceptionsIfUnwinding() propagates exceptions if not unwinding") {
+  bool reachedEnd = false;
+  KJ_EXPECT_THROW_MESSAGE("this is a test, not a real bug", {
+    DestructorUsingLogExceptionsIfUnwinding d(reachedEnd);
+  });
+  KJ_EXPECT(!reachedEnd);
+}
+
+KJ_TEST("logExceptionsIfUnwinding() logs exceptions if unwinding") {
+  bool reachedEnd = false;
+  {
+    KJ_EXPECT_LOG(ERROR, "this is a test, not a real bug");
+    KJ_EXPECT_THROW_MESSAGE("primary exception", {
+      DestructorUsingLogExceptionsIfUnwinding d(reachedEnd);
+      KJ_FAIL_ASSERT("primary exception");
+    });
+  }
+  // The rest of the destructor ran after the exception was logged.
+  KJ_EXPECT(reachedEnd);
+}
+
+KJ_TEST("logExceptionsIfUnwinding() stops running the function at the first exception") {
+  bool reachedSecond = false;
+  bool reachedAfter = false;
+  {
+    KJ_EXPECT_LOG(ERROR, "first");
+    KJ_EXPECT_THROW_MESSAGE("primary exception", {
+      KJ_DEFER({
+        kj::logExceptionsIfUnwinding([&]() {
+          KJ_FAIL_ASSERT("first");
+          reachedSecond = true;
+        });
+        reachedAfter = true;
+      });
+      KJ_FAIL_ASSERT("primary exception");
+    });
+  }
+  KJ_EXPECT(!reachedSecond);
+  KJ_EXPECT(reachedAfter);
+}
+
+KJ_TEST("throwExceptionUnlessUnwinding() throws if not unwinding") {
+  bool reachedEnd = false;
+  KJ_EXPECT_THROW_MESSAGE("secondary", {
+    KJ_DEFER({
+      kj::throwExceptionUnlessUnwinding(KJ_EXCEPTION(FAILED, "secondary"));
+      reachedEnd = true;
+    });
+  });
+  KJ_EXPECT(!reachedEnd);
+}
+
+KJ_TEST("throwExceptionUnlessUnwinding() logs and returns if unwinding") {
+  bool reachedEnd = false;
+  {
+    KJ_EXPECT_LOG(ERROR, "secondary");
+    KJ_EXPECT_THROW_MESSAGE("primary exception", {
+      KJ_DEFER({
+        kj::throwExceptionUnlessUnwinding(KJ_EXCEPTION(FAILED, "secondary"));
+        reachedEnd = true;
+      });
+      KJ_FAIL_ASSERT("primary exception");
+    });
+  }
+  KJ_EXPECT(reachedEnd);
 }
 
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) || \
@@ -150,6 +279,22 @@ TEST(Exception, ExceptionCallbackMustBeOnStack) {
 }
 #endif
 #endif  // !__MINGW32__
+
+KJ_TEST("throwFatalException() is the same as throwException()") {
+  // TODO(cleanup): Remove along with the deprecated throwFatalException().
+  class Callback: public ExceptionCallback {
+  public:
+    uint count = 0;
+    void onException(Exception&& e) override {
+      ++count;
+      next.onException(kj::mv(e));
+    }
+  };
+
+  Callback callback;
+  KJ_EXPECT_THROW_MESSAGE("foo", throwFatalException(KJ_EXCEPTION(FAILED, "foo")));
+  KJ_EXPECT(callback.count == 1);
+}
 
 TEST(Exception, ScopeSuccessFail) {
   bool success = false;
@@ -740,7 +885,7 @@ KJ_TEST("getDestructionReason returns default exception if exception wasn't thro
 
 KJ_TEST("getDestructionReason returns thrown exception if it wasn't consumed") {
   try {
-    kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "test exception"));
+    kj::throwException(KJ_EXCEPTION(DISCONNECTED, "test exception"));
   } catch (...) {
     auto e =
         kj::getDestructionReason(nullptr, kj::Exception::Type::FAILED, __FILE__,
@@ -753,7 +898,7 @@ KJ_TEST("getDestructionReason returns thrown exception if it wasn't consumed") {
 KJ_TEST("getDestructionReason returns default exception if exception was "
         "consumed") {
   try {
-    kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "test exception"));
+    kj::throwException(KJ_EXCEPTION(DISCONNECTED, "test exception"));
   } catch (...) {
     auto caughtException = kj::getCaughtExceptionAsKj();
     KJ_EXPECT(caughtException.getType() == kj::Exception::Type::DISCONNECTED);

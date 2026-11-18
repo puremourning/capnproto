@@ -31,6 +31,31 @@ using kj::byte;
 
 // =======================================================================================
 
+// Every method in KJ_HTTP_FOR_EACH_REQUEST_METHOD has a capnp enumerant of the same name; a missing
+// one fails to compile. CONNECT has none, because a request call can't carry it.
+
+capnp::HttpMethod httpMethodToCapnp(kj::HttpMethod method) {
+  switch (method) {
+#define CASE(m) case kj::HttpMethod::m: return capnp::HttpMethod::m;
+    KJ_HTTP_FOR_EACH_REQUEST_METHOD(CASE)
+#undef CASE
+    case kj::HttpMethod::CONNECT:
+      KJ_FAIL_REQUIRE("use connect() for CONNECT requests");
+  }
+  KJ_UNREACHABLE;
+}
+
+kj::HttpMethod httpMethodFromCapnp(capnp::HttpMethod method) {
+  switch (method) {
+#define CASE(m) case capnp::HttpMethod::m: return kj::HttpMethod::m;
+    KJ_HTTP_FOR_EACH_REQUEST_METHOD(CASE)
+#undef CASE
+  }
+  KJ_FAIL_REQUIRE("unknown method", method);
+}
+
+// =======================================================================================
+
 class HttpOverCapnpFactory::CapnpToKjWebSocketAdapter final: public capnp::WebSocket::Server {
 public:
   CapnpToKjWebSocketAdapter(kj::WebSocket& webSocket,
@@ -187,7 +212,7 @@ private:
   template <typename Func>
   kj::Promise<void> wrap(Func&& func) {
     KJ_IF_SOME(e, error) {
-      kj::throwFatalException(e->clone());
+      kj::throwException(e->clone());
     }
 
     ++activeWriteCount;
@@ -206,11 +231,11 @@ private:
       KJ_IF_SOME(ws, webSocket) {
         co_await canceler.wrap(func(ws));
       } else {
-        kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "request canceled"));
+        kj::throwException(KJ_EXCEPTION(DISCONNECTED, "request canceled"));
       }
     } KJ_CATCH(e) {
       error = kj::heap(e.clone());
-      kj::throwFatalException(kj::mv(e));
+      kj::throwException(kj::mv(e));
     }
 
     done = true;
@@ -552,10 +577,12 @@ public:
   kj::Promise<void> request(
       kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, kj::HttpService::Response& kjResponse) override {
+    // Redundant with httpMethodToCapnp(), but states the rule where requests are sent.
+    KJ_REQUIRE(method != kj::HttpMethod::CONNECT, "use connect() for CONNECT requests");
     auto rpcRequest = inner.requestRequest();
 
     auto metadata = rpcRequest.initRequest();
-    metadata.setMethod(static_cast<capnp::HttpMethod>(method));
+    metadata.setMethod(httpMethodToCapnp(method));
     metadata.setUrl(url);
     metadata.adoptHeaders(factory.headersToCapnp(
         headers, Orphanage::getForMessageContaining(metadata)));
@@ -658,9 +685,9 @@ public:
         // Keep the upgraded transport alive until the Close frame has been written.
         auto originalException = kj::mv(exception);
         co_await context.closeWebSocketForOverload();
-        kj::throwFatalException(kj::mv(originalException));
+        kj::throwException(kj::mv(originalException));
       }
-      kj::throwFatalException(kj::mv(exception));
+      kj::throwException(kj::mv(exception));
     }
 
     // Once the server indicates it is done, then we can cancel pumping the request, because
@@ -671,7 +698,7 @@ public:
     // If the request pump failed (for a non-disconnect reason) we'd better propagate that
     // exception.
     KJ_IF_SOME(e, pumpRequestFailedReason) {
-      kj::throwFatalException(kj::mv(*e));
+      kj::throwException(kj::mv(*e));
     }
 
     // Finish pumping the response or WebSocket. (Probably it's already finished.)
@@ -685,7 +712,7 @@ public:
       // propagate here for the same reason. But, non-DISCONNECTED exceptions are more likely to
       // flag some real bug, so I'm leaving them alone for now. This could be revisited later.
       if (exception.getType() != kj::Exception::Type::DISCONNECTED) {
-        kj::throwFatalException(kj::mv(exception));
+        kj::throwException(kj::mv(exception));
       }
     }
   }
@@ -697,7 +724,13 @@ public:
     auto downPipe = kj::newOneWayPipe();
     rpcRequest.setHost(host);
     rpcRequest.setDown(factory.streamFactory.kjToCapnp(kj::mv(downPipe.out)));
-    rpcRequest.initSettings().setUseTls(settings.useTls);
+    auto settingsBuilder = rpcRequest.initSettings();
+    settingsBuilder.setUseTls(settings.useTls);
+    // Tell the server whether we can act on a startTls() call on the `up` stream, which is the
+    // case exactly when our own caller gave us a tlsStarter to fill in below.
+    settingsBuilder.setClientStartTls(settings.tlsStarter != kj::none
+            ? ConnectSettings::StartTlsSupport::YES
+            : ConnectSettings::StartTlsSupport::NO);
 
     ConnectClientRequestContextImpl context(factory, tunnel);
     RevocableServer<capnp::HttpService::ConnectClientRequestContext> revocableContext(context);
@@ -730,7 +763,7 @@ public:
           mutable -> kj::Promise<void> {
         auto startTlsRpcRequest = upForStartTls.startTlsRequest();
         startTlsRpcRequest.setExpectedServerHostname(expectedServerHostname);
-        return startTlsRpcRequest.send();
+        return startTlsRpcRequest.sendIgnoringResult();
       };
       tlsStarter = kj::mv(cb);
     }
@@ -766,10 +799,12 @@ public:
                           capnp::HttpRequest::Reader request,
                           capnp::HttpService::ClientRequestContext::Client clientContext)
       : factory(factory),
-        method(validateMethod(request.getMethod())),
+        method(httpMethodFromCapnp(request.getMethod())),
         url(request.getUrl()),
         headers(factory.capnpToKj(request.getHeaders())),
-        clientContext(kj::mv(clientContext)) {}
+        clientContext(kj::mv(clientContext)) {
+    KJ_DASSERT(method != kj::HttpMethod::CONNECT);
+  }
 
   kj::Own<kj::AsyncOutputStream> send(
       uint statusCode, kj::StringPtr statusText, const kj::HttpHeaders& headers,
@@ -838,11 +873,6 @@ public:
   kj::HttpHeaders headers;
   capnp::HttpService::ClientRequestContext::Client clientContext;
   bool responseSent = false;
-
-  static kj::HttpMethod validateMethod(capnp::HttpMethod method) {
-    KJ_REQUIRE(method <= capnp::HttpMethod::BAN, "unknown method", method);
-    return static_cast<kj::HttpMethod>(method);
-  }
 
   template <typename T>
   void dontWaitForRpc(kj::Promise<T> promise) {
@@ -970,7 +1000,13 @@ public:
     kj::HttpConnectSettings settings = {
         .useTls = params.getSettings().getUseTls(),
         .tlsStarter = kj::none };
-    settings.tlsStarter = tlsStarter;
+    if (params.getSettings().getClientStartTls() != ConnectSettings::StartTlsSupport::NO) {
+      // The client is prepared to call startTls() on the `up` stream, which invokes whatever
+      // callback the service below fills in here. A client that says it is not must not be offered
+      // a tlsStarter at all: a service which can only upgrade in cooperation with the client would
+      // otherwise wait forever for a request that can never arrive.
+      settings.tlsStarter = tlsStarter;
+    }
     auto headers = factory.capnpToKj(params.getHeaders());
     auto pipe = kj::newTwoWayPipe();
 

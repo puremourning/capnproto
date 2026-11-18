@@ -114,6 +114,24 @@ interface HttpService {
 
 struct ConnectSettings {
   useTls @0 :Bool;
+
+  clientStartTls @1 :StartTlsSupport;
+  # Whether the client can act on a `startTls()` call on the `up` stream, i.e. whether it passed a
+  # `tlsStarter` of its own in `kj::HttpConnectSettings`. The server side uses this to decide
+  # whether to offer a `tlsStarter` to the service handling the tunnel, which is how that service
+  # learns whether its peer is prepared to take part in an upgrade: a service that can only start
+  # TLS in cooperation with the client, rather than on a socket it owns outright, needs to know
+  # that before it offers the upgrade to its own caller.
+
+  enum StartTlsSupport {
+    unknown @0;
+    # Implicitly set by peers that predate this field. The server side treats this as `yes`, because
+    # it always offered a tlsStarter before the field existed and a client omitting the field is
+    # also old enough to expect that.
+
+    no @1;
+    yes @2;
+  }
 }
 
 interface WebSocket {
@@ -150,10 +168,9 @@ struct HttpResponse {
 }
 
 enum HttpMethod {
-  # This enum aligns precisely with the kj::HttpMethod enum. However, the backwards-compat
-  # constraints of a public-facing C++ enum vs. an internal Cap'n Proto interface differ in
-  # several ways, which could possibly lead to divergence someday. For now, a unit test verifies
-  # that they match exactly; if that test ever fails, we'll have to figure out what to do about it.
+  # Each enumerant stands for the kj::HttpMethod of the same name. A method added to
+  # KJ_HTTP_FOR_EACH_REQUEST_METHOD needs an enumerant here too. CONNECT has none: CONNECT requests
+  # use `HttpService.connect()`.
 
   get @0;
   head @1;

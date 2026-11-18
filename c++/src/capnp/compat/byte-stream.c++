@@ -81,6 +81,13 @@ kj::Own<ExplicitEndOutputStream> ExplicitEndOutputStream::wrap(
 
 const uint MAX_BYTES_PER_WRITE = 1 << 16;
 
+static bool isUnbounded(uint64_t limit) {
+  // A pump with no limit asks for kj::maxValue bytes, and each layer it passes through subtracts
+  // what has already been written, so an unbounded limit may arrive somewhat below kj::maxValue.
+  // Anything above half of it is far more than any stream will carry.
+  return limit >= (uint64_t)kj::maxValue / 2;
+}
+
 class ByteStreamFactory::StreamServerBase: public capnp::ByteStream::Server {
 public:
   virtual void returnStream(uint64_t written) = 0;
@@ -130,6 +137,22 @@ public:
                 kj::PromiseFulfillerPair<void> paf = kj::newPromiseAndFulfiller<void>())
       : factory(factory),
         state(Streaming {parent, kj::mv(ownParent), stream, kj::mv(callback), kj::mv(tlsStarter)}),
+        limit(limit),
+        resolveFulfiller(kj::mv(paf.fulfiller)),
+        resolvePromise(paf.promise.fork()) {}
+
+  SubstreamImpl(ByteStreamFactory& factory,
+                capnp::ByteStream::Client ownParent,
+                kj::Own<kj::AsyncOutputStream> throughParentParam,
+                capnp::ByteStream::SubstreamCallback::Client callback,
+                uint64_t limit,
+                kj::PromiseFulfillerPair<void> paf = kj::newPromiseAndFulfiller<void>())
+      // Writes go to `throughParentParam`, a stream on `ownParent`, instead of to a stream
+      // borrowed from the parent. See getSubstream().
+      : factory(factory),
+        throughParent(kj::mv(throughParentParam)),
+        state(Streaming {kj::none, kj::mv(ownParent), *KJ_ASSERT_NONNULL(throughParent),
+                         kj::mv(callback), kj::none}),
         limit(limit),
         resolveFulfiller(kj::mv(paf.fulfiller)),
         resolvePromise(paf.promise.fork()) {}
@@ -185,7 +208,9 @@ public:
         auto req = streaming.callback.endedRequest(MessageSize {4, 0});
         req.setByteCount(completed);
         req.send().detach([](kj::Exception&&){});
-        streaming.parent.returnStream(completed);
+        KJ_IF_SOME(parent, streaming.parent) {
+          parent.returnStream(completed);
+        }
         state = Ended();
       }
     }
@@ -209,7 +234,9 @@ public:
         auto req = streaming.callback.endedRequest(MessageSize {4, 0});
         req.setByteCount(completed);
         auto promise = req.sendIgnoringResult();
-        streaming.parent.returnStream(completed);
+        KJ_IF_SOME(parent, streaming.parent) {
+          parent.returnStream(completed);
+        }
         state = Ended();
         return promise;
       }
@@ -291,7 +318,9 @@ public:
         auto req = streaming.callback.endedRequest(MessageSize {4, 0});
         req.setByteCount(completed);
         auto result = req.sendIgnoringResult();
-        streaming.parent.returnStream(completed);
+        KJ_IF_SOME(parent, streaming.parent) {
+          parent.returnStream(completed);
+        }
         state = Ended();
         return result;
       }
@@ -300,7 +329,41 @@ public:
   }
 
   kj::Promise<void> startTls(StartTlsContext context) override {
-    KJ_UNIMPLEMENTED("A substream does not support TLS initiation");
+    auto params = context.getParams();
+
+    KJ_SWITCH_ONEOF(state) {
+      KJ_CASE_ONEOF(redirected, Redirected) {
+        auto req = redirected.replacement.startTlsRequest(params.totalSize());
+        req.setExpectedServerHostname(params.getExpectedServerHostname());
+        return context.tailCall(kj::mv(req));
+      }
+      KJ_CASE_ONEOF(e, Ended) {
+        KJ_FAIL_REQUIRE("already called end()");
+      }
+      KJ_CASE_ONEOF(b, Borrowed) {
+        KJ_FAIL_REQUIRE("can't call other methods while stream is borrowed");
+      }
+      KJ_CASE_ONEOF(streaming, Streaming) {
+        if (streaming.parent == kj::none) {
+          // We write through our parent rather than borrowing its stream, so the parent kept the
+          // TLS starter.
+          auto req = streaming.ownParent.startTlsRequest(params.totalSize());
+          req.setExpectedServerHostname(params.getExpectedServerHostname());
+          return context.tailCall(kj::mv(req));
+        }
+
+        // A substream takes over the underlying stream's TLS starter for as long as it is the
+        // shortest path to that stream, so it is the one that has to act on this request. Path
+        // shortening is invisible to the caller, which is talking to whichever stream its writes
+        // go to and expects its upgrade to land on the same transport as those writes.
+        auto& starter = KJ_REQUIRE_NONNULL(streaming.tlsStarter,
+            "this stream's transport cannot start TLS");
+        return KJ_REQUIRE_NONNULL(*starter,
+            "this stream's transport did not provide a way to start TLS")(
+            params.getExpectedServerHostname());
+      }
+    }
+    KJ_UNREACHABLE;
   }
 
   kj::Promise<void> getSubstream(GetSubstreamContext context) override {
@@ -321,11 +384,26 @@ public:
       KJ_CASE_ONEOF(streaming, Streaming) {
         auto params = context.getParams();
         auto callback = params.getCallback();
-        auto limit = params.getLimit();
+        auto requestedLimit = params.getLimit();
         context.releaseParams();
         auto results = context.getResults(MessageSize { 2, 1 });
+
+        KJ_ASSERT(completed <= limit);
+        uint64_t remaining = limit - completed;
+        if (requestedLimit > remaining && !isUnbounded(remaining)) {
+          // The new substream could write past our limit before it gives our stream back, and
+          // we only count its bytes when it does. Our own pump would then wait for the new
+          // substream to end, even after our limit's worth of bytes had been written. So instead
+          // of lending it our stream, have it write through our capability, which counts each
+          // write against our limit and redirects once we reach it.
+          results.setSubstream(factory.streamSet.add(kj::heap<SubstreamImpl>(
+              factory, thisCap(), factory.capnpToKjExplicitEnd(thisCap()), kj::mv(callback),
+              requestedLimit)));
+          return kj::READY_NOW;
+        }
+
         results.setSubstream(factory.streamSet.add(kj::heap<SubstreamImpl>(
-            factory, *this, thisCap(), streaming.stream, kj::mv(callback), kj::mv(limit),
+            factory, *this, thisCap(), streaming.stream, kj::mv(callback), requestedLimit,
             kj::mv(streaming.tlsStarter))));
         state = Borrowed { kj::mv(streaming) };
         return kj::READY_NOW;
@@ -337,8 +415,15 @@ public:
 private:
   ByteStreamFactory& factory;
 
+  kj::Maybe<kj::Own<kj::AsyncOutputStream>> throughParent;
+  // Set if we write through our parent's capability rather than a stream borrowed from it. Must
+  // outlive `state`, which refers to it.
+
   struct Streaming {
-    StreamServerBase& parent;
+    kj::Maybe<StreamServerBase&> parent;
+    // None if we write through our parent's capability, in which case we never borrowed its
+    // stream, so there is nothing to return.
+
     capnp::ByteStream::Client ownParent;
     kj::AsyncOutputStream& stream;
     capnp::ByteStream::SubstreamCallback::Client callback;
@@ -366,7 +451,9 @@ private:
         .send().getNext();
 
     // Set the next stream as our replacement.
-    streaming.parent.returnStream(limit);
+    KJ_IF_SOME(parent, streaming.parent) {
+      parent.returnStream(limit);
+    }
     state = Redirected { kj::mv(next) };
     resolveFulfiller->fulfill();
   }
@@ -431,12 +518,10 @@ public:
         return &capnpStream;
       }
       KJ_CASE_ONEOF(b, Borrowed) {
-        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed") { break; }
-        return kj::Promise<void>(kj::READY_NOW);
+        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed");
       }
       KJ_CASE_ONEOF(e, Ended) {
-        KJ_FAIL_REQUIRE("already ended") { break; }
-        return kj::Promise<void>(kj::READY_NOW);
+        KJ_FAIL_REQUIRE("already ended");
       }
     }
     KJ_UNREACHABLE;
@@ -655,8 +740,7 @@ protected:
         return Capability::Client(capnpStream);
       }
       KJ_CASE_ONEOF(b, Borrowed) {
-        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed") { break; }
-        return kj::NEVER_DONE;
+        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed");
       }
       KJ_CASE_ONEOF(e, Ended) {
         // No shortening possible. Pretend we never resolve so that calls continue to be routed
@@ -686,12 +770,10 @@ protected:
         return req.send();
       }
       KJ_CASE_ONEOF(b, Borrowed) {
-        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed") { break; }
-        return kj::READY_NOW;
+        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed");
       }
       KJ_CASE_ONEOF(e, Ended) {
-        KJ_FAIL_REQUIRE("already called end()") { break; }
-        return kj::READY_NOW;
+        KJ_FAIL_REQUIRE("already called end()");
       }
     }
     KJ_UNREACHABLE;
@@ -728,12 +810,10 @@ protected:
         return context.tailCall(kj::mv(req));
       }
       KJ_CASE_ONEOF(b, Borrowed) {
-        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed") { break; }
-        return kj::READY_NOW;
+        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed");
       }
       KJ_CASE_ONEOF(e, Ended) {
-        KJ_FAIL_REQUIRE("already called end()") { break; }
-        return kj::READY_NOW;
+        KJ_FAIL_REQUIRE("already called end()");
       }
     }
     KJ_UNREACHABLE;
@@ -741,23 +821,22 @@ protected:
 
   kj::Promise<void> startTls(StartTlsContext context) override {
     auto params = context.getParams();
-    KJ_IF_SOME(s, tlsStarter) {
-      KJ_SWITCH_ONEOF(state) {
-        KJ_CASE_ONEOF(prober, kj::Own<PathProber>) {
-          return KJ_ASSERT_NONNULL(*s)(params.getExpectedServerHostname());
-        }
-        KJ_CASE_ONEOF(kjStream, kj::Own<kj::AsyncOutputStream>) {
-          return KJ_ASSERT_NONNULL(*s)(params.getExpectedServerHostname());
-        }
-        KJ_CASE_ONEOF(capnpStream, capnp::ByteStream::Client) {
-          return KJ_ASSERT_NONNULL(*s)(params.getExpectedServerHostname());
-        }
-        KJ_CASE_ONEOF(e, Ended) {
-          KJ_FAIL_REQUIRE("cannot call startTls on a bytestream that was ended");
-        }
-        KJ_CASE_ONEOF(b, Borrowed) {
-          KJ_FAIL_REQUIRE("can't call startTls while stream is borrowed");
-        }
+
+    KJ_SWITCH_ONEOF(state) {
+      KJ_CASE_ONEOF(prober, kj::Own<PathProber>) {
+        return invokeTlsStarter(params.getExpectedServerHostname());
+      }
+      KJ_CASE_ONEOF(kjStream, kj::Own<kj::AsyncOutputStream>) {
+        return invokeTlsStarter(params.getExpectedServerHostname());
+      }
+      KJ_CASE_ONEOF(capnpStream, capnp::ByteStream::Client) {
+        return invokeTlsStarter(params.getExpectedServerHostname());
+      }
+      KJ_CASE_ONEOF(e, Ended) {
+        KJ_FAIL_REQUIRE("cannot call startTls on a bytestream that was ended");
+      }
+      KJ_CASE_ONEOF(b, Borrowed) {
+        KJ_FAIL_REQUIRE("can't call startTls while stream is borrowed");
       }
     }
     KJ_UNREACHABLE;
@@ -792,12 +871,10 @@ protected:
         return context.tailCall(kj::mv(req));
       }
       KJ_CASE_ONEOF(b, Borrowed) {
-        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed") { break; }
-        return kj::READY_NOW;
+        KJ_FAIL_REQUIRE("concurrent streaming calls disallowed");
       }
       KJ_CASE_ONEOF(e, Ended) {
-        KJ_FAIL_REQUIRE("already called end()") { break; }
-        return kj::READY_NOW;
+        KJ_FAIL_REQUIRE("already called end()");
       }
     }
     KJ_UNREACHABLE;
@@ -806,6 +883,16 @@ protected:
 private:
   ByteStreamFactory& factory;
   kj::Maybe<kj::Own<kj::TlsStarterCallback>> tlsStarter;
+
+  // Starts the handshake on the transport underneath this stream. The starter is a slot which the
+  // layer that set the transport up fills in if it has a way to perform one; whoever asked for the
+  // upgrade needs to ensure that it does.
+  kj::Promise<void> invokeTlsStarter(kj::StringPtr expectedServerHostname) {
+    auto& slot = KJ_REQUIRE_NONNULL(tlsStarter, "this stream's transport cannot start TLS");
+    return KJ_REQUIRE_NONNULL(
+        *slot, "this stream's transport did not provide a way to start TLS")(
+        expectedServerHostname);
+  }
 
   struct Borrowed { kj::Own<kj::AsyncOutputStream> stream; };
   struct Ended {};
@@ -1082,7 +1169,7 @@ private:
       KJ_CASE_ONEOF(kjStream, StreamServerBase::BorrowedStream) {
         // The ByteStream::Server wraps a regular KJ stream that does not wrap another capnp
         // stream.
-        if (kjStream.limit < (uint64_t)kj::maxValue / 2) {
+        if (!isUnbounded(kjStream.limit)) {
           // But it isn't wrapping that stream forever. Eventually it plans to redirect back to
           // some other stream. So, let's wait for that, and possibly shorten again.
           kjStream.lender.returnStream(0);

@@ -403,8 +403,7 @@ KJ_TEST("double-index table") {
 
 KJ_TEST("B-tree internals") {
   {
-    BTreeImpl::Leaf leaf;
-    memset(&leaf, 0, sizeof(leaf));
+    BTreeImpl::Leaf leaf{};
 
     for (auto i: kj::indices(leaf.rows)) {
       KJ_CONTEXT(i);
@@ -440,8 +439,7 @@ KJ_TEST("B-tree internals") {
   }
 
   {
-    BTreeImpl::Parent parent;
-    memset(&parent, 0, sizeof(parent));
+    BTreeImpl::Parent parent{};
 
     for (auto i: kj::indices(parent.keys)) {
       KJ_CONTEXT(i);
@@ -928,6 +926,45 @@ KJ_TEST("insertion order index") {
     auto range = table.ordered();
     KJ_EXPECT(range.begin() == range.end());
   }
+}
+
+KJ_TEST("insertion order index move assignment releases existing storage") {
+  using UintTable = Table<uint, InsertionOrderIndex>;
+
+  UintTable table;
+  table.insert(12);
+
+  {
+    UintTable other;
+    other.insert(34);
+    other.insert(56);
+    other.insert(78);
+    other.erase(other.begin()[1]);
+    table = kj::mv(other);
+  }
+
+  KJ_EXPECT(table.size() == 2);
+  {
+    auto range = table.ordered();
+    auto iter = range.begin();
+    KJ_ASSERT(iter != range.end());
+    KJ_EXPECT(*iter++ == 34);
+    KJ_ASSERT(iter != range.end());
+    KJ_EXPECT(*iter++ == 78);
+    KJ_EXPECT(iter == range.end());
+  }
+
+  // LeakSanitizer checks that assignment frees the destination's index storage, including when
+  // the source is empty or the destination has no rows but still has allocated capacity.
+  table = UintTable();
+  KJ_EXPECT(table.size() == 0);
+  KJ_EXPECT(table.ordered().begin() == table.ordered().end());
+  table.insert(90);
+  KJ_EXPECT(table.size() == 1);
+  KJ_EXPECT(*table.ordered().begin() == 90);
+  table.clear();
+  table = UintTable();
+  table = UintTable();
 }
 
 KJ_TEST("insertion order index is movable") {

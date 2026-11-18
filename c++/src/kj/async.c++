@@ -565,8 +565,8 @@ public:
     if (error != 0) {
       KJ_FAIL_SYSCALL("posix_memalign", error);
     }
-    memset(allocPtr, 0, totalSize);
     coreLocalFreelists = reinterpret_cast<CoreLocalFreelist*>(allocPtr);
+    kj::asBytes(coreLocalFreelists, nproc).fill(0);
 #endif
   }
 
@@ -762,7 +762,7 @@ struct Executor::Impl {
       for (auto& event: start) {
         start.remove(event);
         executing.add(event);
-        event.state = _::XThreadEvent::EXECUTING;
+        kj::atomicStore(&event.state, _::XThreadEvent::EXECUTING, kj::AtomicMemoryOrder::RELAXED);
         event.armBreadthFirst();
       }
 
@@ -798,7 +798,11 @@ struct Executor::Impl {
   };
 
   kj::MutexGuarded<State> state;
-  // After modifying state from another thread, the loop's port.wake() must be called.
+  // After adding to `start`, `cancel`, `replies`, or `fulfilled`, the adder must call the loop's
+  // wake(), unless `isDispatchNeeded()` was already true before the add. In that case, whoever
+  // made it true is responsible for a wake that the loop has not yet consumed. EventPort::wake()
+  // latches until the port's wait() or poll() returns true, and the loop then calls
+  // dispatchAll(), which drains all four lists at once. Removing entries never consumes a wake.
 
   void processAsyncCancellations(Vector<_::XThreadEvent*>& eventsToCancelOutsideLock) {
     // After calling dispatchAll() or dispatchCancels() with the lock held, it may be that some
@@ -834,7 +838,7 @@ struct Executor::Impl {
     KJ_DEFER(state.lockExclusive());
 
     for (auto& event: s.start) {
-      KJ_ASSERT(event.state == _::XThreadEvent::QUEUED, event.state) { break; }
+      KJ_DTOR_ASSERT(event.state == _::XThreadEvent::QUEUED, event.state);
       s.start.remove(event);
       event.setDisconnected();
       event.sendReply();
@@ -842,7 +846,7 @@ struct Executor::Impl {
     }
 
     for (auto& event: s.executing) {
-      KJ_ASSERT(event.state == _::XThreadEvent::EXECUTING, event.state) { break; }
+      KJ_DTOR_ASSERT(event.state == _::XThreadEvent::EXECUTING, event.state);
       s.executing.remove(event);
       event.promiseNode = kj::none;
       event.setDisconnected();
@@ -851,7 +855,7 @@ struct Executor::Impl {
     }
 
     for (auto& event: s.cancel) {
-      KJ_ASSERT(event.state == _::XThreadEvent::CANCELING, event.state) { break; }
+      KJ_DTOR_ASSERT(event.state == _::XThreadEvent::CANCELING, event.state);
       s.cancel.remove(event);
       event.promiseNode = kj::none;
       event.setDoneState();
@@ -891,6 +895,8 @@ void XThreadEvent::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
 }
 
 void XThreadEvent::ensureDoneOrCanceled() {
+  // This unlocked check requires every state update to be atomic, including intermediate states.
+  // The executor mutex still orders transitions; only DONE needs release ordering.
   if (kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) != DONE) {
     auto lock = targetExecutor->impl->state.lockExclusive();
 
@@ -913,13 +919,14 @@ void XThreadEvent::ensureDoneOrCanceled() {
       case QUEUED:
         lock->start.remove(*this);
         // No wake needed since we removed work rather than adding it.
-        state = DONE;
+        setDoneState();
         break;
       case EXECUTING: {
+        bool wakePending = lock->isDispatchNeeded();
         lock->executing.remove(*this);
         lock->cancel.add(*this);
-        state = CANCELING;
-        loop->wake();
+        kj::atomicStore(&state, CANCELING, kj::AtomicMemoryOrder::RELAXED);
+        if (!wakePending) loop->wake();
 
         Maybe<Executor&> maybeSelfExecutor = kj::none;
         if (threadLocalEventLoop != nullptr) {
@@ -1035,12 +1042,12 @@ void XThreadEvent::ensureDoneOrCanceled() {
 void XThreadEvent::sendReply() noexcept {
   KJ_IF_SOME(e, replyExecutor) {
     // Queue the reply.
-    const EventLoop* replyLoop;
+    const EventLoop* loopToWake = nullptr;
     {
       auto lock = e.impl->state.lockExclusive();
       KJ_IF_SOME(l, lock->loop) {
+        if (!lock->isDispatchNeeded()) loopToWake = &l;
         lock->replies.add(*this);
-        replyLoop = &l;
       } else {
         // Calling thread exited without cancelling the promise. This is UB. In fact,
         // `replyExecutor` is probably already destroyed and we are in use-after-free territory
@@ -1055,12 +1062,12 @@ void XThreadEvent::sendReply() noexcept {
       }
     }
 
-    // Note that it's safe to assume `replyLoop` still exists even though we dropped the lock
+    // Note that it's safe to assume `loopToWake` still exists even though we dropped the lock
     // because that thread would have had to cancel any promises before destroying its own
     // EventLoop, and when it tries to destroy this promise, it will wait for `state` to become
     // `DONE`, which we don't set until later on. That's nice because wake() probably makes a
     // syscall and we'd rather not hold the lock through syscalls.
-    replyLoop->wake();
+    if (loopToWake != nullptr) loopToWake->wake();
   }
 }
 
@@ -1206,16 +1213,22 @@ XThreadPaf::FulfillScope::FulfillScope(XThreadPaf** pointer) {
 XThreadPaf::FulfillScope::~FulfillScope() noexcept(false) {
   if (obj != nullptr) {
     auto lock = obj->executor->impl->state.lockExclusive();
-    lock->fulfilled.add(*obj);
-    kj::atomicStore(&obj->control->state, XThreadPafControl::FULFILLED, kj::AtomicMemoryOrder::RELEASE);
     KJ_IF_SOME(l, lock->loop) {
+      bool wakePending = lock->isDispatchNeeded();
+      lock->fulfilled.add(*obj);
+      kj::atomicStore(&obj->control->state, XThreadPafControl::FULFILLED,
+          kj::AtomicMemoryOrder::RELEASE);
       // TODO(perf): It's annoying we have to call wake() with the lock held, but we have to
       //   prevent the destination EventLoop from being destroyed first.
-      l.wake();
+      if (!wakePending) l.wake();
     } else {
       // The thread which called kj::newPromiseAndCrossThreadFulfiller<T>() apparently exited its
       // own event loop without canceling the cross-thread promise first. Whoever now owns the
-      // promise can only do one thing with it safely: destroy it.
+      // promise can only do one thing with it safely: destroy it. The loop's disconnect() reads
+      // `fulfilled` without the lock once `loop` is null, so mark the promise dispatched without
+      // queuing it, as disconnect() does for the entries it finds.
+      kj::atomicStore(&obj->control->state, XThreadPafControl::DISPATCHED,
+          kj::AtomicMemoryOrder::RELEASE);
     }
   }
 }
@@ -1296,10 +1309,11 @@ void Executor::send(_::XThreadEvent& event, bool sync) const {
     return;
   }
 
-  event.state = _::XThreadEvent::QUEUED;
+  kj::atomicStore(&event.state, _::XThreadEvent::QUEUED, kj::AtomicMemoryOrder::RELAXED);
+  bool wakePending = lock->isDispatchNeeded();
   lock->start.add(event);
 
-  loop->wake();
+  if (!wakePending) loop->wake();
 
   // Event loop will be waiting on executor.wait(), which will be woken when we unlock the mutex.
 
@@ -1338,7 +1352,7 @@ EventLoop& Executor::getLoop() const {
   KJ_IF_SOME(l, impl->state.lockShared()->loop) {
     return l;
   } else {
-    kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "Executor's event loop has exited"));
+    kj::throwException(KJ_EXCEPTION(DISCONNECTED, "Executor's event loop has exited"));
   }
 }
 
@@ -1403,7 +1417,7 @@ struct FiberStack::Impl {
       KJ_FAIL_SYSCALL("mmap(new stack)", errno);
     }
     KJ_ON_SCOPE_FAILURE({
-      KJ_SYSCALL(munmap(stackMapping, allocSize)) { break; }
+      KJ_DTOR_SYSCALL(munmap(stackMapping, allocSize));
     });
 
 #if __linux__
@@ -1453,7 +1467,8 @@ struct FiberStack::Impl {
   static void free(Impl* impl, size_t stackSize) {
     size_t allocSize = stackSize + getPageSize();
     void* stack = reinterpret_cast<byte*>(impl + 1) - allocSize;
-    KJ_SYSCALL(munmap(stack, allocSize)) { break; }
+    // Called from ~FiberStack().
+    KJ_DTOR_SYSCALL(munmap(stack, allocSize));
   }
 
   static size_t getPageSize() {
@@ -1794,9 +1809,9 @@ EventLoop::~EventLoop() noexcept(false) {
   // EventLoop itself, so if there are events on the loop, this indicates a memory leak.
   _::Event* firstEvent = head();
 
-  KJ_REQUIRE(firstEvent == &tailSentinel,
-             "EventLoop destroyed with events still in the queue.  Memory leak?",
-             firstEvent->traceEvent()) {
+  if (firstEvent != &tailSentinel) {
+    // Trace the event before unlinking anything.
+    auto trace = firstEvent->traceEvent();
 
     // Unlink all the events and hope that no one ever fires them...
     for (_::Event* event = firstEvent; event != &tailSentinel;) {
@@ -1806,7 +1821,9 @@ EventLoop::~EventLoop() noexcept(false) {
       event->prev = nullptr;
       event = next;
     }
-    break;
+
+    KJ_DTOR_FAIL_REQUIRE(
+        "EventLoop destroyed with events still in the queue.  Memory leak?", trace);
   }
 
   threadLocalEventLoop = nullptr;
@@ -1891,10 +1908,9 @@ void EventLoop::Id::assertCurrentEventLoop() const {
 }
 
 void EventLoop::leaveScope() {
-  KJ_REQUIRE(threadLocalEventLoop == this,
-             "WaitScope destroyed in a different thread than it was created in.") {
-    break;
-  }
+  // Called from ~WaitScope().
+  KJ_DTOR_REQUIRE(threadLocalEventLoop == this,
+                  "WaitScope destroyed in a different thread than it was created in.");
   threadLocalEventLoop = nullptr;
 }
 
@@ -2048,7 +2064,6 @@ void waitImpl(_::OwnPromiseNode&& node, _::ExceptionOrValue& result, WaitScope& 
   EventLoop& loop = waitScope.loop;
   KJ_REQUIRE(&loop == threadLocalEventLoop, "WaitScope not valid for this thread.");
 
-  // we don't support fibers when running without exceptions, so just remove the whole block
   KJ_IF_SOME(fiber, waitScope.fiber) {
     if (fiber.state == FiberBase::CANCELED) {
       throw fiberCanceledException();
@@ -2199,7 +2214,12 @@ void NeverDone::wait(WaitScope& waitScope, SourceLocation location) const {
 
 void detach(kj::Promise<void>&& promise) {
   EventLoop& loop = currentEventLoop();
-  KJ_REQUIRE(loop.daemons.get() != nullptr, "EventLoop is shutting down.") { return; }
+  if (loop.daemons.get() == nullptr) {
+    // Destructors may call this while the EventLoop is being torn down, so don't throw during
+    // unwind.
+    KJ_DTOR_FAIL_REQUIRE("EventLoop is shutting down.");
+    return;
+  }
   loop.daemons->add(kj::mv(promise));
 }
 
@@ -3207,7 +3227,7 @@ void CoroutineBase::destroy() {
       // but this behaviour will never lead to trouble, is almost always true on practice
       // (only coroutines _created_ during unwind could notice a difference in behaviour),
       // and, more importantly, much faster.
-      kj::throwFatalException(kj::mv(exception));
+      kj::throwException(kj::mv(exception));
     } else {
       // An exception is already unwinding the stack, so throwing this secondary exception would
       // call std::terminate().
@@ -3249,11 +3269,11 @@ void PromiseAwaiterBase::awaitResumeImpl(ExceptionOrValue& result, void* awaited
     // Manually extend the stack trace with the instruction address where the co_await occurred.
     exception.addTrace(awaitedAt);
 
-    // Pass kj::maxValue for ignoreCount here so that `throwFatalException()` doesn't try to
+    // Pass kj::maxValue for ignoreCount here so that `throwException()` doesn't try to
     // extend the stack trace. There's no point in extending the trace beyond the single frame we
     // added above, as the rest of the trace will always be async framework stuff that no one wants
     // to see.
-    kj::throwFatalException(kj::mv(exception), kj::maxValue);
+    kj::throwException(kj::mv(exception), kj::maxValue);
   }
 }
 
