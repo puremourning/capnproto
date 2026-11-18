@@ -1187,13 +1187,13 @@ kj::String TlsPeerIdentity::getCommonName() {
     KJ_FAIL_REQUIRE("client did not provide a certificate");
   }
 
-  X509_NAME* subj = X509_get_subject_name(cert);
+  const X509_NAME* subj = X509_get_subject_name(cert);
 
   int index = X509_NAME_get_index_by_NID(subj, NID_commonName, -1);
   KJ_ASSERT(index != -1, "certificate has no common name?");
-  X509_NAME_ENTRY* entry = X509_NAME_get_entry(subj, index);
+  const X509_NAME_ENTRY* entry = X509_NAME_get_entry(subj, index);
   KJ_ASSERT(entry != nullptr);
-  ASN1_STRING* data = X509_NAME_ENTRY_get_data(entry);
+  const ASN1_STRING* data = X509_NAME_ENTRY_get_data(entry);
   KJ_ASSERT(data != nullptr);
 
   unsigned char* out = nullptr;
