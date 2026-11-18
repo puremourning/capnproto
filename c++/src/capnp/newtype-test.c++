@@ -569,7 +569,49 @@ TEST(Newtype, EvolutionNestedHandBuiltTables) {
   EXPECT_EQ(8, rt2.getBr().getW());
 }
 
+TEST(Newtype, AliasesDeclaredBeforeTheirTargets) {
+  // Aliases of existing structs/interfaces are transparent `using`s, and compile even though
+  // every target is declared later in the schema file.
+  static_assert(kj::isSameType<ForwardStruct, LaterStruct>());
+  static_assert(kj::isSameType<ForwardList, ::capnp::List<LaterStruct>>());
+  static_assert(kj::isSameType<ForwardBranded, GenericTarget<LaterStruct>>());
+  static_assert(kj::isSameType<PingerAlias, Pinger>());
+  static_assert(kj::isSameType<ForwardAliases::Nested::Inner, LaterStruct>());
+
+  ::capnp::MallocMessageBuilder message;
+  auto root = message.initRoot<ForwardAliases>();
+  ForwardStruct::Builder forward = root.initForward();
+  forward.setY(-2);
+  root.initList(2)[1].setY(5);
+  root.initBranded().initValue().setY(3);
+  auto holding = root.getHolding();          // Holding::Builder<...>, naming a later struct
+  holding.initInner().setY(7);
+  holding.setN(8);
+  root.initNested().setY(9);
+
+  auto r = root.asReader();
+  EXPECT_EQ(-2, r.getForward().getY());
+  EXPECT_EQ(5, r.getList()[1].getY());
+  EXPECT_EQ(3, r.getBranded().getValue().getY());
+  EXPECT_EQ(7, r.getHolding().getInner().getY());
+  EXPECT_EQ(8u, r.getHolding().getN());
+  EXPECT_EQ(7, r.getHolding().asAny().getInner().getY());
+  EXPECT_EQ(9, r.getNested().getY());
+  EXPECT_FALSE(r.hasPinger());
+}
+
 #if !CAPNP_LITE
+
+class PingerImpl final: public PingerAlias::Server {   // implemented via the alias name
+public:
+  explicit PingerImpl(uint32_t n): n(n) {}
+  kj::Promise<void> ping(PingContext context) override {
+    context.getResults().setN(n);
+    return kj::READY_NOW;
+  }
+private:
+  uint32_t n;
+};
 
 class RegistryImpl final: public Registry::Server {
   // Reads newtype-typed parameters and writes newtype-typed results. The parameter/result accessors
@@ -596,6 +638,13 @@ public:
     echo.setZ(spot.getZ() * 2);
     results.initKind().setCancel(99);          // union newtype result
     return kj::READY_NOW;
+  }
+
+  kj::Promise<void> ping(PingContext context) override {
+    PingerAlias::Client pinger = context.getParams().getPinger();  // cap through an alias
+    return pinger.pingRequest().send().then([context](auto response) mutable {
+      context.getResults().setN(response.getN() + 1);
+    });
   }
 };
 
@@ -633,6 +682,11 @@ TEST(Newtype, CapabilityParamsAndResults) {
   EXPECT_EQ(OrderType::CANCEL, kind.which());
   EXPECT_TRUE(kind.isCancel());
   EXPECT_EQ(99, kind.getCancel());
+
+  // An interface alias (declared after Registry) as a parameter: the server calls the capability.
+  auto pingReq = client.pingRequest();
+  pingReq.setPinger(kj::heap<PingerImpl>(41));
+  EXPECT_EQ(42u, pingReq.send().wait(waitScope).getN());
 }
 
 #endif  // !CAPNP_LITE

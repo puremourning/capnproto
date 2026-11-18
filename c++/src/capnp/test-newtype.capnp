@@ -152,4 +152,31 @@ interface Registry {
   # inline parameter list; group/union newtypes come in via the named structs above.
   lookup @0 (id :Uuid, age :Age) -> (foundId :Uuid, foundAge :Age);
   place @1 PlaceParams -> PlaceResults;
+  ping @2 (pinger :PingerAlias) -> (n :UInt32);   # interface alias declared after this interface
 }
+
+# Aliases of existing (non-newtype) structs and interfaces, and a group newtype naming a struct,
+# all declared before their targets. The generator must order the outer type definitions so each
+# `using` follows what it names, and keep the wrapper's accessor declarations out of them.
+type ForwardStruct = LaterStruct;
+type ForwardList = List(LaterStruct);
+type ForwardBranded = GenericTarget(LaterStruct);
+type Holding = group { inner @0 :LaterStruct; n @1 :UInt32; }
+type PingerAlias = Pinger;
+
+struct ForwardAliases {
+  forward @0 :ForwardStruct;
+  list @1 :ForwardList;
+  branded @2 :ForwardBranded;
+  holding @[3-4] :Holding;
+  pinger @5 :PingerAlias;
+  nested @6 :Nested.Inner;
+
+  struct Nested {
+    type Inner = LaterStruct;           # an alias nested in a type's body
+  }
+}
+
+struct LaterStruct { y @0 :Int16; }
+struct GenericTarget(T) { value @0 :T; }
+interface Pinger { ping @0 () -> (n :UInt32); }

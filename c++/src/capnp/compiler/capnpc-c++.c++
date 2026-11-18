@@ -3160,69 +3160,87 @@ private:
           return kj::str("    ", toUpperCase(protoName(f.getProto())));
         }, ",\n"),
         "\n  };\n");
+    // The wrapper's nested classes are defined out-of-line, like a struct's `Foo::Reader`: the
+    // outer `struct Name { ... }` (emitted with the other outer type definitions, in file order)
+    // only declares them, and their bodies -- whose accessor declarations name the fields' types --
+    // go in readerBuilderDefs, after every type in the file is declared. Otherwise a field whose
+    // type is declared later in the file (`type W = group { x @0 :Later; }`) fails to compile.
+    kj::String q = kj::str(scope, name, "::");
     kj::StringTree anyClasses = isUnion ? kj::strTree() : kj::strTree(
-        "  class AnyReader {\n"
-        "  public:\n"
-        "    AnyReader() = default;\n"
-        "    AnyReader(::capnp::_::StructReader reader, const ::capnp::_::NewtypeTable* table)\n"
-        "        : _reader(reader), _table(table) {}\n",
+        "class ", q, "AnyReader {\n"
+        "public:\n"
+        "  AnyReader() = default;\n"
+        "  AnyReader(::capnp::_::StructReader reader, const ::capnp::_::NewtypeTable* table)\n"
+        "      : _reader(reader), _table(table) {}\n",
         declsOf(anyReaderM),
-        "    inline const ::capnp::_::NewtypeTable* getTable() const { return _table; }\n"
-        "  private:\n"
-        "    ::capnp::_::StructReader _reader;\n"
-        "    const ::capnp::_::NewtypeTable* _table = &::capnp::_::EMPTY_NEWTYPE_TABLE;\n"
-        "  };\n"
-        "  class AnyBuilder {\n"
-        "  public:\n"
-        "    AnyBuilder() = default;\n"
-        "    AnyBuilder(::capnp::_::StructBuilder builder, const ::capnp::_::NewtypeTable* table)\n"
-        "        : _builder(builder), _table(table) {}\n",
+        "  inline const ::capnp::_::NewtypeTable* getTable() const { return _table; }\n"
+        "private:\n"
+        "  ::capnp::_::StructReader _reader;\n"
+        "  const ::capnp::_::NewtypeTable* _table = &::capnp::_::EMPTY_NEWTYPE_TABLE;\n"
+        "};\n"
+        "\n"
+        "class ", q, "AnyBuilder {\n"
+        "public:\n"
+        "  AnyBuilder() = default;\n"
+        "  AnyBuilder(::capnp::_::StructBuilder builder, const ::capnp::_::NewtypeTable* table)\n"
+        "      : _builder(builder), _table(table) {}\n",
         declsOf(anyBuilderM),
-        "    inline AnyReader asReader() const { return AnyReader(_builder.asReader(), _table); }\n"
-        "    inline const ::capnp::_::NewtypeTable* getTable() const { return _table; }\n"
-        "  private:\n"
-        "    ::capnp::_::StructBuilder _builder;\n"
-        "    const ::capnp::_::NewtypeTable* _table = &::capnp::_::EMPTY_NEWTYPE_TABLE;\n"
-        "  };\n");
-    kj::StringPtr tmplParams = "  template <const ::capnp::_::NewtypeTable* capnpTable_>\n";
+        "  inline AnyReader asReader() const { return AnyReader(_builder.asReader(), _table); }\n"
+        "  inline const ::capnp::_::NewtypeTable* getTable() const { return _table; }\n"
+        "private:\n"
+        "  ::capnp::_::StructBuilder _builder;\n"
+        "  const ::capnp::_::NewtypeTable* _table = &::capnp::_::EMPTY_NEWTYPE_TABLE;\n"
+        "};\n"
+        "\n");
+    kj::StringPtr tmplParams = "template <const ::capnp::_::NewtypeTable* capnpTable_>\n";
     kj::StringPtr readerAsAny = isUnion ? ""
-        : "    inline AnyReader asAny() const { return AnyReader(_reader, capnpTable_); }\n";
+        : "  inline AnyReader asAny() const { return AnyReader(_reader, capnpTable_); }\n";
     kj::StringPtr builderAsAny = isUnion ? ""
-        : "    inline AnyBuilder asAny() { return AnyBuilder(_builder, capnpTable_); }\n";
+        : "  inline AnyBuilder asAny() { return AnyBuilder(_builder, capnpTable_); }\n";
     kj::StringPtr builderAsReader =
-          "    inline Reader<capnpTable_> asReader() const {\n"
-          "      return Reader<capnpTable_>(_builder.asReader());\n"
-          "    }\n";
+          "  inline Reader<capnpTable_> asReader() const {\n"
+          "    return Reader<capnpTable_>(_builder.asReader());\n"
+          "  }\n";
 
-    // The struct holds only declarations for the field accessors (definitions are out-of-line);
-    // the small asReader/asAny helpers stay inline.
+    // The outer struct: the Which enum and declarations of the nested classes only.
     auto body = kj::strTree(
         "struct ", name, " {\n",
         "  ", name, "() = delete;\n",
         whichEnum,
+        isUnion ? "" : "  class AnyReader;\n  class AnyBuilder;\n",
+        "  ", tmplParams,
+        "  class Reader;\n",
+        "  ", tmplParams,
+        "  class Builder;\n",
+        "};\n");
+
+    // The nested class bodies hold only declarations for the field accessors (definitions are
+    // out-of-line, in inlineMethodDefs); the small asReader/asAny helpers stay inline.
+    auto classDefs = kj::strTree(
         kj::mv(anyClasses),
         tmplParams,
-        "  class Reader {\n"
-        "  public:\n"
-        "    Reader() = default;\n"
-        "    explicit Reader(::capnp::_::StructReader reader): _reader(reader) {}\n",
+        "class ", q, "Reader {\n"
+        "public:\n"
+        "  Reader() = default;\n"
+        "  explicit Reader(::capnp::_::StructReader reader): _reader(reader) {}\n",
         declsOf(readerM),
         readerAsAny,
-        "  private:\n"
-        "    ::capnp::_::StructReader _reader;\n"
-        "  };\n",
+        "private:\n"
+        "  ::capnp::_::StructReader _reader;\n"
+        "};\n"
+        "\n",
         tmplParams,
-        "  class Builder {\n"
-        "  public:\n"
-        "    Builder() = default;\n"
-        "    explicit Builder(::capnp::_::StructBuilder builder): _builder(builder) {}\n",
+        "class ", q, "Builder {\n"
+        "public:\n"
+        "  Builder() = default;\n"
+        "  explicit Builder(::capnp::_::StructBuilder builder): _builder(builder) {}\n",
         declsOf(builderM),
         builderAsReader,
         builderAsAny,
-        "  private:\n"
-        "    ::capnp::_::StructBuilder _builder;\n"
-        "  };\n"
-        "};\n");
+        "private:\n"
+        "  ::capnp::_::StructBuilder _builder;\n"
+        "};\n"
+        "\n");
 
     // Out-of-line definitions, emitted (in inlineMethodDefs) after all types are complete.
     kj::String arScope = kj::str(scope, name, "::AnyReader::");
@@ -3238,12 +3256,12 @@ private:
 
     if (scope.size() == 0) {
       return NodeText {
-        kj::strTree(), kj::mv(body), kj::strTree(), kj::strTree(),
+        kj::strTree(), kj::mv(body), kj::mv(classDefs), kj::strTree(),
         kj::mv(defs), kj::strTree(), kj::strTree(), kj::strTree(),
       };
     } else {
       return NodeText {
-        kj::mv(body), kj::strTree(), kj::strTree(), kj::strTree(),
+        kj::mv(body), kj::strTree(), kj::mv(classDefs), kj::strTree(),
         kj::mv(defs), kj::strTree(), kj::strTree(), kj::strTree(),
       };
     }
@@ -3627,6 +3645,97 @@ private:
     kj::StringTree source;
   };
 
+  void aliasTargetIds(schema::Type::Reader type, kj::Vector<uint64_t>& out) {
+    // The node ids a `type` alias's `using Name = ...;` names: the alias it references directly,
+    // if any, else the struct/enum/interface ids in the resolved type, including list elements
+    // and brand bindings.
+    if (type.getTypeId() != 0) {
+      out.add(type.getTypeId());
+      return;
+    }
+    auto addBrand = [&](schema::Brand::Reader brand) {
+      for (auto scope: brand.getScopes()) {
+        if (scope.isBind()) {
+          for (auto binding: scope.getBind()) {
+            if (binding.isType()) aliasTargetIds(binding.getType(), out);
+          }
+        }
+      }
+    };
+    switch (type.which()) {
+      case schema::Type::STRUCT:
+        out.add(type.getStruct().getTypeId());
+        addBrand(type.getStruct().getBrand());
+        break;
+      case schema::Type::ENUM:
+        out.add(type.getEnum().getTypeId());
+        addBrand(type.getEnum().getBrand());
+        break;
+      case schema::Type::INTERFACE:
+        out.add(type.getInterface().getTypeId());
+        addBrand(type.getInterface().getBrand());
+        break;
+      case schema::Type::LIST:
+        aliasTargetIds(type.getList().getElementType(), out);
+        break;
+      default:
+        break;
+    }
+  }
+
+  void collectAliasTargets(schema::Node::Reader node, kj::Vector<uint64_t>& out) {
+    // Alias targets of every `type` node in `node`'s subtree (the node itself included).
+    if (node.isType()) aliasTargetIds(node.getType(), out);
+    for (auto nested: node.getNestedNodes()) {
+      collectAliasTargets(schemaLoader.get(nested.getId()).getProto(), out);
+    }
+  }
+
+  kj::Array<schema::Node::NestedNode::Reader> orderForAliases(schema::Node::Reader file) {
+    // A `using` alias, at file scope or nested in a type's body, sits in the outer type
+    // definitions and so needs its target declared before it -- but those definitions are
+    // otherwise emitted in declaration order, so `type Bar = Foo;` above `struct Foo` would not
+    // compile. Order the file's top-level nodes so that each comes after the top-level nodes its
+    // aliases name. This is a stable topological sort: a file without such forward references
+    // keeps its declaration order, and a cycle (only possible between aliases nested in each
+    // other's bodies) falls back to declaration order.
+    auto nested = file.getNestedNodes();
+    std::map<uint64_t, uint> indexOf;
+    for (uint i = 0; i < nested.size(); i++) indexOf[nested[i].getId()] = i;
+
+    auto topLevelIndex = [&](uint64_t id) -> kj::Maybe<uint> {
+      for (;;) {
+        auto found = indexOf.find(id);
+        if (found != indexOf.end()) return found->second;
+        KJ_IF_SOME(s, schemaLoader.tryGet(id)) {
+          id = s.getProto().getScopeId();
+          if (id == 0 || id == file.getId()) return kj::none;
+        } else {
+          return kj::none;
+        }
+      }
+    };
+
+    kj::Vector<schema::Node::NestedNode::Reader> result(nested.size());
+    kj::Array<uint8_t> state = kj::heapArray<uint8_t>(nested.size());  // 0 new, 1 active, 2 done
+    for (auto& s: state) s = 0;
+    auto visit = [&](auto& self, uint i) -> void {
+      if (state[i] != 0) return;
+      state[i] = 1;
+      kj::Vector<uint64_t> targets;
+      collectAliasTargets(schemaLoader.get(nested[i].getId()).getProto(), targets);
+      for (auto target: targets) {
+        KJ_IF_SOME(j, topLevelIndex(target)) {
+          if (j != i) self(self, j);
+        }
+      }
+      state[i] = 2;
+      result.add(nested[i]);
+    };
+    for (uint i = 0; i < nested.size(); i++) visit(visit, i);
+    return result.releaseAsArray();
+  }
+
   FileText makeFileText(Schema schema,
                         schema::CodeGeneratorRequest::RequestedFile::Reader request) {
     usedImports.clear();
@@ -3661,7 +3770,7 @@ private:
       }
     }
 
-    auto nodeTexts = KJ_MAP(nested, node.getNestedNodes()) {
+    auto nodeTexts = KJ_MAP(nested, orderForAliases(node)) {
       return makeNodeText(namespacePrefix, "", nested.getName(),
                           schemaLoader.getUnbound(nested.getId()), TemplateContext());
     };
